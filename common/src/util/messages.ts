@@ -285,9 +285,8 @@ function filterOrphanModelToolMessages(
   messages: ModelMessageWithAuxiliaryData[],
   logger?: Logger,
 ): ModelMessageWithAuxiliaryData[] {
+  const matchedToolCallIds = new Set<string>()
   const pendingToolCallIds = new Set<string>()
-  const droppedToolResultIds: string[] = []
-  const filteredMessages: ModelMessageWithAuxiliaryData[] = []
   let hasStartedToolResponses = false
 
   for (const message of messages) {
@@ -299,24 +298,57 @@ function filterOrphanModelToolMessages(
       for (const toolCallId of getAssistantToolCallIds(message)) {
         pendingToolCallIds.add(toolCallId)
       }
-      filteredMessages.push(message)
       continue
     }
 
     if (message.role === 'tool') {
-      const validToolResults: ToolModelMessage['content'] = []
-
       for (const part of message.content) {
         const toolCallId = getToolResultPartId(part)
         if (toolCallId && pendingToolCallIds.has(toolCallId)) {
-          validToolResults.push(part)
-        } else {
-          droppedToolResultIds.push(toolCallId ?? '<missing>')
+          matchedToolCallIds.add(toolCallId)
         }
       }
 
+      hasStartedToolResponses = true
+      continue
+    }
+
+    pendingToolCallIds.clear()
+    hasStartedToolResponses = false
+  }
+
+  const droppedToolCallIds: string[] = []
+  const droppedToolResultIds: string[] = []
+  const filteredMessages: ModelMessageWithAuxiliaryData[] = []
+
+  for (const message of messages) {
+    if (message.role === 'assistant') {
+      const filteredContent = message.content.filter((part) => {
+        if (part.type !== 'tool-call') return true
+        if (matchedToolCallIds.has(part.toolCallId)) return true
+        droppedToolCallIds.push(part.toolCallId)
+        return false
+      })
+
+      if (filteredContent.length > 0) {
+        filteredMessages.push(
+          filteredContent.length === message.content.length
+            ? message
+            : { ...message, content: filteredContent },
+        )
+      }
+      continue
+    }
+
+    if (message.role === 'tool') {
+      const validToolResults = message.content.filter((part) => {
+        const toolCallId = getToolResultPartId(part)
+        if (toolCallId && matchedToolCallIds.has(toolCallId)) return true
+        droppedToolResultIds.push(toolCallId ?? '<missing>')
+        return false
+      })
+
       if (validToolResults.length > 0) {
-        hasStartedToolResponses = true
         filteredMessages.push(
           validToolResults.length === message.content.length
             ? message
@@ -326,18 +358,18 @@ function filterOrphanModelToolMessages(
       continue
     }
 
-    pendingToolCallIds.clear()
-    hasStartedToolResponses = false
     filteredMessages.push(message)
   }
 
-  if (droppedToolResultIds.length > 0) {
+  if (droppedToolCallIds.length > 0 || droppedToolResultIds.length > 0) {
     logger?.debug(
       {
+        droppedToolCallCount: droppedToolCallIds.length,
+        droppedToolCallIds,
         droppedToolResultCount: droppedToolResultIds.length,
         droppedToolResultIds,
       },
-      'Dropped orphan tool-result messages before model request.',
+      'Dropped incomplete tool-call messages before model request.',
     )
   }
 
@@ -575,8 +607,8 @@ function validateModelMessages(
       }
       throw new Error(
         `convertCbToModelMessages: Message at index ${i} failed schema validation.\n` +
-          `Role: ${message.role}\n` +
-          `Message:\n${result.error.message}`,
+        `Role: ${message.role}\n` +
+        `Message:\n${result.error.message}`,
       )
     }
   }
@@ -629,8 +661,8 @@ export function systemMessage(
   params:
     | SystemContent
     | ({
-        content: SystemContent
-      } & Omit<SystemMessage, 'role' | 'content'>),
+      content: SystemContent
+    } & Omit<SystemMessage, 'role' | 'content'>),
 ): SystemMessage {
   if (typeof params === 'object' && 'content' in params) {
     return {
@@ -663,8 +695,8 @@ export function userMessage(
   params:
     | UserContent
     | ({
-        content: UserContent
-      } & Omit<UserMessage, 'role' | 'content'>),
+      content: UserContent
+    } & Omit<UserMessage, 'role' | 'content'>),
 ): UserMessage {
   if (typeof params === 'object' && 'content' in params) {
     return {
@@ -701,8 +733,8 @@ export function assistantMessage(
   params:
     | AssistantContent
     | ({
-        content: AssistantContent
-      } & Omit<AssistantMessage, 'role' | 'content'>),
+      content: AssistantContent
+    } & Omit<AssistantMessage, 'role' | 'content'>),
 ): AssistantMessage {
   if (typeof params === 'object' && 'content' in params) {
     return {
@@ -788,10 +820,10 @@ function sanitizeJsonToolResultValue(
 export function jsonToolResult<T extends JSONValue>(
   value: T,
 ): [
-  Extract<ToolResultOutput, { type: 'json' }> & {
-    value: T
-  },
-] {
+    Extract<ToolResultOutput, { type: 'json' }> & {
+      value: T
+    },
+  ] {
   // The ai SDK's `modelMessageSchema` accepts bare-array tool-result values,
   // so we sanitize directly without any top-level envelope. Recursion through
   // `sanitizeJsonToolResultValue` preserves nested arrays and drops

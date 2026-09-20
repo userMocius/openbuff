@@ -2,6 +2,7 @@
   "providers": {
     "opencode-go": {
       "type": "openai-compatible",
+      "api": "chat-completions",
       "baseURL": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_GO_API_KEY",
       "models": [

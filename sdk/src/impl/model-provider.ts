@@ -22,6 +22,7 @@ import {
   VERSION,
 } from '@codebuff/internal/openai-compatible/index'
 import { createAnthropic } from '@ai-sdk/anthropic'
+import { createOpenAI } from '@ai-sdk/openai'
 
 import { getValidChatGptOAuthCredentials } from '../credentials'
 import {
@@ -229,10 +230,10 @@ export async function getModelForRequest(
   }
   const resolvedCapabilities = configuredProviderModel
     ? resolveModelCapabilities({
-        providerId: configuredProviderModel.providerId,
-        model: effectiveModel,
-        loadedConfig: loadedProviderConfig,
-      })
+      providerId: configuredProviderModel.providerId,
+      model: effectiveModel,
+      loadedConfig: loadedProviderConfig,
+    })
     : undefined
   if (
     reasoningEffort === undefined &&
@@ -283,7 +284,11 @@ export async function getModelForRequest(
     }
 
     return {
-      model: createConfiguredOpenAICompatibleModel(configuredProviderModel),
+      model:
+        configuredProviderModel.provider.type === 'openai-compatible' &&
+          configuredProviderModel.provider.api === 'responses'
+          ? createConfiguredOpenAIResponsesModel(configuredProviderModel)
+          : createConfiguredOpenAICompatibleModel(configuredProviderModel),
       isChatGptOAuth: false,
       compatibility: configuredProviderModel.compatibility,
       reasoningEffort,
@@ -333,8 +338,7 @@ export async function getModelForRequest(
   }
 
   throw new Error(
-    `Openbuff could not route model '${effectiveModel}'${
-      agentId ? ` for agent '${agentId}'` : ''
+    `Openbuff could not route model '${effectiveModel}'${agentId ? ` for agent '${agentId}'` : ''
     }. Add a provider mapping in openbuff.json or set OPENBUFF_PROVIDER_CONFIG.`,
   )
 }
@@ -400,10 +404,10 @@ export function resolveModelContextWindows(params: {
       })
       const value = configured
         ? resolveModelCapabilities({
-            providerId: configured.providerId,
-            model: candidateModel,
-            loadedConfig,
-          })?.context?.windowTokens
+          providerId: configured.providerId,
+          model: candidateModel,
+          loadedConfig,
+        })?.context?.windowTokens
         : undefined
       return typeof value === 'number' && value > 0 ? [value] : []
     },
@@ -553,10 +557,9 @@ function resolveVisionModelIfNeeded(params: {
     })
   if (!visionModel) {
     throw new Error(
-      `Model '${effectiveModel}' ${
-        visionSupport === 'no'
-          ? 'is not image-capable'
-          : 'is not annotated as image-capable'
+      `Model '${effectiveModel}' ${visionSupport === 'no'
+        ? 'is not image-capable'
+        : 'is not annotated as image-capable'
       }, but this request contains image input. Configure visionModel in openbuff.json or route this agent to an image-capable model.`,
     )
   }
@@ -610,6 +613,27 @@ function createConfiguredOpenAICompatibleModel(
     supportsStructuredOutputs: provider.supportsStructuredOutputs,
     stringifyTextContent: resolvedModel.compatibility.stringifyTextContent,
   })
+}
+
+function createConfiguredOpenAIResponsesModel(
+  resolvedModel: ResolvedProviderModel,
+): LanguageModel {
+  const { providerId, provider, providerModel, apiKey } = resolvedModel
+  if (provider.type !== 'openai-compatible') {
+    throw new Error(
+      `Provider '${providerId}' is not an OpenAI-compatible provider.`,
+    )
+  }
+
+  return createOpenAI({
+    baseURL: provider.baseURL.replace(/\/$/, ''),
+    apiKey,
+    name: providerId,
+    headers: {
+      'user-agent': `ai-sdk/openai-responses/${VERSION}/openbuff-custom-provider`,
+    },
+    fetch: createConfiguredProviderFetch(resolvedModel),
+  }).responses(providerModel)
 }
 
 /**
@@ -697,10 +721,17 @@ function shouldStripStopSequencesForProviderModel(
 }
 
 function shouldTransformRequestForProviderModel(
-  resolvedModel: Pick<ResolvedProviderModel, 'providerModel'> & {
+  resolvedModel: Pick<ResolvedProviderModel, 'provider' | 'providerModel'> & {
     compatibility?: Partial<ProviderCompatibility>
   },
 ): boolean {
+  if (
+    resolvedModel.provider?.type === 'openai-compatible' &&
+    resolvedModel.provider.api === 'responses'
+  ) {
+    return false
+  }
+
   return (
     shouldDisableThinkingForProviderModel(resolvedModel.providerModel) ||
     shouldDowngradeRequiredToolChoiceForProviderModel(resolvedModel) ||
@@ -710,7 +741,7 @@ function shouldTransformRequestForProviderModel(
 
 export function applyConfiguredProviderRequestCompatibility(
   body: Record<string, unknown>,
-  resolvedModel: Pick<ResolvedProviderModel, 'providerModel'> & {
+  resolvedModel: Pick<ResolvedProviderModel, 'provider' | 'providerModel'> & {
     compatibility?: Partial<ProviderCompatibility>
   },
 ): Record<string, unknown> {
@@ -731,14 +762,14 @@ export function applyConfiguredProviderRequestCompatibility(
     ...body,
     ...(shouldDisableThinking
       ? {
-          thinking: { type: 'disabled' },
-          reasoning_effort: undefined,
-        }
+        thinking: { type: 'disabled' },
+        reasoning_effort: undefined,
+      }
       : {}),
     ...(shouldDowngradeRequiredToolChoice
       ? {
-          tool_choice: undefined,
-        }
+        tool_choice: undefined,
+      }
       : {}),
   }
 

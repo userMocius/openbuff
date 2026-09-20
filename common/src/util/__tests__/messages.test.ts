@@ -325,6 +325,88 @@ describe('convertCbToModelMessages', () => {
       ])
     })
 
+    it('should drop assistant tool calls without a matching tool result', () => {
+      const messages: Message[] = [
+        userMessage('Before incomplete tool call'),
+        assistantMessage({
+          type: 'tool-call',
+          toolCallId: 'missing_result',
+          toolName: 'test_tool',
+          input: {},
+        }),
+        userMessage('After incomplete tool call'),
+      ]
+
+      const result = convertCbToModelMessages({
+        messages,
+        includeCacheControl: false,
+      })
+
+      expect(result).toEqual([
+        expect.objectContaining({
+          role: 'user',
+          content: [
+            expect.objectContaining({ text: 'Before incomplete tool call' }),
+            expect.objectContaining({ text: 'After incomplete tool call' }),
+          ],
+        }),
+      ])
+    })
+
+    it('should keep matched tool calls while dropping incomplete calls in the same assistant message', () => {
+      const messages: Message[] = [
+        assistantMessage([
+          {
+            type: 'tool-call',
+            toolCallId: 'matched_call',
+            toolName: 'test_tool',
+            input: {},
+          },
+          {
+            type: 'tool-call',
+            toolCallId: 'missing_result',
+            toolName: 'test_tool',
+            input: {},
+          },
+        ]),
+        {
+          role: 'tool',
+          toolName: 'test_tool',
+          toolCallId: 'matched_call',
+          content: jsonToolResult({ result: 'success' }),
+        },
+      ]
+
+      const result = convertCbToModelMessages({
+        messages,
+        includeCacheControl: false,
+      })
+
+      expect(result).toHaveLength(2)
+      expect(result[0]).toEqual(
+        expect.objectContaining({
+          role: 'assistant',
+          content: [
+            expect.objectContaining({
+              type: 'tool-call',
+              toolCallId: 'matched_call',
+            }),
+          ],
+        }),
+      )
+      expect(result[1]).toEqual(
+        expect.objectContaining({
+          role: 'tool',
+          content: [
+            expect.objectContaining({
+              type: 'tool-result',
+              toolCallId: 'matched_call',
+            }),
+          ],
+        }),
+      )
+    })
+
     it('should sanitize undefined values from JSON tool output', () => {
       const content = jsonToolResult({
         result: 'success',
@@ -1255,6 +1337,12 @@ describe('convertCbToModelMessages', () => {
           toolName: 'test_tool',
           input: { param: 'value' },
         }),
+        {
+          role: 'tool',
+          toolName: 'test_tool',
+          toolCallId: 'call_123',
+          content: jsonToolResult({ result: 'success' }),
+        },
       ]
 
       const result = convertCbToModelMessages({
@@ -1275,6 +1363,16 @@ describe('convertCbToModelMessages', () => {
             },
           ],
         },
+        expect.objectContaining({
+          role: 'tool',
+          content: [
+            expect.objectContaining({
+              type: 'tool-result',
+              toolCallId: 'call_123',
+              toolName: 'test_tool',
+            }),
+          ],
+        }),
       ])
     })
 

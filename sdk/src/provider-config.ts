@@ -200,6 +200,8 @@ function isLocalHttpUrl(value: string): boolean {
 const openAICompatibleProviderSchema = z
   .object({
     type: z.literal('openai-compatible').default('openai-compatible'),
+    /** API protocol used by this provider. */
+    api: z.enum(['chat-completions', 'responses']).default('chat-completions'),
     baseURL: z
       .string()
       .url()
@@ -1076,10 +1078,10 @@ function warnIfAncestorConfigHasApiKeyEnv(
     ) {
       console.warn(
         `[openbuff] A provider config loaded from a non-project ancestor ` +
-          `(${ancestorPaths.join(', ')}) declares an apiKeyEnv provider. ` +
-          `An ancestor config can route API requests to untrusted endpoints ` +
-          `and leak secrets sourced from env vars. ` +
-          `Set OPENBUFF_TRUST_ANCESTOR_CONFIG=1 to acknowledge and suppress this warning.`,
+        `(${ancestorPaths.join(', ')}) declares an apiKeyEnv provider. ` +
+        `An ancestor config can route API requests to untrusted endpoints ` +
+        `and leak secrets sourced from env vars. ` +
+        `Set OPENBUFF_TRUST_ANCESTOR_CONFIG=1 to acknowledge and suppress this warning.`,
       )
       return
     }
@@ -1676,7 +1678,7 @@ export function recommendConfiguredModel(params: {
     (a, b) =>
       b.score - a.score ||
       Object.values(b.matchedContext).filter(Boolean).length -
-        Object.values(a.matchedContext).filter(Boolean).length ||
+      Object.values(a.matchedContext).filter(Boolean).length ||
       (b.sampleSize ?? 0) - (a.sampleSize ?? 0),
   )[0]
 }
@@ -1752,7 +1754,7 @@ export function resolveConfiguredAgentModelConfig(params: {
 
   throw new Error(
     `No model configured for agent '${agentId ?? 'unknown'}'. ` +
-      `Run /setup or set defaultModel (or agents['${agentId ?? 'unknown'}']) in your openbuff.json.`,
+    `Run /setup or set defaultModel (or agents['${agentId ?? 'unknown'}']) in your openbuff.json.`,
   )
 }
 
@@ -2118,7 +2120,7 @@ export function createProviderPresetConfig(
 ): ProviderConfigFile {
   const preset =
     OPENBUFF_PROVIDER_PRESETS[
-      presetId as keyof typeof OPENBUFF_PROVIDER_PRESETS
+    presetId as keyof typeof OPENBUFF_PROVIDER_PRESETS
     ]
   if (!preset) {
     throw new Error(`Unknown Openbuff provider preset '${presetId}'.`)
@@ -2162,15 +2164,15 @@ export function createProviderPresetConfig(
     ...presetConfig,
     ...(defaultModel
       ? {
-          agents: {
-            ...(presetConfig.agents ?? {}),
-            ...seededAgents,
-          },
-          agentReasoningEfforts: {
-            ...(presetConfig.agentReasoningEfforts ?? {}),
-            ...seededReasoning,
-          },
-        }
+        agents: {
+          ...(presetConfig.agents ?? {}),
+          ...seededAgents,
+        },
+        agentReasoningEfforts: {
+          ...(presetConfig.agentReasoningEfforts ?? {}),
+          ...seededReasoning,
+        },
+      }
       : {}),
   }
   const parseResult = providerConfigFileSchema.safeParse(config)
@@ -2551,18 +2553,16 @@ export function describeLoadedProviderConfig(
 ): string {
   const lines: string[] = []
   lines.push(
-    `Config: ${
-      loadedConfig.sourceFilePaths.length
-        ? loadedConfig.sourceFilePaths.map(getRelativeConfigPath).join(', ')
-        : 'not found'
+    `Config: ${loadedConfig.sourceFilePaths.length
+      ? loadedConfig.sourceFilePaths.map(getRelativeConfigPath).join(', ')
+      : 'not found'
     }`,
   )
   lines.push(`Default model: ${loadedConfig.config.defaultModel ?? '(none)'}`)
   lines.push(
-    `Modes: ${
-      Object.entries(loadedConfig.config.modes ?? {})
-        .map(([mode, model]) => `${mode}=${model}`)
-        .join(', ') || '(none)'
+    `Modes: ${Object.entries(loadedConfig.config.modes ?? {})
+      .map(([mode, model]) => `${mode}=${model}`)
+      .join(', ') || '(none)'
     }`,
   )
   const providers = Object.entries(loadedConfig.config.providers)
@@ -2571,8 +2571,8 @@ export function describeLoadedProviderConfig(
     const models = Array.isArray(provider.models)
       ? provider.models.join(', ')
       : Object.entries(provider.models)
-          .map(([from, to]) => `${from}->${to}`)
-          .join(', ')
+        .map(([from, to]) => `${from}->${to}`)
+        .join(', ')
     const sourceFile = loadedConfig.sourceFiles?.providers?.[providerId]
     const sourceSuffix = sourceFile
       ? ` (defined in ${getRelativeConfigPath(sourceFile)})`

@@ -55,6 +55,7 @@ openbuff.d/
   "providers": {
     "openai": {
       "type": "openai-compatible",
+      "api": "chat-completions",
       "baseURL": "https://api.openai.com/v1",
       "apiKeyEnv": "OPENAI_API_KEY",
       "models": ["gpt-5.5", "gpt-5.4-mini"],
