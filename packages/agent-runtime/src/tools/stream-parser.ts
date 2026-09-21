@@ -109,6 +109,7 @@ export async function processStream(
   const toolCallsToAddToMessageHistory: (CodebuffToolCall | CustomToolCall)[] =
     []
   const assistantMessages: Message[] = []
+  let persistedToolCallCount = 0
   let hadToolCallError = false
   let unknownWorkspaceMutationMayHaveRun = false
   const errorMessages: Message[] = []
@@ -155,7 +156,7 @@ export async function processStream(
       ...writeBarriersByPath.values(),
       customToolBarrier,
       ...inFlightReads,
-    ]).then(() => {})
+    ]).then(() => { })
 
   // Extracts the normalized target path from a write tool's input, for the
   // purpose of selecting the per-path write barrier. Returns `undefined` when
@@ -303,7 +304,7 @@ export async function processStream(
   function createToolExecutionCallback(toolName: string, isXmlMode: boolean) {
     const responseHandler = createResponseHandler()
     return {
-      onTagStart: () => {},
+      onTagStart: () => { },
       onTagEnd: async (
         _: string,
         input: Record<string, string>,
@@ -431,11 +432,11 @@ export async function processStream(
           }
           let edits: Array<
             | {
-                type: 'patch'
-                path: string
-                diff: string
-                basedOnRead?: string
-              }
+              type: 'patch'
+              path: string
+              diff: string
+              basedOnRead?: string
+            }
             | { type: 'delete'; path: string }
           > = []
           const collectEntry = (entry: unknown) => {
@@ -545,10 +546,10 @@ export async function processStream(
         // Check if this is an agent tool call that should be transformed to spawn_agents
         const transformed = !isNativeTool
           ? tryTransformAgentToolCall({
-              toolName: effectiveToolName,
-              input: effectiveInput,
-              spawnableAgents: agentTemplate.spawnableAgents,
-            })
+            toolName: effectiveToolName,
+            input: effectiveInput,
+            spawnableAgents: agentTemplate.spawnableAgents,
+          })
           : null
 
         // Determine if this is a read-only tool. Read-only tools only mutate
@@ -604,8 +605,8 @@ export async function processStream(
               ? true
               : undefined
             : activeGlobalWrite !== undefined ||
-                writeBarriersByPath.size > 0 ||
-                inFlightReads.size > 0
+              writeBarriersByPath.size > 0 ||
+              inFlightReads.size > 0
               ? true
               : undefined
           : undefined
@@ -627,14 +628,14 @@ export async function processStream(
             customToolBarrier,
             ...writeBarriersByPath.values(),
           ]
-          previousPromise = Promise.all(allWriteBarriers).then(() => {})
+          previousPromise = Promise.all(allWriteBarriers).then(() => { })
         } else if (writePath !== undefined) {
           const pathBarrier = getWriteBarrierForPath(writePath)
           previousPromise = Promise.all([
             customToolBarrier,
             pathBarrier,
             ...inFlightReads,
-          ]).then(() => {})
+          ]).then(() => { })
         } else {
           const allWriteBarriers = [
             customToolBarrier,
@@ -643,9 +644,9 @@ export async function processStream(
           previousPromise =
             inFlightReads.size > 0
               ? Promise.all([...allWriteBarriers, ...inFlightReads]).then(
-                  () => {},
-                )
-              : Promise.all(allWriteBarriers).then(() => {})
+                () => { },
+              )
+              : Promise.all(allWriteBarriers).then(() => { })
         }
 
         // Determine which executor to use and with what parameters
@@ -704,8 +705,8 @@ export async function processStream(
         // - Custom/unknown-path writes: advance the global barrier. All later
         //   named writes wait for it, regardless of path extraction.
         const settledToolPromise = toolPromise.then(
-          () => {},
-          () => {},
+          () => { },
+          () => { },
         )
         if (isReadOnlyTool) {
           inFlightReads.add(settledToolPromise)
@@ -925,6 +926,7 @@ export async function processStream(
     const filteredToolCalls = toolCallsToAddToMessageHistory.filter((tc) =>
       completedToolCallIds.has(tc.toolCallId),
     )
+    persistedToolCallCount = filteredToolCalls.length
 
     agentState.messageHistory = buildArray<Message>([
       ...agentState.messageHistory,
@@ -940,6 +942,24 @@ export async function processStream(
   if (signal.aborted) {
     throw new AbortError()
   }
+
+  logger.debug(
+    {
+      agentId: agentState.agentId,
+      agentType: agentTemplate.id,
+      messageCount: agentState.messageHistory.length,
+      assistantMessageCount: assistantMessages.length,
+      toolCallCount: toolCalls.length,
+      toolResultCount: toolResults.length,
+      persistedToolCallCount,
+      persistedToolResultCount: toolResultsToAddToMessageHistory.length,
+      errorMessageCount: errorMessages.length,
+      fullResponseLength: fullResponseChunks.join('').length,
+      messageIdPresent: messageId !== null,
+      hadToolCallError,
+    },
+    'Agent response stream finalized',
+  )
 
   return {
     fullResponse: fullResponseChunks.join(''),

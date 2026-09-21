@@ -527,14 +527,14 @@ export const runAgentStep = async (
     ...expireMessages(agentState.messageHistory, 'agentStep'),
 
     stepPrompt &&
-      userMessage({
-        content: stepPrompt,
-        tags: ['STEP_PROMPT'],
+    userMessage({
+      content: stepPrompt,
+      tags: ['STEP_PROMPT'],
 
-        // James: Deprecate the below, only use tags, which are not prescriptive.
-        timeToLive: 'agentStep' as const,
-        keepDuringTruncation: true,
-      }),
+      // James: Deprecate the below, only use tags, which are not prescriptive.
+      timeToLive: 'agentStep' as const,
+      keepDuringTruncation: true,
+    }),
   )
 
   agentState.messageHistory = agentMessagesUntruncated
@@ -572,14 +572,14 @@ export const runAgentStep = async (
         system,
         toolDefinitions: params.tools
           ? Object.fromEntries(
-              Object.entries(params.tools).map(([name, tool]) => [
-                name,
-                {
-                  description: tool.description,
-                  inputSchema: tool.inputSchema as {},
-                },
-              ]),
-            )
+            Object.entries(params.tools).map(([name, tool]) => [
+              name,
+              {
+                description: tool.description,
+                inputSchema: tool.inputSchema as {},
+              },
+            ]),
+          )
           : {},
         messages: messagesWithSystem({
           system,
@@ -599,22 +599,22 @@ export const runAgentStep = async (
 
   const onCacheDebugProviderRequestBuilt = cacheDebugCorrelation
     ? ({
+      provider,
+      rawBody,
+      normalizedBody,
+    }: {
+      provider: string
+      rawBody: unknown
+      normalizedBody?: unknown
+    }) => {
+      enrichCacheDebugSnapshotWithProviderRequest({
+        correlation: cacheDebugCorrelation,
         provider,
         rawBody,
-        normalizedBody,
-      }: {
-        provider: string
-        rawBody: unknown
-        normalizedBody?: unknown
-      }) => {
-        enrichCacheDebugSnapshotWithProviderRequest({
-          correlation: cacheDebugCorrelation,
-          provider,
-          rawBody,
-          normalized: normalizedBody ?? rawBody,
-          logger,
-        })
-      }
+        normalized: normalizedBody ?? rawBody,
+        logger,
+      })
+    }
     : undefined
 
   // The usage callback is UNCONDITIONAL: we always accumulate cache token
@@ -1572,13 +1572,13 @@ export async function loopAgentSteps(
     const agentTools = useParentTools
       ? {}
       : await buildAgentToolSet({
-          ...params,
-          spawnableAgents: getModelVisibleSpawnableAgents(
-            agentTemplate.spawnableAgents,
-          ),
-          spawnableAgentToolMode: agentTemplate.spawnableAgentToolMode,
-          agentTemplates: localAgentTemplates,
-        })
+        ...params,
+        spawnableAgents: getModelVisibleSpawnableAgents(
+          agentTemplate.spawnableAgents,
+        ),
+        spawnableAgentToolMode: agentTemplate.spawnableAgentToolMode,
+        agentTemplates: localAgentTemplates,
+      })
 
     // Build the effective ToolSet from the current agent state. Base2's
     // handleSteps publishes `unlockedToolTiers` under progressive tool
@@ -1617,23 +1617,23 @@ export async function loopAgentSteps(
       useParentTools
         ? Promise.resolve(parentTools!)
         : getToolSet({
-            toolNames: getEffectiveAgentToolNames(agentTemplate, state),
-            // Computed fresh from the passed state (not the prompt cache):
-            // this runs on the per-step rebuild when the programmatic step
-            // just changed `unlockedToolTiers`, so the new surface —
-            // including custom/MCP definitions — must reflect `state`.
-            additionalToolDefinitions: () =>
-              additionalToolDefinitions({
-                ...params,
-                agentTemplate,
-                agentState: state,
-              }),
-            agentTools,
-            skills: fileContext.skills ?? {},
-            spawnableAgentTypes: getModelVisibleSpawnableAgents(
-              agentTemplate.spawnableAgents,
-            ),
-          })
+          toolNames: getEffectiveAgentToolNames(agentTemplate, state),
+          // Computed fresh from the passed state (not the prompt cache):
+          // this runs on the per-step rebuild when the programmatic step
+          // just changed `unlockedToolTiers`, so the new surface —
+          // including custom/MCP definitions — must reflect `state`.
+          additionalToolDefinitions: () =>
+            additionalToolDefinitions({
+              ...params,
+              agentTemplate,
+              agentState: state,
+            }),
+          agentTools,
+          skills: fileContext.skills ?? {},
+          spawnableAgentTypes: getModelVisibleSpawnableAgents(
+            agentTemplate.spawnableAgents,
+          ),
+        })
 
     let tools: ToolSet = await buildTools(initialAgentState)
     let effectiveAgentTemplate =
@@ -1675,25 +1675,25 @@ export async function loopAgentSteps(
           keepDuringTruncation: true,
         },
         prompt &&
-          prompt in additionalSystemPrompts &&
-          userMessage(
-            withSystemInstructionTags(
-              additionalSystemPrompts[
-                prompt as keyof typeof additionalSystemPrompts
-              ],
-            ),
+        prompt in additionalSystemPrompts &&
+        userMessage(
+          withSystemInstructionTags(
+            additionalSystemPrompts[
+            prompt as keyof typeof additionalSystemPrompts
+            ],
           ),
+        ),
         ,
       ],
 
       instructionsPrompt &&
-        userMessage({
-          content: instructionsPrompt,
-          tags: ['INSTRUCTIONS_PROMPT'],
+      userMessage({
+        content: instructionsPrompt,
+        tags: ['INSTRUCTIONS_PROMPT'],
 
-          // James: Deprecate the below, only use tags, which are not prescriptive.
-          keepLastTags: ['INSTRUCTIONS_PROMPT'],
-        }),
+        // James: Deprecate the below, only use tags, which are not prescriptive.
+        keepLastTags: ['INSTRUCTIONS_PROMPT'],
+      }),
     )
 
     // Convert tools to a serializable format for context-pruner token counting
@@ -1929,29 +1929,29 @@ export async function loopAgentSteps(
         const buildCompiledTaskMemoryMessage = (state: AgentState) =>
           state.taskMemory
             ? userMessage({
-                content: withSystemTags(
-                  compileTaskMemoryContext({
-                    memory: state.taskMemory,
-                    agentType: state.agentType,
-                    contextWindowTokens: state.contextWindowTokens,
-                    rootAgent: !state.parentId,
-                    // Rank evidence toward the files this run has just read or
-                    // edited, so relevance rather than raw recency decides what
-                    // survives the compiled budget.
-                    focusPaths: deriveTaskMemoryFocusPaths(state.taskMemory),
-                  }),
-                ),
-                tags: ['TASK_MEMORY_CONTEXT'],
-                keepDuringTruncation: true,
-              })
+              content: withSystemTags(
+                compileTaskMemoryContext({
+                  memory: state.taskMemory,
+                  agentType: state.agentType,
+                  contextWindowTokens: state.contextWindowTokens,
+                  rootAgent: !state.parentId,
+                  // Rank evidence toward the files this run has just read or
+                  // edited, so relevance rather than raw recency decides what
+                  // survives the compiled budget.
+                  focusPaths: deriveTaskMemoryFocusPaths(state.taskMemory),
+                }),
+              ),
+              tags: ['TASK_MEMORY_CONTEXT'],
+              keepDuringTruncation: true,
+            })
             : false
         let messagesWithStepPrompt = buildArray(
           ...currentAgentState.messageHistory,
           buildCompiledTaskMemoryMessage(currentAgentState),
           stepPrompt &&
-            userMessage({
-              content: stepPrompt,
-            }),
+          userMessage({
+            content: stepPrompt,
+          }),
         )
 
         // Cache system + tools token count for this iteration — between the
@@ -2215,9 +2215,9 @@ export async function loopAgentSteps(
           ...currentAgentState.messageHistory,
           buildCompiledTaskMemoryMessage(currentAgentState),
           stepPrompt &&
-            userMessage({
-              content: stepPrompt,
-            }),
+          userMessage({
+            content: stepPrompt,
+          }),
         )
         currentAgentState.contextTokenCount = estimateContextTokensLocally()
 
@@ -2261,9 +2261,9 @@ export async function loopAgentSteps(
           ).filter(
             (category) =>
               categoriesAfterProgrammatic[category].messages <
-                categoriesBeforeProgrammatic[category].messages ||
+              categoriesBeforeProgrammatic[category].messages ||
               categoriesAfterProgrammatic[category].tokens <
-                categoriesBeforeProgrammatic[category].tokens,
+              categoriesBeforeProgrammatic[category].tokens,
           )
           const compactionTelemetry = registerCompaction({
             action: 'semantic_compaction',
@@ -2286,8 +2286,8 @@ export async function loopAgentSteps(
               compactionTelemetry.consecutiveNoProgressCompactions,
             reason: compactionTelemetry.noProgress
               ? `${semanticReason} ${buildCompactionNoProgressClause(
-                  compactionTelemetry.consecutiveNoProgressCompactions,
-                )}`
+                compactionTelemetry.consecutiveNoProgressCompactions,
+              )}`
               : semanticReason,
             before: {
               tokens: historyTokensBeforeProgrammatic,
@@ -2334,9 +2334,9 @@ export async function loopAgentSteps(
             ...pruningResult.messages,
             buildCompiledTaskMemoryMessage(currentAgentState),
             stepPrompt &&
-              userMessage({
-                content: stepPrompt,
-              }),
+            userMessage({
+              content: stepPrompt,
+            }),
           )
           currentAgentState.contextTokenCount = estimateContextTokensLocally()
           const report = pruningResult.report!
@@ -2364,8 +2364,8 @@ export async function loopAgentSteps(
             escalated: report.escalated,
             reason: compactionTelemetry.noProgress
               ? `${mechanicalReason} ${buildCompactionNoProgressClause(
-                  compactionTelemetry.consecutiveNoProgressCompactions,
-                )}`
+                compactionTelemetry.consecutiveNoProgressCompactions,
+              )}`
               : mechanicalReason,
             before: {
               tokens: report.beforeTokens,
@@ -2551,7 +2551,7 @@ export async function loopAgentSteps(
 
       return {
         agentState: currentAgentState,
-        output: getAgentOutput(currentAgentState, agentTemplate),
+        output: getAgentOutput(currentAgentState, agentTemplate, logger),
       }
     } catch (error) {
       // Handle user-initiated aborts separately - don't log as errors
@@ -2622,6 +2622,36 @@ export async function loopAgentSteps(
         error instanceof Error ? error.message : getErrorObject(error).message
       const errorMessage = apiErrorDetails.message ?? fallbackMessage
       const statusCode = apiErrorDetails.statusCode
+      const errorObject = getErrorObject(error)
+      const isSuccessfulResponseProcessingError =
+        errorMessage.includes('Failed to process successful response')
+
+      logger.error(
+        {
+          agentType,
+          agentId: currentAgentState.agentId,
+          runId,
+          totalSteps,
+          errorName: errorObject.name,
+          errorMessage,
+          errorStack: errorObject.stack,
+          statusCode,
+          errorCode: apiErrorDetails.errorCode,
+          isSuccessfulResponseProcessingError,
+          messageCount: currentAgentState.messageHistory.length,
+          recentMessageRoles: currentAgentState.messageHistory
+            .slice(-8)
+            .map((message) => message.role),
+          recentMessageContentTypes: currentAgentState.messageHistory
+            .slice(-8)
+            .map((message) =>
+              typeof message.content === 'string'
+                ? ['text']
+                : message.content.map((part) => part.type),
+            ),
+        },
+        'Agent run error captured',
+      )
 
       const status = signal.aborted ? 'cancelled' : 'failed'
       await finishAgentRun({

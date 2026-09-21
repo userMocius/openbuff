@@ -4,6 +4,7 @@ import type {
   AgentState,
   AgentOutput,
 } from '@codebuff/common/types/session-state'
+import type { Logger } from '@codebuff/common/types/contracts/logger'
 
 /** Messages tagged with these tags are stripped from agent output. */
 const EXCLUDED_OUTPUT_TAGS = ['TOOL_CALL_ERROR'] as const
@@ -63,6 +64,7 @@ function getLastAssistantTurnMessages(messageHistory: Message[]): Message[] {
 export function getAgentOutput(
   agentState: AgentState,
   agentTemplate: AgentTemplate,
+  logger?: Logger,
 ): AgentOutput {
   if (agentTemplate.outputMode === 'structured_output') {
     return {
@@ -75,6 +77,21 @@ export function getAgentOutput(
       agentState.messageHistory,
     )
     if (lastTurnMessages.length === 0) {
+      logger?.warn(
+        {
+          agentId: agentState.agentId,
+          agentType: agentState.agentType,
+          outputMode: agentTemplate.outputMode,
+          messageCount: agentState.messageHistory.length,
+          messageRoles: agentState.messageHistory.slice(-8).map((message) => message.role),
+          messageContentTypes: agentState.messageHistory.slice(-8).map((message) =>
+            typeof message.content === 'string'
+              ? 'text'
+              : message.content.map((part) => part.type),
+          ),
+        },
+        'Agent produced no last-message output',
+      )
       return {
         type: 'error',
         message: 'No response from agent',
