@@ -1,6 +1,7 @@
 import z from 'zod/v4'
 
 import { toolResultOutputSchema } from './messages/content-part'
+import { MemoryReuseReceiptV1Schema } from './memory-v2'
 
 export const printModeStartSchema = z.object({
   type: z.literal('start'),
@@ -207,10 +208,29 @@ export const printModeContextWindowSchema = z.object({
   max: z.number(),
   compactionTriggerTokens: z.number().optional(),
   compactionTargetTokens: z.number().optional(),
+  // ADDITIVE, optional: tokens the deterministic tool-result evictor freed in
+  // THIS iteration. Carried here (not only on the compaction events) because
+  // eviction usually prevents an LLM pass entirely — the context_window
+  // emission is then the ONLY event that iteration produces. Absent on events
+  // emitted before the field existed and whenever the evictor ran as a no-op.
+  evictedTokens: z.number().optional(),
 })
 export type PrintModeContextWindow = z.infer<
   typeof printModeContextWindowSchema
 >
+
+/**
+ * Per-turn memory reuse receipt on the public handleEvent surface. ADDITIVE,
+ * non-breaking: a NEW member of printModeEventSchema. Unknown-type-safe for
+ * older consumers (the SDK default handler only branches on 'error'; the CLI
+ * match chain has a catch-all .otherwise). Carried on the live turn stream
+ * only; never persisted to the memory-v2 event store.
+ */
+export const printModeMemoryReuseSchema = z.object({
+  type: z.literal('memory_reuse'),
+  receipt: MemoryReuseReceiptV1Schema,
+})
+export type PrintModeMemoryReuse = z.infer<typeof printModeMemoryReuseSchema>
 
 const contextCategoryStatsSchema = z.object({
   tokens: z.number(),
@@ -277,6 +297,12 @@ export const printModeContextCompactionSchema = z.object({
   // whether the escalation pass had to drop extra optional messages.
   compactionCount: z.number().optional(),
   consecutiveNoProgressCompactions: z.number().optional(),
+  // ADDITIVE, optional: tokens/messages freed by the deterministic tool-result
+  // evictor during the iteration that produced this result, so a consumer can
+  // distinguish the free reclaim from the LLM pass's own. Absent on events
+  // emitted before eviction existed or when the evictor ran as a no-op.
+  evictedTokens: z.number().optional(),
+  evictedCount: z.number().optional(),
   shortfallTokens: z.number().optional(),
   fitsBudget: z.boolean().optional(),
   escalated: z.boolean().optional(),
@@ -332,13 +358,26 @@ export type PrintModeContextCompaction = z.infer<
  *     template instead gets an equivalent runtime-driven pass, and both
  *     announce through this event. A consumer must therefore expect `started`
  *     from prompt-only agents too.
- *   - It IS suppressed for an iteration where the transient loop-owned
- *     anti-thrash advisory is active (`suppressSemanticCompaction` on the
- *     agent state, set after consecutive passes reclaimed no context space in
- *     the current turn and reset at loop entry). A suppressed iteration runs
- *     no pass and emits NEITHER half of the pair — it is not reported as a
- *     `started`/`settled` no-op — so a consumer must not infer "the trigger
- *     was never exceeded" from the absence of an event.
+ *   - It IS suppressed for an iteration the loop's token-state governor
+ *     denies (cooldown, rearm-pending, or the per-turn pass cap), and for an
+ *     iteration where the transient loop-owned anti-thrash advisory
+ *     (`suppressSemanticCompaction` on the agent state) is active. The
+ *     advisory keeps its documented streak-based contract: it is set once
+ *     two consecutive semantic passes in the turn reclaim no context space
+ *     — which also spends the turn's remaining pass budget in the governor
+ *     — cleared by a productive pass, and reset to `undefined` at loop
+ *     entry. An over-trigger iteration the governor denies is additionally
+ *     mirrored into the advisory so the generator-driven inline spawn path
+ *     honors the same pacing; below the trigger the advisory is not touched.
+ *     The mirror is per-iteration and never sticky: it recomputes the field
+ *     from the current governor decision and the streak state, so the
+ *     documented clearing paths — a productive pass, and a second announced
+ *     pass after the governor re-arms — stay reachable for the inline spawn
+ *     path.
+ *     A suppressed iteration runs no pass and emits
+ *     NEITHER half of the pair — it is not reported as a `started`/`settled`
+ *     no-op — so a consumer must not infer "the trigger was never exceeded"
+ *     from the absence of an event.
  *   - It is deliberately NOT gated on an explicit `maxContextLength` override,
  *     so an overridden run does not emit a `started` on every step.
  *   - For the runtime-driven (prompt-only) pass, the ordinary spawn-permission
@@ -398,6 +437,11 @@ export const printModeContextCompactionStatusSchema = z.object({
   resolvedContextWindowTokens: z.number().optional(),
   triggerBudgetTokens: z.number().optional(),
   targetBudgetTokens: z.number().optional(),
+  // ADDITIVE, optional: tokens freed by the deterministic tool-result evictor
+  // in the same iteration the pass was announced, so consumers can show that
+  // part of the reclaim was free. Absent on events emitted before eviction
+  // existed and whenever the evictor ran as a no-op.
+  evictedTokens: z.number().optional(),
 })
 export type PrintModeContextCompactionStatus = z.infer<
   typeof printModeContextCompactionStatusSchema
@@ -596,6 +640,7 @@ export const printModeEventSchema = z.discriminatedUnion('type', [
   printModeContextCompactionStatusSchema,
   printModeContextRequestTrimSchema,
   printModeContextWindowSchema,
+  printModeMemoryReuseSchema,
   printModeJobUpdateSchema,
   printModeReasoningDeltaSchema,
 ])

@@ -35,12 +35,14 @@ the exact rules):
 Any config file may delegate to a directory of fragments via `extends`,
 `include`, or `includes` (or an implicit `openbuff.d/` directory sitting
 next to the file). A fragment directory is read alphabetically; each `*.json`
-file inside is merged in order before the parent file. This repo uses this
-pattern:
+file inside is merged in order before the parent file. This repo ships a
+copyable example of this pattern (`openbuff.json.example` plus
+`openbuff.d.example/`); copy them to `openbuff.json` and `openbuff.d/` to
+adopt it:
 
 ```
-openbuff.json              # root (minimal / pointer)
-openbuff.d/
+openbuff.json.example      # root (minimal / pointer)
+openbuff.d.example/
   providers.json           # provider definitions
   routes.json              # defaultModel, modes, agents overrides
   indexing.json            # local index settings
@@ -220,9 +222,25 @@ removed. Declare capabilities explicitly:
 }
 ```
 
-This repo's `openbuff.d/providers.json` sets
+#### Output token ceiling
+
+`context.outputTokens` declares the model's per-response output token ceiling.
+It is forwarded to the provider as `maxOutputTokens` on agent streaming
+requests when the agent template does not declare its own `maxOutputTokens`.
+Precedence: agent template `maxOutputTokens` > per-model
+`modelCapabilities[modelId].context.outputTokens` >
+`defaultCapabilities.context.outputTokens` > provider default behavior.
+
+Without any of these, the provider's own default applies (the
+Anthropic-compatible path defaults to a small ~4k cap, which can truncate
+large tool-call payloads such as multi-edit transactions mid-JSON). Caveat:
+the `chatgpt-oauth` backend does not support `max_output_tokens`/`max_tokens`,
+so the ceiling is a no-op there.
+
+The shipped example `openbuff.d.example/providers.json` sets
 `defaultCapabilities.context.windowTokens: 500000` on every provider as a
-fallback baseline. A model that does not declare an explicit
+fallback baseline (copy `openbuff.d.example/` into your own `openbuff.d/`
+to adopt it). A model that does not declare an explicit
 `modelCapabilities[modelId].context.windowTokens` override therefore trims at
 ~450k tokens (500k − 10% reserve) rather than getting no trimming at all.
 Per-model overrides still win over the provider default — declare
@@ -233,7 +251,9 @@ legacy top-level `contextWindowTokens` field.)
 
 ### Indexing and retrieval
 
-The `indexing` config (loaded from `openbuff.d/indexing.json`) controls the
+The `indexing` config (see the shipped `openbuff.d.example/indexing.json`
+example, or an `indexing.json` fragment in your own `openbuff.d/`) controls
+the
 local repository index used by `query_index`. Lexical and graph metadata stay
 on the local machine. Semantic indexing is opt-in and sends a bounded sample of
 each eligible file (path, symbols, headings, concepts, and up to 4,000

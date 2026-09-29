@@ -71,6 +71,7 @@ export type { AgentDefinition } from '@codebuff/common/templates/initial-agents-
 export type { ToolName } from '@codebuff/common/tools/constants'
 export {
   codebuffFsToNodePromises,
+  inspectPersistedTaskMemoryV1,
   loadPersistedTaskMemory,
   pruneStaleTaskMemoryEvidence,
   reconcileTaskMemoryEvidence,
@@ -79,6 +80,7 @@ export {
 export type {
   TaskMemoryPruneOutcome,
   TaskMemoryStoreFs,
+  TaskMemoryV1Inspection,
   WorkspaceMoveRecord,
 } from './services/task-memory-store'
 // The persisted-record type closure the task-memory API above is typed with.
@@ -90,6 +92,43 @@ export type {
   TaskMemoryEvidenceV1,
   TaskMemoryV1,
 } from '@codebuff/common/types/task-memory'
+
+// Additive Memory V2 contracts. V1 remains exported above for compatibility.
+export * from '@codebuff/common/types/memory-v2'
+export {
+  classifyMemoryArtifactPath,
+  isMemoryArtifactPersistenceAllowed,
+  normalizeMemoryArtifactPath,
+} from '@codebuff/common/util/memory-artifact-policy'
+export type {
+  MemoryArtifactPathKind,
+  MemoryArtifactPolicyDecision,
+  MemoryGeneratedArtifactProvenance,
+  MemoryGeneratedDisposition,
+} from '@codebuff/common/util/memory-artifact-policy'
+export type * from './services/memory-v2/types'
+export { MemoryV2Coordinator } from './services/memory-v2/coordinator'
+export {
+  auditTaskMemoryV1Migration,
+  getV1MigrationIdentity,
+  importTaskMemoryV1,
+} from './services/memory-v2/v1-migration'
+export type {
+  V1MigrationAuditOutcome,
+  V1MigrationAuditReader,
+  V1MigrationOutcome,
+  V1MigrationSourceItemCounts,
+  V1MigrationWarningCode,
+} from './services/memory-v2/v1-migration'
+export { MemoryV2OperatorService } from './services/memory-v2/operator-service'
+export {
+  createMemoryEventDraft,
+  deriveMemoryEventId,
+  deriveMemorySessionId,
+  deriveObservationId,
+  deriveQueryId,
+  deriveTaskId,
+} from './services/memory-v2/event-factory'
 
 export type {
   ClientToolCall,

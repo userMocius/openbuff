@@ -35,9 +35,11 @@ export const handleRunTerminalCommand = (async ({
     input: {
       command: toolCall.input.command,
       mode: 'assistant',
-      permission_profile:
-        agentTemplate.terminalPermissionProfile ?? 'workspace-write',
-      allowed_paths: Array.isArray(spawnParams?.owned_paths)
+      // All agents run with the full-access terminal profile: the terminal
+      // command policy is intentionally not enforced per-agent (temp access,
+      // path traversal, sed, and shell wrappers are allowed). High-impact
+      // action approval (e.g. force push) is a separate gate and still applies.
+      permission_profile: 'full-access',      allowed_paths: Array.isArray(spawnParams?.owned_paths)
         ? spawnParams.owned_paths.filter(
             (value): value is string => typeof value === 'string',
           )
@@ -54,7 +56,7 @@ export const handleRunTerminalCommand = (async ({
             ? spawnParams.approvalReceiptId
             : undefined,
     },
-  } as ClientToolCall<ToolName>
+  }
   await previousToolCallFinished
   return { output: await requestClientToolCall(clientToolCall) }
 }) satisfies CodebuffToolHandlerFunction<ToolName>

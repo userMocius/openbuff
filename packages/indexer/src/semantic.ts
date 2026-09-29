@@ -36,7 +36,7 @@ export interface SemanticHit {
 }
 
 /** Bump when {@link fileEmbeddingText} changes in a vector-incompatible way. */
-export const FILE_EMBEDDING_TEXT_VERSION = '2'
+export const FILE_EMBEDDING_TEXT_VERSION = '3'
 
 /**
  * Stable cache identity for vectors produced by one embedding configuration.
@@ -76,15 +76,24 @@ export function cosineSimilarity(a: number[], b: number[]): number {
 
 /**
  * Compact natural-language-ish representation of a file for embedding: path,
- * symbols, headings, and concepts. Deliberately small so embedding is cheap and
- * stays within model input limits.
+ * symbols, headings, concepts, and chunk qualifiedNames. Deliberately small
+ * so embedding is cheap and stays within model input limits.
+ *
+ * Chunk-aware choice (P-B B4): the file graph is kept (no chunk node blowup);
+ * only the embedding text is chunk-aware, bounded to the first 20 chunk
+ * qualifiedNames so vocabulary stays bounded while method names gain recall.
  */
 export function fileEmbeddingText(file: IndexedFile): string {
+  const chunkNames = (file.chunks ?? [])
+    .slice(0, 20)
+    .map((c) => c.qualifiedName)
+    .join(' ')
   const parts = [
     file.path,
     file.symbols.slice(0, 40).join(' '),
     file.headings.slice(0, 20).join(' '),
     file.concepts.slice(0, 30).join(' '),
+    chunkNames,
     file.contentSample?.slice(0, 4_000),
   ]
   return parts.filter((p) => p && p.trim().length > 0).join('\n')
@@ -92,6 +101,16 @@ export function fileEmbeddingText(file: IndexedFile): string {
 
 export function fileEmbeddingHash(file: IndexedFile): string {
   return createHash('sha256').update(fileEmbeddingText(file)).digest('hex')
+}
+
+/**
+ * Out-of-band record of files whose embedding came back empty or invalid and
+ * were dropped from the vector set. Callers surface the count through status
+ * channels so semantic recall holes are visible instead of silent.
+ */
+export interface BuildFileVectorsDiagnostics {
+  skippedPaths: string[]
+  skippedCount: number
 }
 
 /** Embed every file (batched) into vectors. Errors propagate to the caller. */
@@ -104,6 +123,7 @@ export async function buildFileVectors(
     embeddingHash?: string
     vector: number[]
   }> = [],
+  diagnostics?: BuildFileVectorsDiagnostics,
 ): Promise<FileVector[]> {
   // The exact embedding input is the durable identity. Path is part of that
   // input, so renames correctly invalidate vectors instead of reusing a vector
@@ -127,15 +147,47 @@ export async function buildFileVectors(
     const embeddings = await embed(
       batch.map((entry) => fileEmbeddingText(entry.file)),
     )
+    // EmbedFn contract: one vector per input, order-preserving. A short or
+    // over-long batch is a provider bug, not a per-file gap — fail the batch
+    // loudly instead of silently leaving semantic recall holes that no
+    // diagnostic can see (reliability finding
+    // missing-batch-embeddings-dropped-silently).
+    if (!Array.isArray(embeddings) || embeddings.length !== batch.length) {
+      throw new Error(
+        `embedder returned ${Array.isArray(embeddings) ? embeddings.length : 'a non-array'} for a batch of ${batch.length}`,
+      )
+    }
+    // Dimension consistency within the batch: vectors from one model must
+    // share a dimension. A divergent vector is dropped (and recorded) rather
+    // than fed into cosine similarity, where it would silently score 0
+    // against every file.
+    let expectedDimension = 0
+    for (const vector of embeddings) {
+      if (Array.isArray(vector) && vector.length > 0) {
+        expectedDimension = vector.length
+        break
+      }
+    }
+    const skippedInBatch: string[] = []
     for (let j = 0; j < batch.length; j++) {
       const vector = embeddings[j]
-      if (vector && vector.length > 0) {
+      if (
+        Array.isArray(vector) &&
+        vector.length > 0 &&
+        (expectedDimension === 0 || vector.length === expectedDimension)
+      ) {
         vectors.push({
           path: batch[j].file.path,
           embeddingHash: batch[j].embeddingHash,
           vector,
         })
+      } else {
+        skippedInBatch.push(batch[j].file.path)
       }
+    }
+    if (skippedInBatch.length > 0 && diagnostics) {
+      diagnostics.skippedPaths.push(...skippedInBatch)
+      diagnostics.skippedCount += skippedInBatch.length
     }
   }
   return vectors

@@ -28,6 +28,7 @@ Common phase triggers and routing policies:
   Basher requires `params.command`. For compatibility, `spawn_agents` repairs an explicit string-valued top-level `command` into `params.command` and decodes the bounded provider serialization `command</arg_key><arg_value>...` when it occurs directly in Basher params, but it never treats prompt prose as executable input. A spawn whose required params are genuinely absent is published with a structured failure result so the parent can inspect the validation error and retry safely.
   Prefer short project-script commands (`bun path/to/script`) over `bun -e` / `node -e` probes — interpreter eval is high-impact harness `arbitrary-code` and needs approval in balanced mode. Do not put env dumps or multi-KB heredocs / live `$()` env probes in `params.command`; terminal policy still denies those even when the harness classifier is quiet. Keep complex logic in project files authored with edit tools, and use `bun run smoke:harness` as the durable local classifier/policy check.
 - `set_output` expects native object fields. Complete stringified JSON objects and exact JSON code-fence/comment wrappers are decoded for compatibility. Malformed or incomplete string data is never accepted as agent output; the call receives a recoverable tool result so the agent can retry without losing the structured-output contract.
+- **Embedder contract note (set_output moved out of `programmaticToolNames`):** structured-output agents — `researcher-web` first — now declare `set_output` in `toolNames` (model-facing) with an empty `programmaticToolNames` list, instead of intercepting it at the `handleSteps` generator boundary. A host or harness that introspected `programmaticToolNames` to decide whether to intercept `set_output` programmatically will now see an empty list and must stop intercepting: the model self-calls `set_output`, and the runtime applies the structured-output contract (validation, recoverable failures) at the model-call boundary. Embedders that relied on generator-level interception must move that interception to the model tool-call path or accept the model-driven behavior.
 - Native tool inputs use canonical provider schemas, while the shared compatibility parser repairs a bounded set of unambiguous model-generated shapes before validation. This includes singular/plural selectors (`path`/`paths`, `file`/`files`, `edit`/`edits`, `agent`/`agents`), single items for declared collection fields, and explicit camelCase/snake_case equivalents. Canonical fields win when both forms are present; truncated JSON, unknown aliases, and ambiguous shapes still fail validation.
 - `dependency-manager` — explicit dependency-mutation phase only. It receives structured manager/operation/package/workspace inputs, constructs one bounded ecosystem-native command, and supports npm/pnpm/Yarn/Bun, uv/Poetry/pip, Cargo, Go modules, .NET, Bundler, Composer, SwiftPM, Dart/Flutter Pub, Mix, Maven dependency resolution, and Gradle dependency inspection. It cannot run arbitrary shell or global installs, and a missing-package diagnostic alone is not authorization to spawn it.
 - `debugger` — repair phase after repeated validation failures, runtime failures, or unclear crash behavior.
@@ -38,9 +39,9 @@ Common phase triggers and routing policies:
 Cross-cutting orchestration policy:
 
 - Ask the user before destructive commands, public API/contract changes, dependency additions, schema/data migrations, release/publish/deploy actions, production-affecting scripts, or ambiguous product behavior.
-- Terminal execution is enforced by runtime permission profiles, not prompt text alone: `read-only`, the clone-scoped `librarian-read-only`, `workspace-write`, and explicit `full-access`. Background commands are request-owned unless `detach` is explicitly requested.
+- All agents now run terminal commands under the `full-access` permission profile: the runtime resolves every agent to `full-access` in `packages/agent-runtime/src/tools/handlers/tool/run-terminal-command.ts`, so the per-agent profile gates (`read-only`, the clone-scoped `librarian-read-only`, `workspace-write`, etc.) are not enforced for bundled agents. The profile catalog still exists in the SDK policy helper (`evaluateTerminalCommandPolicy`) for host use. Background commands are request-owned unless `detach` is explicitly requested.
 - Browser-use defaults to `params.interactionPolicy: "read-only"`. Clicks, typing, uploads, evaluation, and other browser-state mutations require `allow-interactions`; each run receives an isolated browser session that is closed with the owning SDK run.
-- `base2-plan` can spawn `basher`, `browser-use`, `debugger`, and `general-agent` for deep analysis. Plan-only authority propagates through descendants: terminal-capable children are clamped to the read-only terminal profile and browser interactions remain denied even if a child requests `allow-interactions`. Mutation agents and direct edit/terminal tools remain unavailable. The spawn batch limit (`MAX_SPAWN_BATCH_SIZE`, currently 12) is a concurrency bound; planners may launch additional joined waves until coverage is complete and can poll/cancel detached analysis with `check_background_agent`.
+- `base2-plan` can spawn `basher`, `browser-use`, `debugger`, and `general-agent` for deep analysis. Plan-only authority propagates through descendants: terminal-capable children are clamped to the read-only terminal profile (this plan-only terminal attenuation is currently superseded by the global full-access override — the runtime resolves all agents to `full-access` — so it no longer takes effect in the bundled runtime) and browser interactions remain denied even if a child requests `allow-interactions`. Mutation agents and direct edit/terminal tools remain unavailable. The spawn batch limit (`MAX_SPAWN_BATCH_SIZE`, currently 12) is a concurrency bound; planners may launch additional joined waves until coverage is complete and can poll/cancel detached analysis with `check_background_agent`.
 - Prefer dedicated tools over shell fallbacks: `git_status` for repo state, file/read/search tools for inspection, `read_image` for images, deterministic edit tools for edits, configured hooks for validation, and browser/CLI visual agents for smoke checks.
 - Maintain durable plan artifacts in EXECUTE_PLAN at phase boundaries, blockers, validation/review results, and finalization.
 - Parallelism is allowed for independent discovery shards, independent validation commands, and static review that does not depend on validation output. Dependent edits, fragile debug loops, and validation-repair cycles stay sequential.
@@ -57,9 +58,9 @@ Runtime agent restrictions keep real security boundaries while removing over-str
 - Project-path containment for reads/writes/spawned work
 - `cap.v3` HMAC signing with project/path/run scope binding
 - `replace_range` authority chain (authenticated capability, not prose hashes)
-- Plan-only terminal attenuation (descendants stay on the read-only terminal profile)
+- Plan-only terminal attenuation (descendants stay on the read-only terminal profile) — currently overridden by the global full-access terminal profile, so it is no longer effective in the bundled runtime
+- Privilege-escalation, system-package, and env-dump bans (these apply to the non-full-access policy profiles, still enforced for SDK hosts and the high-impact approval gate, not to bundled agents now on full-access)
 - Force/delete/default-branch push gating
-- Privilege-escalation, system-package, and env-dump bans
 - Large-file scoped `basedOnRead` hard-fail when the anchor is required and invalid
 - `str_replace` circuit-breaker non-draining success (limit 5)
 
@@ -106,14 +107,14 @@ diagnostics (`file`, range, severity, code, message, command, source) while the
 original bounded stdout/stderr remains available for recovery.
 
 - Automated security/test/doc auxiliary agents have explicit lifecycle handling. Their done flags are written only after successful completion; crashes and blocking security verdicts persist as blockers. Test/doc writers run automatically only when the user request explicitly includes those deliverables, and mixed-package test targets are routed to package-specific commands.
-- Productive agent steps, subagent duration, file mutations, configured file-change hooks, and terminal commands are all unbounded in wall-clock time by default. The remaining safeguards are user cancellation, the repeated-step no-progress watchdog, cost/token budgets, spawn-depth limits, and context compaction; observational poll bounds (`check_job`, `check_background_agent`) and network/lock timeouts are unchanged. Reviewer crashes retry once; repeated crashes require the explicit user phrase `bypass reviewer gate` before finalization can continue.
+- Productive agent steps, subagent duration, file mutations, configured file-change hooks, and terminal commands are all unbounded in wall-clock time by default. The remaining safeguards are user cancellation, cost/token budgets, spawn-depth limits, and context compaction; observational poll bounds (`check_job`, `check_background_agent`) and network/lock timeouts are unchanged. Gate repair and reviewer/specialist no-verdict retries are unlimited by default (finite caps only via `OPENBUFF_MAX_*` env or `createBase2` options); reviewer crashes retry once, and repeated no-verdict outputs keep re-prompting the reviewer instead of parking. Repeated reviewer crashes require the explicit user phrase `bypass reviewer gate` before finalization can continue.
 - Root-orchestrator mutating/control gate operations such as Git-status observation, file-change hooks, and structural inventory are model-hidden programmatic tools. Their results are injected when needed after edits, so the harness remains active without paying for those schemas on every provider request. The orchestrator must **not** treat basher typechecks or `run_targeted_validation` as gate substitutes — only the runtime-owned hooks→reviewer cycle clears the gate. The read-only `get_change_review_bundle` tool remains model-visible so an orchestrator can refresh a stale reviewer snapshot after compaction. Fresh greetings and simple gratitude prompts take a narrow conversational fast path only when no pending work or reviewer blocker exists.
 
 **Pattern-specific agents** are intentionally **excluded** from `spawnableAgents` because they have a narrow contract that only makes sense within a specific workflow pattern. They are spawned by the pattern flow itself, not by the orchestrator:
 
 - **`synthesizer`** — the "reduce" half of the [`audit-codebase`](../agents/patterns/audit-codebase.md) map-reduce pattern. It reads ONLY finding files from a scratchpad directory (`.agents/sessions/<slug>/findings/*.md`) and produces a single cross-cutting audit report. It never reads raw source, has `includeMessageHistory: false`, and uses `outputMode: 'structured_output'`. Spawning it outside the audit pattern would be a misuse: it lacks source-reading tools (no `code_search`, `read_outline`, `query_index`, etc.) and its prompt is scoped to a findings directory, so it cannot perform general review or analysis tasks. The `audit-codebase` pattern spawns it directly in Step 4 (Synthesize) after all shard auditors have written their findings to disk.
 
-The distinction matters because adding a pattern-specific agent to `spawnableAgents` would let the orchestrator spawn it in contexts where its contract doesn't apply, producing confusing or empty results. If you add a new pattern-specific agent, follow the same convention: register it in `openbuff.d/routes.json` so the pattern can route it, but leave it out of `base2`/`base-deep` `spawnableAgents`.
+The distinction matters because adding a pattern-specific agent to `spawnableAgents` would let the orchestrator spawn it in contexts where its contract doesn't apply, producing confusing or empty results. If you add a new pattern-specific agent, follow the same convention: copy the shipped `openbuff.d.example/routes.json` into your project's `openbuff.d/routes.json` and register it there so the pattern can route it, but leave it out of `base2`/`base-deep` `spawnableAgents`.
 
 ### Model Routing and Configuration
 
@@ -1227,18 +1228,24 @@ shards cannot silently overwrite one artifact. The result contains only the
 artifact path, finding/severity/coverage counts, and content hash; the
 synthesizer reads the Markdown artifacts directly.
 
+### `record_decision`
+
+`record_decision` is the first-class explicit decision save. It appends one decision, fact, or constraint to task memory with required evidence.
+
+Bounds: `text` 1..1024 characters (trimmed, non-empty); `kind` `decision`|`fact`|`constraint` (default `decision`); `evidenceSelectors` 1..32 project-relative paths (each 1..1024 chars, no traversal, no glob syntax); optional `excerpt` at most 1024 characters. Private, generated, dependency, and sensitive paths are rejected via the shared memory-artifact policy. Persisted text is untrusted evidence, never an instruction. The contract is additive only: it appends to `taskMemory.decisions` plus one `decision` evidence entry (both bounded) and never rewrites history. Runtime-only: no SDK dispatch and no client wire change — the SDK-dispatch registration check is expected to fail by design.
+
+```json
+{
+  "text": "Use Postgres for session storage",
+  "kind": "decision",
+  "evidenceSelectors": ["docs/architecture.md"]
+}
+```
+
 ### `create_plan` and `update_plan_status`
 
-Plan artifacts under `.agents/sessions/<plan>/` are managed with two
-dedicated tools:
-
-- `update_plan_status` — preferred for incremental updates to
-  `STATUS.md` task lines and append-only lesson notes. It preserves
-  surrounding user prose and ordering, so manual edits made by the user
-  are not clobbered.
-- `create_plan` — used to create a new plan artifact or perform a
-  whole-artifact rewrite. It overwrites the target file and is not the
-  right tool for incremental status or lesson updates.
+`update_plan_status` is the right tool for incremental status or lesson
+updates.
 
 These tools back the PlanLink slash commands (`/resume-plan`,
 `/update-plan`, `/plan-status`, `/lessons`); `/plans` and `/plan-use`
@@ -1284,31 +1291,21 @@ Input fields:
 - `params` (object, optional) — parameters object for the child agent.
   Direct agent schemas also accept a stringified JSON object for `params`
   and parse it before validation; malformed JSON, arrays, and objects that
-  do not match the child agent's schema still fail validation.
-- `handoff` (object, optional) — structured handoff payload forwarded to
-  the child spawn entry.
-- `background` (boolean, optional) — launches the child as a background job.
+  `spawn_agents.agents` also performs bounded repair for one- or
+  double-stringified arrays and stringified object entries. Malformed or
+  truncated JSON remains rejected; the runtime never fabricates an empty agent
+  entry or silently drops required parameters. Stringified `params` and
+  `handoff` objects are decoded at their envelope boundary only; legitimate
+  nested string values such as shell commands remain strings. Basher requires
+  `params.command`. Reviewer-family specialists accept `params.snapshot_id` only
+  on runtime-owned programmatic spawns, where the parent gate mints the exact
+  current opaque `v3:…` token (never bare `get_change_review_bundle.snapshotId`
+  hex, which is evidence-only); manual/advisory prompt-authored spawns must omit
+  `params.snapshot_id` entirely — put the scoped file list in `params.files` and
+  the review question in the prompt. Only `security-reviewer` accepts
+  `params.snapshot_fingerprint` (with `params.changed_files`), and manual spawns
+  omit that key too.
 
-`spawn_agents.agents` also performs bounded repair for one- or
-double-stringified arrays and stringified object entries. Malformed or
-truncated JSON remains rejected; the runtime never fabricates an empty agent
-entry or silently drops required parameters. Stringified `params` and
-`handoff` objects are decoded at their envelope boundary only; legitimate
-nested string values such as shell commands remain strings. Basher requires
-`params.command`, and snapshot-scoped reviewers require the exact current
-gate-owned `v3:…` `params.snapshot_id` / `snapshot_fingerprint` from the parent
-gate (not bare `get_change_review_bundle.snapshotId` hex, which is evidence-only).
-
-Example:
-
-```json
-{
-  "prompt": "Run pwd",
-  "params": { "command": "pwd" }
-}
-```
-
-Equivalent tolerated form when a provider serializes nested params as a
 string:
 
 ```json
@@ -1540,7 +1537,7 @@ replay, so both directions are stated explicitly:
   its completed-pass branch for an unknown `status`. A `'declined'` block —
   whose result fields are the zeroed placeholders of a pass that never reported
   one — therefore renders there as a completed pass claiming `→ 0 tokens
-  (−0%)`, and `subagent`/`trimSource` are dropped, so a nested or request-time
+(−0%)`, and `subagent`/`trimSource` are dropped, so a nested or request-time
   trim is presented as a root-level runtime pass. That mis-rendering is
   cosmetic and confined to the transcript card: no persisted field is
   reinterpreted, nothing fails to parse, and the session still loads. Consumers
@@ -1585,24 +1582,82 @@ Live compaction state is reported by a separate additive
 carries `state: 'started' | 'settled'`, the required agent/run correlation
 `runId` and `ancestorRunIds` (plus an optional `agentId`), and optional
 `contextTokens`, `resolvedContextWindowTokens`, `triggerBudgetTokens`, and
-`targetBudgetTokens`. `packages/agent-runtime/src/run-agent-step.ts` emits
+`targetBudgetTokens`, and `evictedTokens`. `packages/agent-runtime/src/run-agent-step.ts` emits
 `started` immediately before the programmatic step whenever the window-derived
-semantic trigger is exceeded, whether or not the agent has a `handleSteps`
+semantic trigger is exceeded AND the run's loop-local token-state compaction
+governor allows the pass — a pacing state machine (armed → cooldown →
+rearm-pending, with a per-turn pass cap and an emergency override at the
+provider-safe limit) that bounds how often the expensive full-transcript pruner
+pass may run per turn — whether or not the agent has a `handleSteps`
 generator: an orchestrator's generator spawns the pruner itself, while a
 prompt-only template gets a runtime-driven pass
 (`packages/agent-runtime/src/util/runtime-semantic-compaction.ts`). Two
 additional gates apply, and both suppress the announcement as well as the pass:
-the transient loop-owned anti-thrash advisory (`suppressSemanticCompaction`,
-set after consecutive passes reclaim no space and reset at loop entry), and — for
-the runtime-driven pass only — the ordinary spawn-permission contract, so a
+a governor-denied iteration, and the transient loop-owned anti-thrash advisory
+(`suppressSemanticCompaction`, set after consecutive passes reclaim no space
+and reset at loop entry). For
+the runtime-driven pass the ordinary spawn-permission contract also applies, so a
 prompt-only template that does not declare `context-pruner` in its
 `spawnableAgents` announces a pass that then declines to spawn. Emission is
-deliberately not gated on an explicit `maxContextLength` override.
+deliberately not gated on an explicit `maxContextLength` override. Before the
+governor is even consulted, a deterministic zero-cost tool-result evictor
+(`packages/agent-runtime/src/util/tool-result-eviction.ts`) replaces stale
+tool-result bodies with tombstones whenever context exceeds the eviction floor
+(55% of the window) — and it is importance-aware: paths recorded in task
+memory (evidence, inspected files, edits) mark tool results that cite them as
+protected, so the evictor cannot strip the context behind a recorded decision.
+The tokens it frees are reported as `evictedTokens` and frequently pull
+context below the semantic trigger so no LLM pass is needed.
 `settled` is emitted after both compaction branches whenever a `started` was
 emitted, and again on the run's exit path when a step throws or is cancelled
 before reaching them, so a pass that decides not to compact cannot leave a
 pending state on screen. As with `job_update`, consumers should treat unknown
 event variants as no-ops; no consumer migration is required.
+
+Compaction also carries a recall leg so its information loss stays
+recoverable. Before a semantic pass or mechanical trim rewrites history, the
+runtime archives the pre-compaction transcript onto the new optional
+`AgentState.compactionArchive`
+(`packages/agent-runtime/src/util/context-archive.ts`, capped at 8 snapshots
+of 200 messages with 4k-char per-message truncation; plain JSON, so sessions
+persisted before the field existed parse without it). The registered
+`recall_context` tool (granted to base2 CORE) searches those archived tool
+bodies with bounded case-insensitive AND-match snippets and returns
+provenance, so pre-compaction content is always marked stale-until-verified;
+the archive itself never enters the model context. Eviction is deliberately
+NOT archived: tombstones already instruct a re-run, and a fresh read of live
+files is more faithful than a stale body. After a semantic pass, the runtime
+verifies the extraction
+(`packages/agent-runtime/src/util/compaction-verification.ts`): expected facts
+(paths read or written, truncated commands) are derived from the
+PRE-compaction transcript and checked against the post-compaction history and
+task memory, and gaps are named in the `context_compaction` event's
+`recovery` guidance so the user sees what was lost and how to recover it
+(`recall_context` or a re-read). Deterministic fidelity scoring lives in
+`evals/compaction-fidelity/scenario.test.ts` (F1–F4, no LLM calls).
+
+An OPTIONAL background consolidation leg (canary-gated OFF by default) adds
+bounded SUMMARIES on top of the verbatim archive: when a template sets
+`programmaticConfig.backgroundSnapshotConsolidation === true`, the runtime
+fires a fire-and-forget prompt-only LLM child
+(`packages/agent-runtime/src/util/context-consolidation-runner.ts`) after each
+compaction settle that summarizes up to 3 not-yet-consolidated archive
+snapshots (oldest first, char-budgeted newest-first prompt; identifiers,
+paths, commands, and numbers preserved verbatim by instruction). The summary
+is stored capped (8 × 6k chars) on the new optional
+`AgentState.contextConsolidations` (`common/src/types/context-consolidation.ts`)
+and is surfaced by `recall_context` as an additive `consolidations` section
+(OR-ranked, max 3 hits, with `sourceArchivedAts` staleness provenance) —
+omitted entirely when no consolidations exist, so the tool's output contract
+is unchanged for sessions that never enable the canary. The child has NO
+tools and NO transcript write-back: its only product is the summary string,
+it never delays the agent step (the trigger call is synchronous and cheap;
+the LLM run continues in the background), and its failure is logged and
+dropped — the verbatim archive remains the source of truth. Because the
+background child costs one small LLM call per consolidation run, the canary
+is OFF by default and a template must opt in explicitly; summaries are
+agent-stale-by-construction (they describe PRE-compaction content) and cite
+their snapshot provenance for exactly that reason.
 
 Because every `loopAgentSteps` invocation emits these events — the root turn,
 foreground subagents, and inline agents alike — the protocol is scoped by run
@@ -1736,7 +1791,9 @@ revision, so `commitTaskMemory` would reject the transcript replacement for
 exactly the spellings documented as equivalent. The same match also governs the transient
 `suppressSemanticCompaction` anti-thrash skip, which declines a pruner spawn —
 after its input is validated — for the rest of a turn whose consecutive
-semantic passes reclaimed no context space. Custom history editors must opt in
+semantic passes reclaimed no context space. The skip also applies on an
+over-trigger iteration the loop's compaction governor denies, so the
+generator-driven spawn path honors the same pacing. Custom history editors must opt in
 with both `messageHistoryMode: 'full'` and
 `propagateMessageHistoryChanges: true`.
 Ordinary inline children have independent system prompts, tools, and
@@ -1918,7 +1975,7 @@ purpose:
 | Project scaffold   | `init` (implicit)                                                                                   |
 | Provider account   | `connect` (`chatgpt`, `connect:chatgpt`) — only present when `CHATGPT_OAUTH_ENABLED` is `true`      |
 | Edit history       | `undo`, `redo`                                                                                      |
-| Durable plans      | `interview`, `resume-plan` (`rp`), `update-plan` (`up`), `plan-status` (`ps`), `lessons` (`lesson`) |
+| Durable plans      | `interview`, `resume-plan` (`rp`), `update-plan` (`up`), `plan-status` (`ps`), `lessons` (`lesson`), `plans` (`plan-ls`), `plan-use` (`plan-active`, `use-plan`) |
 | Code review        | `review`                                                                                            |
 | Conversation       | `new` (`n`, `clear`, `c`, `reset`, implicit), `history` (`chats`), `prompts` (`prompt-search`)      |
 | Agent shortcuts    | `agent:general` (inserts `@general-agent `)                                                         |

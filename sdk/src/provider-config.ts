@@ -12,6 +12,8 @@ import { getSystemProcessEnv } from './env'
 import type { FileChangeHook } from './tools/file-change-hooks'
 
 export const PROVIDER_CONFIG_ENV_VAR = 'OPENBUFF_PROVIDER_CONFIG'
+export const OPENBUFF_TRUST_ANCESTOR_CONFIG_ENV_VAR =
+  'OPENBUFF_TRUST_ANCESTOR_CONFIG'
 const PROVIDER_CONFIG_FILE_NAME = 'openbuff.json'
 const GLOBAL_PROVIDER_CONFIG_FILE_NAME = 'provider-config.json'
 
@@ -213,9 +215,9 @@ const openAICompatibleProviderSchema = z
     models: z.union([z.array(z.string().min(1)), modelMapSchema]),
     supportsStructuredOutputs: z.boolean().default(false),
     compatibility: providerCompatibilitySchema,
-    /** Default context window in tokens for all models in this provider. */
+    /** @deprecated Unused for capability resolution. Use defaultCapabilities.context.windowTokens instead. */
     contextWindowTokens: positiveIntSchema.optional(),
-    /** Per-model context window overrides (model id -> tokens). */
+    /** @deprecated Unused for capability resolution. Use modelCapabilities.<model>.context.windowTokens instead. */
     modelContextWindowTokens: z
       .record(z.string().min(1), positiveIntSchema)
       .optional(),
@@ -242,9 +244,9 @@ const chatGptOAuthProviderSchema = z.object({
   type: z.literal('chatgpt-oauth'),
   models: z.union([z.array(z.string().min(1)), modelMapSchema]),
   compatibility: providerCompatibilitySchema,
-  /** Default context window in tokens for all models in this provider. */
+  /** @deprecated Unused for capability resolution. Use defaultCapabilities.context.windowTokens instead. */
   contextWindowTokens: positiveIntSchema.optional(),
-  /** Per-model context window overrides (model id -> tokens). */
+  /** @deprecated Unused for capability resolution. Use modelCapabilities.<model>.context.windowTokens instead. */
   modelContextWindowTokens: z
     .record(z.string().min(1), positiveIntSchema)
     .optional(),
@@ -286,9 +288,9 @@ const anthropicProviderSchema = z
     apiKeyEnv: envVarNameSchema.optional(),
     models: z.union([z.array(z.string().min(1)), modelMapSchema]),
     compatibility: anthropicCompatibilitySchema,
-    /** Default context window in tokens for all models in this provider. */
+    /** @deprecated Unused for capability resolution. Use defaultCapabilities.context.windowTokens instead. */
     contextWindowTokens: positiveIntSchema.optional(),
-    /** Per-model context window overrides (model id -> tokens). */
+    /** @deprecated Unused for capability resolution. Use modelCapabilities.<model>.context.windowTokens instead. */
     modelContextWindowTokens: z
       .record(z.string().min(1), positiveIntSchema)
       .optional(),
@@ -314,7 +316,6 @@ const providerSchema = z.union([
   chatGptOAuthProviderSchema,
   anthropicProviderSchema,
 ])
-
 const DEFAULT_INDEXING_CONFIG = {
   enabled: true,
   cacheDir: '.codebuff-index',
@@ -375,6 +376,8 @@ const indexingConfigSchema = z
             heading: nonNegativeNumberSchema.optional(),
             concept: nonNegativeNumberSchema.optional(),
             import: nonNegativeNumberSchema.optional(),
+            /** Match against code chunk qualifiedName/kind (LexicalWeights.chunk). */
+            chunk: nonNegativeNumberSchema.optional(),
           })
           .optional(),
         graph: z
@@ -466,6 +469,8 @@ export const providerConfigFileSchema = z
           filePattern: z.string().min(1).optional(),
           /** Optional per-hook wall-clock bound in seconds. Omitted means no timeout. */
           timeoutSeconds: z.number().int().positive().max(3600).optional(),
+          /** Run the command once per matching changed file instead of project-wide (FileChangeHook.runPerFile). */
+          runPerFile: z.boolean().optional(),
         }),
       )
       .default([]),
@@ -1019,8 +1024,7 @@ export function getAncestorProviderConfigPaths(startDir: string): string[] {
   // root, which is always below home, so this bound preserves real use cases
   // while closing the unbounded-to-filesystem-root walk.
   const home = os.homedir()
-  const trustAncestorConfig =
-    (getSystemProcessEnv().OPENBUFF_TRUST_ANCESTOR_CONFIG ?? '') === '1'
+  const trustAncestorConfig = isAncestorTrustEnabled()
   const depthCeiling = trustAncestorConfig
     ? Number.MAX_SAFE_INTEGER
     : MAX_ANCESTOR_SCAN_DEPTH
@@ -1044,6 +1048,75 @@ export function getAncestorProviderConfigPaths(startDir: string): string[] {
   return paths
 }
 
+function isAncestorTrustEnabled(): boolean {
+  return (
+    (getSystemProcessEnv().OPENBUFF_TRUST_ANCESTOR_CONFIG ?? '') === '1'
+  )
+}
+
+/**
+ * Classify a provider config file path for the ancestor-config trust gate
+ * (M1-T3 credential-exfiltration vector). Trusted sources are the project
+ * (at/under `projectRoot`), the global openbuff config directory (user-owned,
+ * not repository-controlled), and the explicit OPENBUFF_PROVIDER_CONFIG
+ * override. Everything else — notably any ancestor directory ABOVE the
+ * project — is untrusted: an `openbuff.json` there can route API requests to
+ * attacker-controlled endpoints and exfiltrate env-var secrets via apiKeyEnv.
+ * Exported for tests; containment uses resolved-prefix + path.sep so a sibling
+ * directory sharing the prefix (`<root>-evil`) is never trusted.
+ */
+export function isTrustedProviderConfigPath(
+  configPath: string,
+  options: { projectRoot: string; explicitConfigPath?: string },
+): boolean {
+  const resolved = path.resolve(configPath)
+  const trustedRoots: string[] = [path.resolve(options.projectRoot)]
+  trustedRoots.push(
+    ...getOpenbuffConfigDirs().map((configDir) => path.resolve(configDir)),
+  )
+  if (options.explicitConfigPath) {
+    trustedRoots.push(path.resolve(options.explicitConfigPath))
+  }
+  return trustedRoots.some(
+    (trustedRoot) =>
+      resolved === trustedRoot || resolved.startsWith(trustedRoot + path.sep),
+  )
+}
+
+/**
+ * Fail-closed strip for untrusted ancestor fragments (M1-T3): remove every
+ * provider that declares a truthy `apiKeyEnv` from the FRAGMENT's providers
+ * before it reaches mergeProviderConfigs. Only apiKeyEnv providers are
+ * removed — routes/models for trusted providers in the same fragment still
+ * merge — because a provider sourced from a config outside the project can
+ * route requests to attacker-controlled endpoints and exfiltrate the
+ * env-var secret. Returns the stripped provider ids and their env-var names
+ * for the diagnostic. Safe to mutate the fragment: readProviderConfigFile
+ * returns a freshly parsed result (its per-call cache is not shared across
+ * load invocations).
+ */
+function stripApiKeyEnvProvidersFromFragment(
+  fragment: ProviderConfigLoadResult,
+): { ids: string[]; envVarNames: string[] } {
+  const providers = fragment.config.providers
+  if (!providers) return { ids: [], envVarNames: [] }
+  const ids: string[] = []
+  const envVarNames: string[] = []
+  for (const [providerId, provider] of Object.entries(providers)) {
+    if (
+      provider &&
+      typeof provider === 'object' &&
+      'apiKeyEnv' in provider &&
+      provider.apiKeyEnv
+    ) {
+      delete providers[providerId]
+      ids.push(providerId)
+      envVarNames.push(String(provider.apiKeyEnv))
+    }
+  }
+  return { ids, envVarNames }
+}
+
 /**
  * Warn when a provider that sources its API key from an env var was loaded
  * from a config file outside the project root. An ancestor `openbuff.json`
@@ -1058,6 +1131,13 @@ function warnIfAncestorConfigHasApiKeyEnv(
   sourceFilePaths: string[],
   cwd: string,
 ): void {
+  // Honor this function's own advertised opt-out: with the trust flag set the
+  // user has explicitly acknowledged ancestor apiKeyEnv providers, so the
+  // warning must not fire. (It previously warned unconditionally even though
+  // its message pointed at this exact flag.)
+  if (isAncestorTrustEnabled()) {
+    return
+  }
   const projectRoot = path.resolve(cwd)
   const ancestorPaths = sourceFilePaths.filter((p) => {
     const resolved = path.resolve(p)
@@ -1192,19 +1272,18 @@ function collectProviderConfigDependencyPaths(
   return state.paths
 }
 
-/**
- * Build a cache key that changes whenever the set of resolved config paths,
- * expanded fragment paths/directories, any of their mtimes, or the explicit
- * env-var override changes. Missing files/directories contribute a sentinel so
- * that newly-created configs or openbuff.d fragments invalidate the cache.
- */
-function buildProviderConfigCacheKey(
+// NOTE: The resolved dependency-path LIST is deliberately re-collected on
+// every call instead of memoized. Memoizing it on configPaths identity alone
+// hides files added or removed inside a fragment directory (e.g. openbuff.d):
+// the new file's path is absent from the cached list, so its mtime never
+// reaches buildProviderConfigCacheKey, and the process would serve stale
+// provider config until restart. Per-call re-discovery is the previous, safe
+// behavior; the per-file mtime stats in buildProviderConfigCacheKey below are
+// the actual hot-path cost, and those stay cached via providerConfigCache.
+function resolveProviderConfigDependencyPaths(
   configPaths: string[],
   explicitConfigPath: string | undefined,
-): string {
-  const parts: string[] = explicitConfigPath
-    ? [`env=${explicitConfigPath}`]
-    : []
+): string[] {
   const dependencyPaths: string[] = []
   const seen = new Set<string>()
   for (const configPath of configPaths) {
@@ -1214,6 +1293,40 @@ function buildProviderConfigCacheKey(
       addProviderConfigDependencyPath(dependencyPaths, seen, dependencyPath)
     }
   }
+  // `explicitConfigPath` is already folded into configPaths by
+  // loadProviderConfigSync; keep the parameter so callers can pass the env
+  // override for diagnostics without changing the walk.
+  void explicitConfigPath
+  return dependencyPaths
+}
+
+/**
+ * Build a cache key that changes whenever the set of resolved config paths,
+ * expanded fragment paths/directories, any of their mtimes, the explicit
+ * env-var override, or the OPENBUFF_TRUST_ANCESTOR_CONFIG opt-in changes. Missing
+ * files/directories contribute a sentinel so
+ * that newly-created configs or openbuff.d fragments invalidate the cache.
+ */
+function buildProviderConfigCacheKey(
+  configPaths: string[],
+  explicitConfigPath: string | undefined,
+): string {
+  // The ancestor-trust opt-in changes whether apiKeyEnv providers are
+  // stripped from untrusted ancestor fragments, so it must be part of the
+  // key: otherwise toggling it mid-process serves a stale cached result and
+  // can bypass the fail-closed gate.
+  const parts: string[] = [
+    `trustAncestorConfig=${
+      getSystemProcessEnv().OPENBUFF_TRUST_ANCESTOR_CONFIG ?? ''
+    }`,
+  ]
+  if (explicitConfigPath) {
+    parts.push(`env=${explicitConfigPath}`)
+  }
+  const dependencyPaths = resolveProviderConfigDependencyPaths(
+    configPaths,
+    explicitConfigPath,
+  )
 
   for (const dependencyPath of dependencyPaths) {
     let mtime: string
@@ -1271,6 +1384,34 @@ export function loadProviderConfigSync(
 
     try {
       const parsedConfig = readProviderConfigFile(configPath)
+      // Fail-closed trust gate (M1-T3): an apiKeyEnv provider declared by a
+      // config outside the project (an ancestor directory above cwd) can
+      // route requests to attacker-controlled endpoints and exfiltrate
+      // env-var secrets. Strip such providers from the FRAGMENT before the
+      // merge (stripping after the merge could not attribute providers to
+      // files) unless the user opted in via OPENBUFF_TRUST_ANCESTOR_CONFIG=1.
+      // Project configs, global config-dir configs, and the explicit
+      // OPENBUFF_PROVIDER_CONFIG override are always trusted.
+      if (
+        !isTrustedProviderConfigPath(configPath, {
+          projectRoot: process.cwd(),
+          explicitConfigPath,
+        }) &&
+        !isAncestorTrustEnabled()
+      ) {
+        const stripped = stripApiKeyEnvProvidersFromFragment(parsedConfig)
+        if (stripped.ids.length > 0) {
+          diagnostics.push({
+            filePath: configPath,
+            message:
+              `apiKeyEnv provider(s) ${stripped.ids.join(', ')} ` +
+              `(apiKeyEnv: ${stripped.envVarNames.join(', ')}) ignored: ` +
+              `providers from configs outside the project can route requests ` +
+              `to untrusted endpoints and exfiltrate env-var secrets. ` +
+              `Set OPENBUFF_TRUST_ANCESTOR_CONFIG=1 to trust this config.`,
+          })
+        }
+      }
       config = mergeProviderConfigs(config, parsedConfig.config)
       sourceFilePaths.push(...parsedConfig.sourceFilePaths)
       sourceFiles = mergeSourceFiles(
@@ -1811,6 +1952,24 @@ export function resolveConfiguredProviderModel(params: {
   return undefined
 }
 
+/**
+ * One-time deprecation notice for legacy context-window fields. Emits at most
+ * once per process so hot paths (per-request context-window resolution) do not
+ * spam the console.
+ */
+let hasWarnedLegacyContextWindowFields = false
+function warnLegacyContextWindowFields(): void {
+  if (hasWarnedLegacyContextWindowFields) return
+  hasWarnedLegacyContextWindowFields = true
+  console.warn(
+    `[openbuff] Provider config uses the deprecated contextWindowTokens / ` +
+      `modelContextWindowTokens fields. They still resolve the context ` +
+      `window, but capability metadata should be declared via ` +
+      `defaultCapabilities.context.windowTokens and ` +
+      `modelCapabilities.<model>.context.windowTokens instead.`,
+  )
+}
+
 export function resolveContextWindowTokens(params: {
   agentId?: string
   model?: string
@@ -1831,12 +1990,35 @@ export function resolveContextWindowTokens(params: {
     return undefined
   }
 
-  return resolveModelCapabilities({
+  // Explicit capability metadata wins: modelCapabilities.context.windowTokens
+  // (per-model, then provider defaultCapabilities) is the single source of
+  // truth when configured.
+  const explicitTokens = resolveModelCapabilities({
     providerId: configuredProviderModel.providerId,
     model: effectiveModel,
     loadedConfig,
   }).context?.windowTokens
+  if (explicitTokens !== undefined) {
+    return explicitTokens
+  }
+
+  // Legacy mapping: configs written before defaultCapabilities/modelCapabilities
+  // declared context windows via the provider-level contextWindowTokens and
+  // per-model modelContextWindowTokens fields. Those fields are deprecated but
+  // still honored here (with a one-time warning) so existing configs do not
+  // silently lose context-window resolution.
+  const provider = configuredProviderModel.provider
+  const legacyModelOverride =
+    provider.modelContextWindowTokens?.[effectiveModel] ??
+    provider.modelContextWindowTokens?.[configuredProviderModel.providerModel]
+  const legacyTokens =
+    legacyModelOverride ?? provider.contextWindowTokens ?? undefined
+  if (legacyTokens !== undefined) {
+    warnLegacyContextWindowFields()
+  }
+  return legacyTokens
 }
+
 
 export type OpenbuffProviderPreset = {
   id: string
@@ -1846,19 +2028,64 @@ export type OpenbuffProviderPreset = {
   envHelp?: string
 }
 
-const OPENCODE_GO_MODELS = [
+const OPENCODE_GO_BASE_URL = 'https://opencode.ai/zen/go/v1'
+
+/**
+ * Models served via `.../go/v1/chat/completions` (OpenAI-compatible).
+ * Source: https://opencode.ai/docs/go/#endpoints
+ */
+export const OPENCODE_GO_CHAT_MODELS = [
+  'glm-5.3-flash',
+  'glm-5.3',
+  'glm-5.2',
   'glm-5.1',
   'glm-5',
+  'kimi-k3',
+  'kimi-k2.7-code',
   'kimi-k2.6',
   'kimi-k2.5',
+  'longcat-2.0',
   'mimo-v2.5-pro',
   'mimo-v2.5',
-  'qwen3.6-plus',
-  'qwen3.5-plus',
-  'minimax-m2.7',
-  'minimax-m2.5',
+  'deepseek-v4.1-flash',
   'deepseek-v4-pro',
   'deepseek-v4-flash',
+  'deepseek-v4-flash-vision-exp',
+  'hy4-preview',
+  'hy3',
+] as const
+
+/**
+ * Models served via `.../go/v1/messages` (Anthropic Messages API).
+ * Must be routed through an `anthropic-compatible` provider entry pointing
+ * at the same Go baseURL — the AI SDK posts `<baseURL>/messages`, which is
+ * exactly the Go messages endpoint.
+ * Source: https://opencode.ai/docs/go/#endpoints
+ */
+export const OPENCODE_GO_ANTHROPIC_MODELS = [
+  'minimax-m3',
+  'minimax-m2.7',
+  'minimax-m2.5',
+  'qwen3.8-max',
+  'qwen3.8-flash',
+  'qwen3.7-max',
+  'qwen3.7-plus',
+  'qwen3.6-plus',
+  'qwen3.5-plus',
+] as const
+
+/**
+ * Models served via `.../go/v1/responses` (OpenAI Responses API).
+ * Routed through the Chat Completions <-> Responses translator in
+ * `impl/opencode-go-responses-fetch.ts`, so they are routable like the
+ * chat and messages models above.
+ * Source: https://opencode.ai/docs/go/#endpoints
+ */
+export const OPENCODE_GO_RESPONSES_MODELS = [
+  'grok-4.6',
+  'gpt-5.6-luna',
+  'muse-spark-1.3-contributor',
+  'muse-spark-1.2-contributor',
 ] as const
 
 const OPENAI_API_MODELS = [
@@ -1892,7 +2119,7 @@ export const OPENBUFF_PROVIDER_PRESETS = {
       providers: {
         'opencode-go': {
           type: 'openai-compatible',
-          baseURL: 'https://opencode.ai/zen/go/v1',
+          baseURL: OPENCODE_GO_BASE_URL,
           apiKeyEnv: 'OPENCODE_GO_API_KEY',
           supportsStructuredOutputs: false,
           compatibility: {
@@ -1903,7 +2130,21 @@ export const OPENBUFF_PROVIDER_PRESETS = {
             supportsStopSequences: false,
             stripProviderMetadata: true,
           },
-          models: [...OPENCODE_GO_MODELS],
+          models: [...OPENCODE_GO_CHAT_MODELS, ...OPENCODE_GO_RESPONSES_MODELS],
+        },
+        'opencode-go-anthropic': {
+          type: 'anthropic-compatible',
+          baseURL: OPENCODE_GO_BASE_URL,
+          apiKeyEnv: 'OPENCODE_GO_API_KEY',
+          compatibility: {
+            stripCacheControl: false,
+            stringifyTextContent: false,
+            supportsTools: true,
+            supportsRequiredToolChoice: true,
+            supportsStopSequences: true,
+            stripProviderMetadata: false,
+          },
+          models: [...OPENCODE_GO_ANTHROPIC_MODELS],
         },
       },
     },
@@ -2358,6 +2599,7 @@ function writeJsonFilesTransaction(files: Map<string, unknown>): void {
       serialized: JSON.stringify(value, null, 2) + '\n',
       backupCreated: false,
       installed: false,
+      restoreFailed: false,
     }
   })
 
@@ -2389,6 +2631,9 @@ function writeJsonFilesTransaction(files: Map<string, unknown>): void {
           fs.renameSync(item.backupPath, item.filePath)
         }
       } catch (rollbackError) {
+        // The backup is now the only surviving copy of the original file.
+        // Mark it so the finally block preserves it instead of unlinking it.
+        item.restoreFailed = true
         rollbackErrors.push(
           `${item.filePath}: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`,
         )
@@ -2402,12 +2647,30 @@ function writeJsonFilesTransaction(files: Map<string, unknown>): void {
     )
   } finally {
     for (const item of staged) {
-      for (const cleanupPath of [item.tempPath, item.backupPath]) {
+      // Temp files are always safe to remove. Backup files must survive a
+      // failed rollback: they hold the only surviving copy of the original
+      // file, so deleting them here would be irreversible.
+      try {
+        if (fs.existsSync(item.tempPath)) fs.unlinkSync(item.tempPath)
+      } catch {
+        // Best-effort cleanup after commit or rollback.
+      }
+      if (item.restoreFailed) {
         try {
-          if (fs.existsSync(cleanupPath)) fs.unlinkSync(cleanupPath)
+          if (fs.existsSync(item.backupPath)) {
+            console.error(
+              `Failed to restore provider config from backup; preserving backup at ${item.backupPath}`,
+            )
+          }
         } catch {
-          // Best-effort cleanup after commit or rollback.
+          // Best-effort notification only; never mask the original failure.
         }
+        continue
+      }
+      try {
+        if (fs.existsSync(item.backupPath)) fs.unlinkSync(item.backupPath)
+      } catch {
+        // Best-effort cleanup after commit or rollback.
       }
     }
   }
@@ -2427,8 +2690,32 @@ function writeJsonFileAtomic(filePath: string, value: unknown): void {
     ) {
       throw error
     }
-    fs.unlinkSync(filePath)
-    fs.renameSync(tempPath, filePath)
+    // Never unlink the existing file before the replacement is safely in
+    // place: a crash (or a failed rename) in the unlink-then-rename window
+    // would leave the user's openbuff.json gone with no backup. Instead,
+    // move the old file to a unique backup path, rename the temp file into
+    // place, and only then delete the backup. If the swap fails, best-effort
+    // restore the backup to the target before propagating.
+    const backupPath = `${filePath}.bak.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+    fs.renameSync(filePath, backupPath)
+    try {
+      fs.renameSync(tempPath, filePath)
+    } catch (renameError) {
+      try {
+        fs.renameSync(backupPath, filePath)
+      } catch (restoreError) {
+        console.error(
+          'Failed to restore provider config from backup after failed rename:',
+          restoreError instanceof Error ? restoreError.message : String(restoreError),
+        )
+      }
+      throw renameError
+    }
+    try {
+      fs.unlinkSync(backupPath)
+    } catch {
+      // Best-effort cleanup; a leftover backup is harmless.
+    }
   }
 }
 

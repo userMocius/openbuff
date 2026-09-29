@@ -12,6 +12,7 @@ import { containsStructuralAuditReceipt } from '@codebuff/common/util/audit-rece
 import {
   agentHandoffSchema,
   agentReceiptSchema,
+  agentRoleSchema,
 } from '@codebuff/common/types/agent-handoff'
 import { rm } from 'node:fs/promises'
 
@@ -369,11 +370,16 @@ export function validateVersionedAgentHandoff(params: {
     }
     return
   }
-  if (
-    record.schemaVersion === undefined &&
-    params.agentType !== 'repair-editor'
-  ) {
-    return
+  // M2-T2 (fail closed): ANY provided handoff must be a complete v1 envelope.
+  // Unversioned/legacy objects used to be accepted silently here and then
+  // flowed into consumers that dereference `handoff.permissions` (a bare
+  // TypeError) and stamp raw taskId/role into agent receipts. The tool-input
+  // schemas still accept the legacy SHAPE so model calls fail HERE with an
+  // actionable message instead of opaque zod output or a TypeError.
+  if (record.schemaVersion === undefined) {
+    throw new Error(
+      `Invalid handoff for agent ${params.agentType}: handoffs must be complete schemaVersion 1 envelopes (taskId, role, objective, requirements, acceptanceCriteria, context, nonGoals, findings, permissions). Legacy unversioned handoff objects are not accepted; pass prompt/params instead.`,
+    )
   }
   if (
     record.schemaVersion !== 1 ||
@@ -458,8 +464,17 @@ export function deriveSpawnTemplateCapabilities(params: {
     : agentTemplate
   if (!handoff) return inheritedTemplate
 
-  const requestedTools = new Set(handoff.permissions.allowedTools)
   const staticTools = getEffectiveAgentToolNames(inheritedTemplate)
+  // M2-T2 empty-permission semantics: an empty `allowedTools` list means "no
+  // change" to the child's static tool set — the same convention as empty
+  // readablePaths/writablePaths (preserve static scope) — never a zero-tool
+  // child that burns a full spawn cycle and fails downstream. Only a
+  // non-empty list narrows (to requested ∩ static) or grants read-only tools.
+  const requestedTools = new Set(
+    handoff.permissions.allowedTools.length > 0
+      ? handoff.permissions.allowedTools
+      : staticTools,
+  )
   const grantableReadOnlyTools = new Set(HANDOFF_GRANTABLE_READ_ONLY_TOOLS)
   // A handoff may grant the closed allowlist of read-only discovery tools even
   // when they are absent from the child's static tool set. Any other requested
@@ -565,8 +580,17 @@ const HIGH_FIDELITY_STRING_FIELDS = new Set([
   'digest',
   'stdout',
   'stderr',
+  // Basher long-log verbatim pointers: the parent reads back via
+  // read_logs/read_files using these fields, so they must survive
+  // compaction verbatim (they are short identifiers, never truncated).
+  'fullLogPath',
+  'logFile',
+  'jobId',
 ])
 const PARENT_AGENT_OUTPUT_ARRAY_ITEMS = 48
+// extractedLines is control-plane: the basher 80-line extract must survive
+// (not clipped to the 48-item default). Overall output stays bounded by the
+// 256k PARENT_AGENT_OUTPUT_MAX_CHARS check with a truncation receipt.
 const CONTROL_PLANE_ARRAY_FIELDS = new Set([
   'reviewedFiles',
   'requirementCoverage',
@@ -578,6 +602,7 @@ const CONTROL_PLANE_ARRAY_FIELDS = new Set([
   'errors',
   'unresolved',
   'requestedValidation',
+  'extractedLines',
 ])
 
 function truncateReviewerText(value: unknown, maxChars: number): unknown {
@@ -697,6 +722,67 @@ function compactAgentOutputValue(
   return compacted
 }
 
+/**
+ * Locate the reviewer attestation core — schemaVersion, verdict,
+ * snapshotFingerprint, reviewedFiles, coverage — inside an arbitrarily nested
+ * child output, depth-first. Only a FULLY attestation-shaped review qualifies
+ * (a verdict string plus a snapshotFingerprint string or a reviewedFiles
+ * array), so a verdict-shaped quoted example without attestation payload never
+ * qualifies.
+ *
+ * WHY: the lossy fallback in boundAgentOutputForParent used to destroy these
+ * fields; the gate's walker then found zero structured entries and parked the
+ * run with "reviewer did not return the required structured snapshot
+ * attestation" despite a complete review. Preservation only — the gate's
+ * fingerprint/coverage checks are unchanged and still run on the entry the
+ * walker resolves.
+ */
+function extractReviewerAttestationCore(
+  value: unknown,
+  depth = 0,
+): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || depth > 8) return undefined
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const found = extractReviewerAttestationCore(entry, depth + 1)
+      if (found) return found
+    }
+    return undefined
+  }
+  const record = value as Record<string, unknown>
+  if (
+    typeof record.verdict === 'string' &&
+    (typeof record.snapshotFingerprint === 'string' ||
+      Array.isArray(record.reviewedFiles))
+  ) {
+    return {
+      ...(typeof record.schemaVersion === 'number'
+        ? { schemaVersion: record.schemaVersion }
+        : {}),
+      verdict: record.verdict,
+      ...(typeof record.snapshotFingerprint === 'string'
+        ? { snapshotFingerprint: record.snapshotFingerprint }
+        : {}),
+      ...(Array.isArray(record.reviewedFiles)
+        ? { reviewedFiles: record.reviewedFiles }
+        : {}),
+      ...(typeof record.coverage === 'string'
+        ? { coverage: record.coverage }
+        : {}),
+      ...(Array.isArray(record.findings) ? { findings: record.findings } : {}),
+    }
+  }
+  if (record.type === 'json' || record.type === 'structuredOutput') {
+    const found = extractReviewerAttestationCore(record.value, depth + 1)
+    if (found) return found
+  }
+  for (const nested of Object.values(record)) {
+    const found = extractReviewerAttestationCore(nested, depth + 1)
+    if (found) return found
+  }
+  return undefined
+}
+
 function summarizeNestedAgentOutput(value: unknown): unknown {
   const strings = new Map<string, string>()
   const artifacts = new Set<string>()
@@ -745,6 +831,10 @@ function summarizeNestedAgentOutput(value: unknown): unknown {
   return {
     type: 'truncatedNestedAgentOutput',
     truncated: true,
+    // Gate-crash fix: the depth-7 collapse must not swallow a complete
+    // reviewer attestation nested inside; re-locate it and hoist the core to
+    // the surface so the walker still resolves a shaped entry.
+    ...(extractReviewerAttestationCore(value) ?? {}),
     ...Object.fromEntries(strings),
     ...(artifacts.size > 0 ? { artifacts: [...artifacts].slice(0, 16) } : {}),
   }
@@ -769,6 +859,10 @@ function boundAgentOutputForParent(
           },
         }
       : rawCompacted
+  // Gate-crash fix: locate the reviewer attestation core ONCE so the lossy
+  // fallbacks below preserve it instead of destroying the only surviving
+  // structured verdict.
+  const attestationCore = extractReviewerAttestationCore(value)
   let serialized = ''
   try {
     serialized = JSON.stringify(compacted)
@@ -777,6 +871,7 @@ function boundAgentOutputForParent(
       type: 'agentReceipt',
       agentType,
       truncated: true,
+      ...(attestationCore ?? {}),
       summary: 'Agent output was not serializable.',
     }
   }
@@ -820,6 +915,12 @@ function boundAgentOutputForParent(
     type: 'agentReceipt',
     agentType,
     truncated: true,
+    // Preserve the reviewer attestation core (verdict, snapshotFingerprint,
+    // reviewedFiles, coverage) when the oversize fallback replaces the real
+    // payload: without it the gate's walker finds zero structured entries and
+    // parks the run on "did not return the required structured snapshot
+    // attestation" despite a complete review.
+    ...(attestationCore ?? {}),
     summary: `${serialized.slice(0, 48_000)}...[truncated child output]...${serialized.slice(-8_000)}`,
   }
 }
@@ -828,6 +929,22 @@ export function normalizeSpawnedAgentOutput(
   output: any,
   agentType?: string,
 ): any {
+  // M0-T3 output durability: a child that never called set_output must never
+  // surface as an undefined/null/empty value that the parent cannot
+  // distinguish from real (possibly compact) output. Emit an explicit partial
+  // marker with a diagnostic instead. Additive fields only — every existing
+  // return shape keeps its fields.
+  if (
+    output === undefined ||
+    output === null ||
+    (typeof output === 'string' && !output.trim())
+  ) {
+    return {
+      summary: '',
+      partial: true,
+      errorMessage: `${agentType ?? 'subagent'} ended without calling set_output`,
+    }
+  }
   if (
     output &&
     typeof output === 'object' &&
@@ -840,6 +957,10 @@ export function normalizeSpawnedAgentOutput(
         typeof message === 'string' && message.trim()
           ? message
           : 'Subagent failed before producing output',
+      // A run-level error means the run ended before the child produced its
+      // real result: mark it explicitly partial so the parent sees the
+      // failure mode without inferring it from a bare errorMessage.
+      partial: true,
     }
   }
   if (output && typeof output === 'object' && !Array.isArray(output)) {
@@ -1017,7 +1138,16 @@ export async function finalizeOwnedLibrarianClone(params: {
 }
 
 function inferAgentRole(agentType: string, handoff?: AgentHandoff): AgentRole {
-  if (handoff) return handoff.role
+  // Free-form handoffs may arrive loosely typed (cast through `any` at spawn
+  // boundaries); only trust handoff.role when it is a valid agentRoleSchema
+  // value, otherwise fall through to the agentType inference below instead of
+  // emitting a role that fails the strict receipt parse.
+  if (
+    handoff &&
+    agentRoleSchema.safeParse((handoff as { role?: unknown }).role).success
+  ) {
+    return handoff.role
+  }
   if (agentType === 'repair-editor') return 'repair-editor'
   if (agentType.includes('editor')) return 'editor'
   if (agentType === 'test-writer') return 'test-writer'
@@ -1334,7 +1464,28 @@ function buildReceiptContextUsage(
   }
 }
 
-export function buildRuntimeAgentReceipt(params: {
+/**
+ * Models/runtimes can emit explicitly-undefined keys inside structured output;
+ * agentReceiptSchema.parse rejects them, killing the inline spawn before its
+ * terminal receipt. JSON.stringify drops undefined keys identically, so
+ * stripping them here keeps the receipt build total without changing any
+ * serialized shape.
+ */
+function stripUndefinedValuedKeys(value: unknown, depth = 0): unknown {
+  if (depth > 8 || value === null || typeof value !== 'object') return value
+  if (Array.isArray(value))
+    return value.map((item) => stripUndefinedValuedKeys(item, depth + 1))
+  const out: Record<string, unknown> = Object.create(null)
+  for (const [key, nested] of Object.entries(
+    value as Record<string, unknown>,
+  )) {
+    if (nested === undefined) continue
+    out[key] = stripUndefinedValuedKeys(nested, depth + 1)
+  }
+  return out
+}
+
+function buildRuntimeAgentReceiptOrThrow(params: {
   agentType: string
   agentId: string
   handoff?: AgentHandoff
@@ -1359,12 +1510,8 @@ export function buildRuntimeAgentReceipt(params: {
     typeof shardId === 'string' &&
     shardId.trim().length > 0 &&
     trimmedSnapshotId.length > 0
-  // Credit the generator harvest from the harvest flag alone: the harvest
-  // never sets AgentState.consecutiveTextOnlyWithoutCompletion, and the
-  // step-cap early return never touches it either, so requiring that counter
-  // suppressed the retryable 'no task_completed' error on one exit path and not
-  // the other. Only a harvest that recovered REAL answer text may stand in for
-  // explicit completion: an answerless / step-capped run marks its output with
+  // Credit the generator harvest from the harvest flag alone. Only a harvest
+  // that recovered REAL answer text may stand in for explicit completion: an answerless / step-capped run marks its output with
   // noHarvestedAnswer, whose summary is just a placeholder, so it stays a
   // retryable partial the parent can re-spawn instead of completed with zero
   // errors.
@@ -1382,8 +1529,11 @@ export function buildRuntimeAgentReceipt(params: {
     !containsStructuralAuditReceipt(receiptSources, trimmedSnapshotId)
   const completionContractFailed =
     missingExplicitCompletion || missingAuditReceipt
+  const runtimeMutationToolMessages = extractRuntimeMutationToolMessages(
+    params.agentState?.messageHistory,
+  )
   const mutationAttestations = extractMutationAttestations(
-    extractRuntimeMutationToolMessages(params.agentState?.messageHistory),
+    runtimeMutationToolMessages,
   )
   const claimedChangedFiles = extractReceiptStringArray(
     params.output,
@@ -1411,6 +1561,16 @@ export function buildRuntimeAgentReceipt(params: {
       ? [
           {
             message: `Child output claimed changed files without mutation receipts: ${overclaimedPaths.join(', ')}.`,
+            retryable: false,
+          },
+        ]
+      : []),
+    ...(overclaimedPaths.length > 0 &&
+    mutationAttestations.length === 0 &&
+    runtimeMutationToolMessages.length > 0
+      ? [
+          {
+            message: `${runtimeMutationToolMessages.length} edit_transaction tool result${runtimeMutationToolMessages.length === 1 ? '' : 's'} ${runtimeMutationToolMessages.length === 1 ? 'was' : 'were'} present but none yielded a parseable mutation receipt (evicted/truncated or callId-correlation mismatch); unbacked claimed paths: ${overclaimedPaths.join(', ')}.`,
             retryable: false,
           },
         ]
@@ -1460,17 +1620,17 @@ export function buildRuntimeAgentReceipt(params: {
     params.output,
     'findingsAddressed',
   )
-  const attestedFindingIds =
-    overclaimedPaths.length > 0
-      ? []
-      : params.handoff
-        ? claimedFindingIds.filter((id) => {
-            const finding = params.handoff?.findings.find(
-              (item) => item.id === id,
-            )
-            return !!finding?.files.some((path) => actualChangedPaths.has(path))
-          })
-        : claimedFindingIds
+  // Partial-overclaim credit: one unbacked changed-file claim must not wipe
+  // the credit of OTHER findings whose files ARE receipt-backed. A claimed
+  // finding id is credited iff the handoff finding exists AND its files
+  // intersect the receipt-backed path set (fail closed per finding).
+  // Handoff-less spawns keep passing claimedFindingIds through unchanged.
+  const attestedFindingIds = params.handoff
+    ? claimedFindingIds.filter((id) => {
+        const finding = params.handoff?.findings?.find((item) => item.id === id)
+        return !!finding?.files.some((path) => actualChangedPaths.has(path))
+      })
+    : claimedFindingIds
   // RF-2/RF-7/RF-11/RF-16: runtime-attested mutations are the completion
   // authority for editor-family agents. A stale blocked/null child output must
   // not hide applied work from the parent gate, while receipt errors still
@@ -1520,6 +1680,38 @@ export function buildRuntimeAgentReceipt(params: {
         }
     : normalizedOutput
   const contextUsage = buildReceiptContextUsage(params.agentState)
+  const reviewCore = extractReviewerAttestationCore(reconciledOutput)
+  // Attach the compact reviewer attestation core as the receipt's `review`
+  // field so the gate's walker can attest even when the bulky structured
+  // result payload was truncated in transit. Built explicitly (no spread) so
+  // extractReviewerAttestationCore's extra keys (schemaVersion, findings)
+  // never reach the strict review schema, and the verdict is filtered to the
+  // three schema-allowed values so a junk verdict is omitted instead of
+  // failing the parse. Omitted entirely when the child produced no review.
+  const reviewVerdict = reviewCore?.verdict
+  const reviewCoreRecord =
+    reviewVerdict === 'LOOKS_GOOD' ||
+    reviewVerdict === 'NON_BLOCKING' ||
+    reviewVerdict === 'BLOCKING'
+      ? {
+          verdict: reviewVerdict,
+          ...(typeof reviewCore?.snapshotFingerprint === 'string'
+            ? { snapshotFingerprint: reviewCore.snapshotFingerprint }
+            : {}),
+          ...(Array.isArray(reviewCore?.reviewedFiles)
+            ? {
+                reviewedFiles: reviewCore.reviewedFiles.filter(
+                  (file): file is string => typeof file === 'string',
+                ),
+              }
+            : {}),
+          ...(reviewCore?.coverage === 'covered' ||
+          reviewCore?.coverage === 'missing' ||
+          reviewCore?.coverage === 'n/a'
+            ? { coverage: reviewCore.coverage }
+            : {}),
+        }
+      : undefined
   const receipt = agentReceiptSchema.parse({
     schemaVersion: 1,
     receiptId: generateCompactId(),
@@ -1560,10 +1752,67 @@ export function buildRuntimeAgentReceipt(params: {
     ),
     artifacts: extractReceiptStringArray(receiptSources, 'artifacts'),
     errors,
-    output: reconciledOutput as any,
+    output: stripUndefinedValuedKeys(reconciledOutput) as any,
+    ...(reviewCoreRecord ? { review: reviewCoreRecord } : {}),
     ...(contextUsage ? { contextUsage } : {}),
   })
   return receipt
+}
+
+/**
+ * R2 total receipt build: the receipt build must NEVER throw. Previously a
+ * strict `agentReceiptSchema.parse` failure or a deref into a malformed
+ * handoff escaped the spawn handler and killed the entire agent run. Any
+ * failure in the core build now falls back to a minimal, field-complete,
+ * schema-valid failed receipt that preserves the original error message.
+ */
+export function buildRuntimeAgentReceipt(params: {
+  agentType: string
+  agentId: string
+  handoff?: AgentHandoff
+  spawnParams?: Record<string, unknown>
+  output: unknown
+  agentState?: AgentState
+  status?: AgentReceipt['status']
+  error?: unknown
+}): AgentReceipt {
+  try {
+    return buildRuntimeAgentReceiptOrThrow(params)
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    const rawTaskId = params.handoff?.taskId ?? `spawn-${params.agentId}`
+    const taskId =
+      typeof rawTaskId === 'string' && rawTaskId.trim().length > 0
+        ? rawTaskId
+        : 'unknown-task'
+    const agentId =
+      typeof params.agentId === 'string' && params.agentId.trim().length > 0
+        ? params.agentId
+        : 'unknown-agent'
+    return agentReceiptSchema.parse({
+      schemaVersion: 1,
+      receiptId: generateCompactId(),
+      taskId,
+      role: 'specialist',
+      agentId,
+      status: 'failed',
+      changedFiles: [],
+      requirementsAddressed: [],
+      acceptanceCriteriaAddressed: [],
+      findingsAddressed: [],
+      evidence: [],
+      assumptions: [],
+      unresolved: [],
+      requestedValidation: [],
+      artifacts: [],
+      errors: [
+        {
+          message: `Receipt build failed: ${detail}`,
+          retryable: false,
+        },
+      ],
+    })
+  }
 }
 
 export function reconcileAgentReceiptIntoParent(params: {
@@ -1809,31 +2058,40 @@ export function validateAgentInput(
         params && typeof params === 'object' && !Array.isArray(params)
           ? (params as Record<string, unknown>)
           : undefined
-      const rawSnapshotId =
-        typeof paramsRecord?.snapshot_id === 'string'
-          ? paramsRecord.snapshot_id.trim()
-          : ''
-      const isBareBundleHex = /^[a-f0-9]{64}$/i.test(rawSnapshotId)
-      const bareHexNote = isBareBundleHex
-        ? ` Received bare 64-hex bundle snapshotId "${rawSnapshotId.slice(0, 12)}…" (evidence-only, from get_change_review_bundle) — not gate attestation. Recompute the gate-owned v3 token via hashGateSnapshotDetails(pendingGateFiles) and pass that as params.snapshot_id.`
-        : ''
+      // Branch the recovery hint on whether the caller actually supplied a
+      // snapshot_id key, so exactly one directive is emitted per situation.
+      const snapshotIdSupplied = Object.hasOwn(
+        paramsRecord ?? {},
+        'snapshot_id',
+      )
       const recoveryHint =
         normalizedAgentType === 'basher' && issuePaths.has('command')
           ? '\n\nRecovery: spawn Basher with { "agent_type": "basher", "params": { "command": "<shell command>" } }. A command mentioned only in prompt prose is never executed.'
           : reviewerFamilyRequiredSnapshotIds.has(normalizedAgentType) &&
               issuePaths.has('snapshot_id')
-            ? `\n\nRecovery: set params.snapshot_id to the gate-assigned opaque v3:… token from the parent gate (hashGateSnapshotDetails(pendingGateFiles) / specialistCreditFingerprint), for example { "agent_type": "${normalizedAgentType}", "params": { "snapshot_id": "v3:<64-hex>" } }. Bare hex from get_change_review_bundle.snapshotId is evidence-only and will fail attestation; never invent or reuse a stale fingerprint.${bareHexNote}`
+            ? snapshotIdSupplied
+              ? `\n\nRecovery: the supplied params.snapshot_id is invalid — the gate-assigned opaque v3:… token is minted only for runtime-owned programmatic spawns, and no caller-side call can obtain or derive one. Bare hex from get_change_review_bundle.snapshotId is evidence-only and will fail attestation; never invent or reuse a stale fingerprint, and never use a truncated 16-char display prefix from gate blocks or telemetry. A manual spawn cannot supply a valid token: omit params.snapshot_id entirely — put the scoped file list in params.files and the review question in the prompt — and end the turn to wait for the runtime-owned gate. Only security-reviewer accepts params.snapshot_fingerprint; reviewer-family agents never do.`
+              : `\n\nRecovery: manual spawns omit \`params.snapshot_id\` entirely — put the scoped file list in \`params.files\` and the review question in the prompt. Post-edit reviewer-family spawns are runtime-owned: end the turn and wait for the gate instead of spawning manually. Only security-reviewer accepts \`params.snapshot_fingerprint\`; reviewer-family agents never do.`
             : normalizedAgentType === 'security-reviewer' &&
                 (issuePaths.has('snapshot_fingerprint') ||
                   Object.hasOwn(paramsRecord ?? {}, 'snapshot_id'))
-              ? '\n\nRecovery: replace params.snapshot_id with params.snapshot_fingerprint, or add params.snapshot_fingerprint when it is missing. Retain params.changed_files and preserve both canonical field names exactly.'
+              ? '\n\nRecovery: security-reviewer is the documented exception to the omit-for-manual contract — its schema still requires params.changed_files and params.snapshot_fingerprint on manual spawns too. Replace params.snapshot_id with params.snapshot_fingerprint, or add params.snapshot_fingerprint with the stable fingerprint value to echo exactly; the schema imposes no v3: pattern on that key, so no gate-owned token is needed. Retain params.changed_files and preserve both canonical field names exactly.'
               : normalizedAgentType === 'dependency-manager' &&
                   (issuePaths.has('manager') || issuePaths.has('operation'))
                 ? '\n\nRecovery: place both canonical keys in params, for example { "agent_type": "dependency-manager", "params": { "manager": "npm", "operation": "add" } }. manager must come from repository manifest/environment evidence. operation must be one of add, remove, sync, restore, or update. Do not infer dependency mutation authorization from a validation failure.'
                 : normalizedAgentType === 'librarian' &&
                     issuePaths.has('repoUrl')
                   ? '\n\nRecovery: set params.repoUrl to a GitHub URL, for example { "agent_type": "librarian", "params": { "repoUrl": "https://github.com/<owner>/<repo>" } }. params.repoUrl must have the form https://github.com/<owner>/<repo>; a URL only in prompt prose is not used.'
-                  : ''
+                  : normalizedAgentType === 'thinker'
+                    ? '\n\nRecovery: prompt is required for thinker — pass a self-contained decision packet in prompt (decision, confirmed evidence, constraints, options, risks, unknowns). params accepts only depth and outputSchemaHint; do not place files or commands in params.'
+                    : normalizedAgentType === 'general-agent'
+                      ? '\n\nRecovery: prompt is required for general-agent — pass a self-contained prompt plus params.filePaths/params.directoryPaths. Use filePaths/directoryPaths, not files/directories; preserve both canonical field names exactly.'
+                      : normalizedAgentType === 'architect' ||
+                          normalizedAgentType === 'docs-architect'
+                        ? '\n\nRecovery: spawn the architect/advisory specialist with the review question in prompt and the scoped file list in params.files. params.snapshot_id is optional — omit it on manual spawns; put the scoped file list in params.files and the review question in the prompt.'
+                        : normalizedAgentType === 'editor'
+                          ? '\n\nRecovery: spawn editor with a 5-section brief (Requirements, Target files, Constraints/non-goals, Patterns, Risks) or concrete prose naming the exact target path plus the implementation action. Do not rely on parent conversation history.'
+                          : ''
       const paramsContract = formatAgentParamsContract(inputSchema.params)
       throw new Error(
         `Invalid params for agent ${agentType}: ${formatValidationIssues({ issues: result.error.issues })}\n\nExact params contract (from the child agent schema): ${paramsContract}\nPreserve params field names exactly.${recoveryHint}\n\nOriginal params value:\n${formatValueForError(params ?? {})}`,
@@ -2087,9 +2345,9 @@ export async function executeSubagent(
   } catch (error) {
     // Any subagent failure (cancellation, budget exhaustion, thrown error) must
     // still emit a finish event so the UI never shows a subagent that started
-    // but never finished. Re-throw so the parent sees the error via
-    // Promise.allSettled.
+    // but never finished.
     failed = true
+    const errorMessage = error instanceof Error ? error.message : String(error)
     onResponseChunk({
       type: 'subagent_finish',
       agentId: withDefaults.agentState.agentId,
@@ -2101,9 +2359,43 @@ export async function executeSubagent(
       params: spawnParams,
       spawnToolCallId,
       spawnIndex,
-      error: error instanceof Error ? error.message : String(error),
+      error: errorMessage,
     })
-    throw error
+    // Only GENUINE parent/user cancellation must keep propagating so the run
+    // aborts. Gate this on the PARENT signal actually being aborted — never on
+    // error.name === 'AbortError'/'TimeoutError' alone. A child-internal abort
+    // (an aborted sub-operation, a timed-out provider fetch, or an abort
+    // raised while the settle tail processes a large set_output payload plus
+    // receipt reconciliation) surfaces as an AbortError while the parent
+    // signal is still live. The previous guard re-threw on the error NAME
+    // regardless of the parent signal, so a mutating child (editor /
+    // repair-editor) that had ALREADY committed its edits crashed the entire
+    // parent turn at receipt-delivery time with 'Error executing handleSteps
+    // for agent base2: The operation was aborted'. Reviewers rarely tripped it
+    // because they settle a tiny attestation object fast; the long mutating
+    // settle tail is what widened the window. When the parent signal is NOT
+    // aborted we degrade to the structured error output below instead of
+    // taking down the session.
+    const parentSignalAborted =
+      (withDefaults as { signal?: AbortSignal }).signal?.aborted === true
+    if (parentSignalAborted) {
+      throw error
+    }
+    // Degrade instead of throwing: a re-raised error previously propagated
+    // through Promise.allSettled as a rejected settlement and failed the whole
+    // parent turn — including the common case where the child had already
+    // committed its edits and only the final receipt delivery crashed. A
+    // structured error output keeps the failure visible to the parent (the
+    // spawned-output normalizer maps it to an explicit partial diagnostic;
+    // covered by spawn-agent-utils-output.test.ts) without taking down the
+    // session.
+    result = {
+      agentState: withDefaults.agentState,
+      output: {
+        type: 'error' as const,
+        message: `Subagent ${agentTemplate.id} crashed: ${errorMessage}`,
+      },
+    }
   }
 
   if (!failed) {

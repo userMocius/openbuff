@@ -188,6 +188,140 @@ describe('credentials', () => {
     })
   })
 
+  describe('writeCredentialsFileAtomic EEXIST/EPERM fallback', () => {
+    const makeErrnoError = (code: string): NodeJS.ErrnoException => {
+      const error: NodeJS.ErrnoException = new Error(
+        `simulated ${code} from renameSync`,
+      )
+      error.code = code
+      return error
+    }
+
+    // Fail specific 1-indexed renameSync call numbers so tests can exercise
+    // each branch of the fallback independently.
+    const stubRenameFailures = (failingCalls: number[], code = 'EEXIST') => {
+      const originalRenameSync = fs.renameSync
+      const failing = new Set(failingCalls)
+      let call = 0
+      ;(fs as any).renameSync = (...args: unknown[]) => {
+        call++
+        if (failing.has(call)) {
+          throw makeErrnoError(code)
+        }
+        return (originalRenameSync as (...renameArgs: unknown[]) => void)(
+          ...(args as [string, string]),
+        )
+      }
+      return () => {
+        fs.renameSync = originalRenameSync
+      }
+    }
+    const setupCredentialsFile = (env: any) => {
+      const configDir = getConfigDir(env)
+      fs.mkdirSync(configDir, { recursive: true })
+      const credPath = getCredentialsPath(env)
+      const oldContent = JSON.stringify({
+        default: {
+          userId: 'user-fallback',
+          email: 'user-fallback@test.com',
+          token: 'token-old',
+        },
+      })
+      fs.writeFileSync(credPath, oldContent)
+      return { configDir, credPath, oldContent }
+    }
+
+    const newCreds = (): ChatGptOAuthCredentials => ({
+      accessToken: 'chatgpt-fallback-access',
+      refreshToken: 'chatgpt-fallback-refresh',
+      expiresAt: Date.now() + 3_600_000,
+      connectedAt: Date.now(),
+    })
+
+    test(
+      'keeps the credentials file present with old or new content when ' +
+        'the first rename fails with EEXIST',
+      () => {
+        const tmpDir = fs.mkdtempSync(
+          path.join(os.tmpdir(), 'chatgpt-fallback-eexist-'),
+        )
+        const env = { NEXT_PUBLIC_CB_ENVIRONMENT: 'test' } as any
+        const originalHomedir = os.homedir
+        ;(os as any).homedir = () => tmpDir
+
+        try {
+          const { credPath, configDir } = setupCredentialsFile(env)
+          const restoreRename = stubRenameFailures([1])
+
+          try {
+            saveChatGptOAuthCredentials(newCreds(), env)
+
+            // The swap succeeded via the fallback: new content is in place.
+            expect(fs.existsSync(credPath)).toBe(true)
+            const parsed = JSON.parse(fs.readFileSync(credPath, 'utf8'))
+            expect(parsed.chatgptOAuth.accessToken).toBe(
+              'chatgpt-fallback-access',
+            )
+            expect(parsed.default.userId).toBe('user-fallback')
+
+            // The backup was cleaned up and no stray temp/backup files remain.
+            const leftovers = fs
+              .readdirSync(configDir)
+              .filter((name) => /\.bak\.|\.tmp\./.test(name))
+            expect(leftovers).toEqual([])
+          } finally {
+            restoreRename()
+          }
+        } finally {
+          ;(os as any).homedir = originalHomedir
+          fs.rmSync(tmpDir, { recursive: true })
+        }
+      },
+    )
+
+    test(
+      'preserves the old credentials file and a recoverable backup when ' +
+        'the swap rename fails again — the file is never left missing',
+      () => {
+        const tmpDir = fs.mkdtempSync(
+          path.join(os.tmpdir(), 'chatgpt-fallback-fail-'),
+        )
+        const env = { NEXT_PUBLIC_CB_ENVIRONMENT: 'test' } as any
+        const originalHomedir = os.homedir
+        ;(os as any).homedir = () => tmpDir
+
+        // Copy-based fallback: renameSync is only called for temp -> target.
+        // Failing BOTH calls (calls 1 and 2) exercises the branch where the
+        // swap rename fails again after the copy — the target must still
+        // hold the old content and the backup must survive for recovery.
+        const restoreRename = stubRenameFailures([1, 2], 'EPERM')
+
+        try {
+          const { credPath, configDir, oldContent } = setupCredentialsFile(env)
+
+          expect(() => saveChatGptOAuthCredentials(newCreds(), env)).toThrow()
+
+          // Copy-based fallback: the target is never moved away, so after a
+          // failed rename it still exists with the OLD content, and the
+          // copy-based backup preserves a recoverable copy of the original.
+          expect(fs.existsSync(credPath)).toBe(true)
+          expect(fs.readFileSync(credPath, 'utf8')).toBe(oldContent)
+          const backups = fs
+            .readdirSync(configDir)
+            .filter((name) => /\.bak\./.test(name))
+          expect(backups.length).toBe(1)
+          expect(fs.readFileSync(path.join(configDir, backups[0]!), 'utf8')).toBe(
+            oldContent,
+          )
+        } finally {
+          restoreRename()
+          ;(os as any).homedir = originalHomedir
+          fs.rmSync(tmpDir, { recursive: true })
+        }
+      },
+    )
+  })
+
   describe('isChatGptOAuthValid', () => {
     test('returns false when no credentials exist', () => {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chatgpt-novalid-'))
@@ -274,6 +408,125 @@ describe('credentials', () => {
         expect(result).not.toBeNull()
         expect(result?.accessToken).toBe('new-chatgpt-access-token')
         expect(result?.refreshToken).toBe('new-chatgpt-refresh-token')
+      } finally {
+        ;(os as any).homedir = originalHomedir
+        fs.rmSync(tmpDir, { recursive: true })
+      }
+    })
+
+    test('shares one fetch for two concurrent refreshes with the SAME config dir', async () => {
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'chatgpt-refresh-same-dir-'),
+      )
+      // M2-T5 repair: the config dir must live under the MOCKED homedir (an
+      // isolated tmpDir), not a root-level absolute path — writeCredentialsFileAtomic
+      // creates it with mode 0700, so an absolute path like '/shared-refresh-dir-a'
+      // cannot be created by an unprivileged test user, and getChatGptOAuthCredentials
+      // reads via the homedir-derived getConfigDir while the file was written to the
+      // literal path.
+      const env = {
+        OPENBUFF_CONFIG_DIR: path.join(tmpDir, 'shared-refresh-dir'),
+      } as any
+      const originalHomedir = os.homedir
+      ;(os as any).homedir = () => tmpDir
+
+      try {
+        const configDir = getConfigDir(env)
+        fs.mkdirSync(configDir, { recursive: true })
+        fs.writeFileSync(
+          path.join(configDir, 'credentials.json'),
+          JSON.stringify({
+            chatgptOAuth: {
+              accessToken: 'old-access',
+              refreshToken: 'shared-refresh-token',
+              expiresAt: Date.now() - 1_000,
+              connectedAt: Date.now() - 7_200_000,
+            },
+          }),
+        )
+
+        let fetchCalls = 0
+        globalThis.fetch = mock(() => {
+          fetchCalls++
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                access_token: 'shared-refresh-access',
+                refresh_token: 'shared-refresh-token',
+                expires_in: 3600,
+              }),
+          } as Response)
+        }) as unknown as typeof fetch
+
+        const [a, b] = await Promise.all([
+          refreshChatGptOAuthToken(env),
+          refreshChatGptOAuthToken(env),
+        ])
+
+        expect(fetchCalls).toBe(1)
+        expect(a).not.toBeNull()
+        expect(b).toBe(a)
+      } finally {
+        ;(os as any).homedir = originalHomedir
+        fs.rmSync(tmpDir, { recursive: true })
+      }
+    })
+
+    test('issues two fetches for two concurrent refreshes with DIFFERENT config dirs', async () => {
+      const tmpDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'chatgpt-refresh-multi-dir-'),
+      )
+      // M2-T5 repair: same isolation rule as the same-dir test above — the
+      // config dirs must live under the mocked homedir's tmpDir so they can
+      // actually be created and read.
+      const envA = {
+        OPENBUFF_CONFIG_DIR: path.join(tmpDir, 'refresh-dir-a'),
+      } as any
+      const envB = {
+        OPENBUFF_CONFIG_DIR: path.join(tmpDir, 'refresh-dir-b'),
+      } as any
+      const originalHomedir = os.homedir
+      ;(os as any).homedir = () => tmpDir
+
+      try {
+        for (const env of [envA, envB]) {
+          fs.mkdirSync(getConfigDir(env), { recursive: true })
+          fs.writeFileSync(
+            path.join(getConfigDir(env), 'credentials.json'),
+            JSON.stringify({
+              chatgptOAuth: {
+                accessToken: 'old-access',
+                refreshToken: 'dir-refresh-token',
+                expiresAt: Date.now() - 1_000,
+                connectedAt: Date.now() - 7_200_000,
+              },
+            }),
+          )
+        }
+
+        let fetchCalls = 0
+        globalThis.fetch = mock(() => {
+          fetchCalls++
+          return Promise.resolve({
+            ok: true,
+            json: () =>
+              Promise.resolve({
+                access_token: 'per-dir-refresh-access',
+                refresh_token: 'dir-refresh-token',
+                expires_in: 3600,
+              }),
+          } as Response)
+        }) as unknown as typeof fetch
+
+        const [a, b] = await Promise.all([
+          refreshChatGptOAuthToken(envA),
+          refreshChatGptOAuthToken(envB),
+        ])
+
+        expect(fetchCalls).toBe(2)
+        expect(a).not.toBeNull()
+        expect(b).not.toBeNull()
       } finally {
         ;(os as any).homedir = originalHomedir
         fs.rmSync(tmpDir, { recursive: true })

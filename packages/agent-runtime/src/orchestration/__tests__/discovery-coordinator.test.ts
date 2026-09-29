@@ -4,9 +4,14 @@ import {
   buildDiscoveryQuestion,
   claimDiscoveryShard,
   completeDiscoveryShard,
+  evaluateMemoryCover,
   planDiscoveryBatch,
   reconcileInterruptedDiscoveryShards,
+  recordDiscoveryResult,
+  recordMemoryReuse,
+  tryClaimDiscoveryShard,
 } from '../discovery-coordinator'
+import { MemoryReuseReceiptV1Schema } from '@codebuff/common/types/memory-v2'
 
 describe('discovery coordinator', () => {
   test('derives a stable non-empty question for params-only discovery agents', () => {
@@ -40,6 +45,58 @@ describe('discovery coordinator', () => {
     })
 
     expect(claimed.state.shards[0].question).toBe('file-picker discovery')
+  })
+
+  test('completed shard with different workspaceSnapshotId allows re-claim', () => {
+    const first = claimDiscoveryShard({
+      agentType: 'file-picker',
+      question: 'find tests',
+      workspaceRevision: 1,
+      taskId: 'task-1',
+      workspaceSnapshotId: 'snap-1',
+    })
+    const completed = completeDiscoveryShard({
+      existing: first.state,
+      shardKey: first.shardKey,
+      status: 'completed',
+    })!
+    // Same task, different workspace snapshot → should allow re-claim
+    expect(() =>
+      claimDiscoveryShard({
+        existing: completed,
+        agentType: 'file-picker',
+        question: 'find tests',
+        workspaceRevision: 1,
+        taskId: 'task-1',
+        workspaceSnapshotId: 'snap-2',
+      }),
+    ).not.toThrow()
+  })
+
+  test('completed shard with same identity still suppresses re-claim', () => {
+    const first = claimDiscoveryShard({
+      agentType: 'file-picker',
+      question: 'find tests',
+      workspaceRevision: 1,
+      taskId: 'task-1',
+      workspaceSnapshotId: 'snap-1',
+    })
+    const completed = completeDiscoveryShard({
+      existing: first.state,
+      shardKey: first.shardKey,
+      status: 'completed',
+    })!
+    // Same task, same workspace snapshot → should throw
+    expect(() =>
+      claimDiscoveryShard({
+        existing: completed,
+        agentType: 'file-picker',
+        question: 'find tests',
+        workspaceRevision: 1,
+        taskId: 'task-1',
+        workspaceSnapshotId: 'snap-1',
+      }),
+    ).toThrow(/Duplicate discovery shard/)
   })
 
   test('deduplicates candidates and merges evidence reasons', () => {
@@ -203,6 +260,47 @@ describe('discovery coordinator', () => {
     ).not.toThrow()
   })
 
+  test('taskId and workspaceSnapshotId appear in the shard record after claim', () => {
+    const claimed = claimDiscoveryShard({
+      agentType: 'file-picker',
+      question: 'identity fields',
+      workspaceRevision: 10,
+      taskId: 'task-abc-123',
+      workspaceSnapshotId: 'snap-xyz-789',
+    })
+
+    expect(claimed.state.shards[0].taskId).toBe('task-abc-123')
+    expect(claimed.state.workspaceSnapshotId).toBe('snap-xyz-789')
+  })
+
+  test('different taskIds produce different shard keys for the same question', () => {
+    const claimA = claimDiscoveryShard({
+      agentType: 'file-picker',
+      question: 'same question',
+      workspaceRevision: 1,
+      taskId: 'task-a',
+    })
+    const claimB = claimDiscoveryShard({
+      agentType: 'file-picker',
+      question: 'same question',
+      workspaceRevision: 1,
+      taskId: 'task-b',
+    })
+
+    expect(claimA.shardKey).not.toBe(claimB.shardKey)
+  })
+
+  test('workspaceSnapshotId is carried through planDiscoveryBatch', () => {
+    const state = planDiscoveryBatch({
+      query: 'snapshot batch',
+      result: ['src/file.ts'],
+      workspaceRevision: 1,
+      workspaceSnapshotId: 'snap-batch-001',
+    })
+
+    expect(state.workspaceSnapshotId).toBe('snap-batch-001')
+  })
+
   test('leaves settled shards and missing coverage untouched', () => {
     const claimed = claimDiscoveryShard({
       agentType: 'file-picker',
@@ -224,5 +322,403 @@ describe('discovery coordinator', () => {
     expect(reconcileInterruptedDiscoveryShards(reconciledOnce)).toBe(
       reconciledOnce,
     )
+  })
+
+  test('recordDiscoveryResult delegates to planDiscoveryBatch and returns updated coverage', () => {
+    const initial = planDiscoveryBatch({
+      query: 'initial search',
+      workspaceRevision: 1,
+      result: ['src/existing.ts'],
+    })
+
+    const updated = recordDiscoveryResult({
+      existing: initial,
+      agentType: 'file-picker',
+      question: 'find auth files',
+      result: { files: ['src/auth.ts', 'src/login.ts'] },
+      workspaceRevision: 2,
+      workspaceSnapshotId: 'snap-001',
+    })
+
+    expect(updated.candidates.map((c) => c.path)).toContain('src/auth.ts')
+    expect(updated.candidates.map((c) => c.path)).toContain('src/login.ts')
+    expect(updated.workspaceRevision).toBe(2)
+    expect(updated.workspaceSnapshotId).toBe('snap-001')
+    expect(updated.revision).toBeGreaterThan(initial.revision)
+  })
+
+  test('recordDiscoveryResult works without existing coverage', () => {
+    const result = recordDiscoveryResult({
+      agentType: 'file-lister',
+      question: 'list test files',
+      result: ['tests/auth.test.ts'],
+      workspaceRevision: 1,
+    })
+
+    expect(result.candidates).toHaveLength(1)
+    expect(result.candidates[0].path).toBe('tests/auth.test.ts')
+  })
+
+  test('evaluateMemoryCover skips on full cover', () => {
+    const evaluation = evaluateMemoryCover({
+      excerpts: [{ path: 'src/auth/login.ts', excerpt: 'login' }],
+      pathPrefixes: ['src/auth'],
+      query: 'authentication',
+    })
+
+    expect(evaluation.decision).toBe('skip')
+    expect(evaluation.remainingGaps).toEqual([])
+    expect(evaluation.coveringExcerpts.map((entry) => entry.path)).toContain(
+      'src/auth/login.ts',
+    )
+  })
+
+  test('evaluateMemoryCover narrows on partial cover', () => {
+    const evaluation = evaluateMemoryCover({
+      excerpts: [{ path: 'src/auth/login.ts', excerpt: 'login' }],
+      pathPrefixes: ['src/auth', 'src/other'],
+      query: 'authentication',
+    })
+
+    expect(evaluation.decision).toBe('narrow')
+    expect(evaluation.remainingGaps).toEqual(['src/other'])
+    expect(evaluation.coveringExcerpts).toHaveLength(1)
+  })
+
+  test('evaluateMemoryCover goes full on stale revision', () => {
+    const evaluation = evaluateMemoryCover({
+      excerpts: [
+        { path: 'src/auth/login.ts', excerpt: 'login', workspaceRevision: 1 },
+      ],
+      pathPrefixes: ['src/auth'],
+      query: 'authentication',
+      workspaceRevision: 2,
+    })
+
+    expect(evaluation.decision).toBe('full')
+    expect(evaluation.coveringExcerpts).toEqual([])
+  })
+
+  test('evaluateMemoryCover goes full on stale index snapshot', () => {
+    const evaluation = evaluateMemoryCover({
+      excerpts: [{ path: 'src/auth/login.ts', excerpt: 'login' }],
+      pathPrefixes: ['src/auth'],
+      query: 'authentication',
+      indexSnapshotId: 'index-new',
+      existingIndexSnapshotId: 'index-old',
+    })
+
+    expect(evaluation.decision).toBe('full')
+    expect(evaluation.reason).toBe('stale-index-snapshot')
+  })
+
+  test('evaluateMemoryCover goes full without cover', () => {
+    expect(
+      evaluateMemoryCover({ pathPrefixes: ['src/auth'], query: 'auth' })
+        .decision,
+    ).toBe('full')
+    expect(
+      evaluateMemoryCover({
+        excerpts: [{ path: 'src/auth/login.ts' }],
+      }).decision,
+    ).toBe('full')
+  })
+
+  test('tryClaimDiscoveryShard returns duplicate receipt instead of throwing', () => {
+    const first = tryClaimDiscoveryShard({
+      agentType: 'query_index',
+      question: 'find auth files',
+      workspaceRevision: 1,
+      taskId: 'task-1',
+    })
+    expect(first.duplicate).toBe(false)
+    expect(first.shardKey).toHaveLength(24)
+
+    const second = tryClaimDiscoveryShard({
+      existing: first.state,
+      agentType: 'query_index',
+      question: 'find auth files',
+      workspaceRevision: 1,
+      taskId: 'task-1',
+    })
+    expect(second.duplicate).toBe(true)
+    expect(second.shardKey).toBe(first.shardKey)
+    expect(second.state).toBe(first.state)
+  })
+
+  test('claimDiscoveryShard throw semantics unchanged', () => {
+    const claimed = claimDiscoveryShard({
+      agentType: 'file-picker',
+      question: 'throw check',
+      workspaceRevision: 9,
+    })
+    expect(() =>
+      claimDiscoveryShard({
+        existing: claimed.state,
+        agentType: 'file-picker',
+        question: 'check throw',
+        workspaceRevision: 9,
+      }),
+    ).toThrow(/Duplicate discovery shard/)
+  })
+})
+
+describe('recordMemoryReuse', () => {
+  test('lazily initializes a zeroed receipt on first call', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'code_search',
+      decision: 'full',
+      served: 0,
+      gaps: 0,
+    })
+
+    expect(state.memoryReuse).toEqual({
+      schemaVersion: 1,
+      turnId: '',
+      skip: 0,
+      narrow: 0,
+      full: 1,
+      recordsServed: 0,
+      gapsRemaining: 0,
+      recordedDecisions: 0,
+      conceptExpanded: 0,
+      byTool: [{ tool: 'code_search', decision: 'full', served: 0, gaps: 0 }],
+    })
+  })
+
+  test('skip increments skip and adds served to recordsServed', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'query_index',
+      decision: 'skip',
+      served: 5,
+      gaps: 0,
+    })
+
+    expect(state.memoryReuse!.skip).toBe(1)
+    expect(state.memoryReuse!.recordsServed).toBe(5)
+  })
+
+  test('narrow increments narrow and adds served to recordsServed', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'query_index',
+      decision: 'narrow',
+      served: 3,
+      gaps: 0,
+    })
+
+    expect(state.memoryReuse!.narrow).toBe(1)
+    expect(state.memoryReuse!.recordsServed).toBe(3)
+  })
+
+  test('full increments full and does NOT add served to recordsServed', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'glob',
+      decision: 'full',
+      served: 7,
+      gaps: 0,
+    })
+
+    expect(state.memoryReuse!.full).toBe(1)
+    expect(state.memoryReuse!.recordsServed).toBe(0)
+  })
+
+  test('coveredStableChunkIds dedupe, sort, cap, and stay absent when undefined', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'read_files',
+      decision: 'skip',
+      served: 3,
+      gaps: 0,
+      coveredStableChunkIds: ['chunk:b', 'chunk:a', 'chunk:b', ''],
+    })
+    expect(state.memoryReuse!.byTool![0]!.coveredStableChunkIds).toEqual([
+      'chunk:a',
+      'chunk:b',
+    ])
+
+    const cappedState: Parameters<typeof recordMemoryReuse>[0] = {}
+    recordMemoryReuse(cappedState, {
+      tool: 'read_files',
+      decision: 'skip',
+      served: 40,
+      gaps: 0,
+      coveredStableChunkIds: Array.from(
+        { length: 40 },
+        (_, index) => `chunk:${String(index).padStart(2, '0')}`,
+      ).reverse(),
+    })
+    const capped = cappedState.memoryReuse!.byTool![0]!.coveredStableChunkIds!
+    expect(capped).toHaveLength(32)
+    expect([...capped].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))).toEqual(
+      capped,
+    )
+
+    const absentState: Parameters<typeof recordMemoryReuse>[0] = {}
+    recordMemoryReuse(absentState, {
+      tool: 'glob',
+      decision: 'full',
+      served: 0,
+      gaps: 0,
+    })
+    expect(
+      absentState.memoryReuse!.byTool![0]!.coveredStableChunkIds,
+    ).toBeUndefined()
+  })
+
+  test('drops coveredStableChunkIds entries longer than the receipt schema bound', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+    const oversized = 'z'.repeat(129)
+    const bounded = 'k'.repeat(128)
+
+    recordMemoryReuse(state, {
+      tool: 'query_index',
+      decision: 'skip',
+      served: 2,
+      gaps: 0,
+      coveredStableChunkIds: [oversized, bounded, ''],
+    })
+
+    const receipt = state.memoryReuse!
+    expect(receipt.byTool![0]!.coveredStableChunkIds).toEqual([bounded])
+    // The produced receipt must satisfy its own published schema once the
+    // emit path stamps turnId (recordMemoryReuse leaves it '' in-flight).
+    expect(() =>
+      MemoryReuseReceiptV1Schema.parse({ ...receipt, turnId: 'input:test' }),
+    ).not.toThrow()
+  })
+
+  test('gaps accumulate into gapsRemaining for every decision', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'a',
+      decision: 'skip',
+      served: 0,
+      gaps: 2,
+    })
+    recordMemoryReuse(state, {
+      tool: 'b',
+      decision: 'narrow',
+      served: 0,
+      gaps: 3,
+    })
+    recordMemoryReuse(state, {
+      tool: 'c',
+      decision: 'full',
+      served: 0,
+      gaps: 4,
+    })
+
+    expect(state.memoryReuse!.gapsRemaining).toBe(9)
+  })
+
+  test('recordedDecisions accumulate and default to 0 when omitted', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'a',
+      decision: 'skip',
+      served: 0,
+      gaps: 0,
+      recordedDecisions: 4,
+    })
+    recordMemoryReuse(state, {
+      tool: 'b',
+      decision: 'skip',
+      served: 0,
+      gaps: 0,
+    })
+    recordMemoryReuse(state, {
+      tool: 'c',
+      decision: 'skip',
+      served: 0,
+      gaps: 0,
+      recordedDecisions: 6,
+    })
+
+    expect(state.memoryReuse!.recordedDecisions).toBe(10)
+  })
+
+  test('each call appends one byTool entry with the tool sliced to 64 chars', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+    const longTool = 'x'.repeat(100)
+
+    recordMemoryReuse(state, {
+      tool: longTool,
+      decision: 'narrow',
+      served: 2,
+      gaps: 1,
+    })
+
+    expect(state.memoryReuse!.byTool).toHaveLength(1)
+    expect(state.memoryReuse!.byTool![0]).toEqual({
+      tool: 'x'.repeat(64),
+      decision: 'narrow',
+      served: 2,
+      gaps: 1,
+    })
+  })
+
+  test('byTool is capped at 32 while top-level counters keep incrementing', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    for (let i = 0; i < 33; i++) {
+      recordMemoryReuse(state, {
+        tool: `tool-${i}`,
+        decision: 'skip',
+        served: 1,
+        gaps: 0,
+      })
+    }
+
+    expect(state.memoryReuse!.byTool).toHaveLength(32)
+    expect(state.memoryReuse!.skip).toBe(33)
+    expect(state.memoryReuse!.recordsServed).toBe(33)
+  })
+
+  test('is deterministic across independent states for the same ordered sequence', () => {
+    const entries: Parameters<typeof recordMemoryReuse>[1][] = [
+      { tool: 'code_search', decision: 'skip', served: 5, gaps: 1, recordedDecisions: 2 },
+      { tool: 'glob', decision: 'narrow', served: 3, gaps: 2 },
+      { tool: 'query_index', decision: 'full', served: 9, gaps: 4, recordedDecisions: 1 },
+    ]
+
+    const stateA: Parameters<typeof recordMemoryReuse>[0] = {}
+    const stateB: Parameters<typeof recordMemoryReuse>[0] = {}
+    for (const entry of entries) {
+      recordMemoryReuse(stateA, entry)
+      recordMemoryReuse(stateB, entry)
+    }
+
+    expect(stateA.memoryReuse).toEqual(stateB.memoryReuse)
+  })
+
+  test('floors negative and fractional served/gaps to non-negative integers', () => {
+    const state: Parameters<typeof recordMemoryReuse>[0] = {}
+
+    recordMemoryReuse(state, {
+      tool: 'code_search',
+      decision: 'skip',
+      served: 4.9,
+      gaps: -3,
+    })
+
+    expect(state.memoryReuse!.recordsServed).toBe(4)
+    expect(state.memoryReuse!.gapsRemaining).toBe(0)
+    expect(state.memoryReuse!.byTool![0]).toEqual({
+      tool: 'code_search',
+      decision: 'skip',
+      served: 4,
+      gaps: 0,
+    })
   })
 })

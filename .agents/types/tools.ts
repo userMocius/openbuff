@@ -30,6 +30,8 @@ export type ToolName =
   | 'list_jobs'
   | 'lookup_agent_info'
   | 'query_index'
+  | 'recall_context'
+  | 'record_decision'
   | 'read_docs'
   | 'read_files'
   | 'read_image'
@@ -89,6 +91,8 @@ export interface ToolParamsMap {
   list_jobs: ListJobsParams
   lookup_agent_info: LookupAgentInfoParams
   query_index: QueryIndexParams
+  recall_context: RecallContextParams
+  record_decision: RecordDecisionParams
   read_docs: ReadDocsParams
   read_files: ReadFilesParams
   read_image: ReadImageParams
@@ -595,6 +599,30 @@ export interface QueryIndexParams {
 }
 
 /**
+ * Search archived pre-compaction transcripts for verbatim facts a compaction pass removed from visible context.
+ */
+export interface RecallContextParams {
+  /** Case-insensitive search terms for archived pre-compaction transcripts. ALL terms must match a verbatim result (AND); stored background summaries use best-effort OR matching. */
+  query: string
+}
+
+/**
+ * Explicitly record a decision, fact, or constraint with evidence.
+ */
+export interface RecordDecisionParams {
+  /** Decision text to record. Trimmed, 1..1024 characters. */
+  text: string
+  /** Kind of record to save. Defaults to decision. */
+  kind?: 'decision' | 'fact' | 'constraint'
+  /** Required evidence: 1..32 project-relative paths without traversal or glob syntax. */
+  evidenceSelectors: string[]
+  /** Optional supporting excerpt, at most 1024 characters. */
+  excerpt?: string
+  /** Optional observation ids this decision supersedes (1..16 ids, each 1..128 chars). Emits append-only claim.superseded events; never blocks capture. */
+  supersedes?: string[]
+}
+
+/**
  * Fetch up-to-date documentation for libraries and frameworks using Context7 API.
  */
 export interface ReadDocsParams {
@@ -931,6 +959,7 @@ export interface SpawnAgentsParams {
             text: string
             files: string[]
             snapshotFingerprint: string
+            reviewer?: string
           }[]
           permissions: {
             readablePaths: string[]
@@ -979,7 +1008,7 @@ export interface SpawnAgentsParams {
       push?: boolean
       /** Remote used for fetch/push (git-committer) */
       remote?: string
-      /** Assigned gate snapshot fingerprint (reviewer specialists) */
+      /** Optional gate-assigned snapshot token (reviewer specialists). Runtime-owned spawns pass the gate-assigned v3:… token; manual spawns omit this key entirely. */
       snapshot_id?: string
       /** Changed file paths to review (security-reviewer) */
       changed_files?: string[]
@@ -1108,6 +1137,8 @@ export interface UpdatePlanStatusParams {
     summary?: string
     receiptIds?: string[]
   }
+  /** Requests a committed-surface specialist review of the claimed task's runtime-observed files: base2 derives a bounded fileset from the task files, verifies the worktree is fully committed and clean, routes the reviewer-family specialists over the committed bytes, and mints a durable plan-task gate receipt (evidence `committed-surface`). Requires a claimed current task; the review runs on base2's next gate pass and the request is consumed on that first attempt whether it mints or is rejected. */
+  requestCommittedSurfaceReview?: boolean
 }
 
 /**
@@ -1153,6 +1184,7 @@ export interface WriteAuditFindingsParams {
   /** Each findings entry rejects control and Unicode format characters in title, risk, fix, and evidence — NUL, any other control character, and the U+2028/U+2029 line separators — while still accepting tabs and line breaks in that prose. findings[].path is a location rather than prose, so it must be a single-line value with none of those characters and no tabs or line breaks; it is trimmed, and the trimmed value is the one rendered into the finding heading. */
   findings: {
     severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'
+    /** coverage.domains accepts canonical domain ids only, so use api-contract there: the legacy api-abi alias is accepted only in findings[].domain. */
     domain:
       | 'security'
       | 'correctness'
@@ -1163,11 +1195,16 @@ export interface WriteAuditFindingsParams {
       | 'test-coverage'
       | 'api-contract'
       | 'api-abi'
+    /** Each findings entry rejects control and Unicode format characters in title, risk, fix, and evidence — NUL, any other control character, and the U+2028/U+2029 line separators — while still accepting tabs and line breaks in that prose. findings[].path is a location rather than prose, so it must be a single-line value with none of those characters and no tabs or line breaks; it is trimmed, and the trimmed value is the one rendered into the finding heading. */
     path: string
     line?: number
+    /** Each findings entry rejects control and Unicode format characters in title, risk, fix, and evidence — NUL, any other control character, and the U+2028/U+2029 line separators — while still accepting tabs and line breaks in that prose. findings[].path is a location rather than prose, so it must be a single-line value with none of those characters and no tabs or line breaks; it is trimmed, and the trimmed value is the one rendered into the finding heading. */
     title: string
+    /** Each findings entry rejects control and Unicode format characters in title, risk, fix, and evidence — NUL, any other control character, and the U+2028/U+2029 line separators — while still accepting tabs and line breaks in that prose. findings[].path is a location rather than prose, so it must be a single-line value with none of those characters and no tabs or line breaks; it is trimmed, and the trimmed value is the one rendered into the finding heading. */
     risk: string
+    /** Each findings entry rejects control and Unicode format characters in title, risk, fix, and evidence — NUL, any other control character, and the U+2028/U+2029 line separators — while still accepting tabs and line breaks in that prose. findings[].path is a location rather than prose, so it must be a single-line value with none of those characters and no tabs or line breaks; it is trimmed, and the trimmed value is the one rendered into the finding heading. */
     fix: string
+    /** Each findings entry rejects control and Unicode format characters in title, risk, fix, and evidence — NUL, any other control character, and the U+2028/U+2029 line separators — while still accepting tabs and line breaks in that prose. findings[].path is a location rather than prose, so it must be a single-line value with none of those characters and no tabs or line breaks; it is trimmed, and the trimmed value is the one rendered into the finding heading. */
     evidence: string
   }[]
   /** Every coverage list must name each entry at most once: a repeated file, subsystemId, featureId, or domain is rejected rather than counted twice. Entries are compared after trimming surrounding whitespace, and the trimmed value is what reaches the artifact and the receipt, so two spellings that differ only in whitespace are the same entry. Every coverage files, subsystemIds, and featureIds entry must be a single-line value: tabs, carriage returns, newlines, NUL, any other control or Unicode format character, and the U+2028/U+2029 line separators are rejected. Entries are trimmed, and the trimmed value is the one uniqueness is judged on. */

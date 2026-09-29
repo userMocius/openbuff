@@ -1,0 +1,4811 @@
+import { Database } from 'bun:sqlite'
+import { createHash } from 'node:crypto'
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  statSync,
+  type Stats,
+} from 'node:fs'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+
+import {
+  MemoryAppendRequestSchema,
+  MemoryEventDraftSchema,
+  MemoryEventEnvelopeSchema,
+  MemoryEventIdSchema,
+  MemoryExportRequestSchema,
+  ProjectIdSchema,
+  MemoryHealthRequestSchema,
+  MemoryRebuildRequestSchema,
+  MemoryRetrievalRequestSchema,
+  MemoryRetrievalResultSchema,
+  MemoryVerifyOutcomeSchema,
+  MemoryVerifyRequestSchema,
+  type MemoryAppendOutcome,
+  type MemoryAppendRequest,
+  type MemoryEventDraft,
+  type MemoryEventEnvelope,
+  type MemoryExpectedTail,
+  type MemoryExportOutcome,
+  type MemoryExportRequest,
+  type MemoryHealth,
+  type MemoryHealthRequest,
+  type MemoryOperationError,
+  type MemoryQueryOutcome,
+  type MemoryRebuildOutcome,
+  type MemoryRebuildRequest,
+  type MemoryRetrievalRequest,
+  type MemoryObservation,
+  type MemorySelector,
+  type RankingReason,
+  type MemoryVerifyOutcome,
+  type MemoryVerifyRequest,
+} from '../../../../common/src/types/memory-v2'
+import {
+  deriveUsefulnessTier,
+  scoreUsefulness,
+  type UsefulnessTier,
+} from './usefulness-scorer'
+import {
+  observationIdsReferencedBy,
+  selectCompactionCandidates,
+  type GCRelevantEnvelope,
+} from '../../../../common/src/util/compaction-eligibility'
+import type {
+  GcCandidateSelection,
+  MemoryObservationStatusEntry,
+  MemoryObservationStatusReadRequest,
+  MemoryRepositoryV2,
+  MemoryStoreStats,
+  PrivilegedCompactionInput,
+  PrivilegedCompactionResult,
+} from '../../../../sdk/src/services/memory-v2/types'
+import {
+  detectContradictions,
+  extractStableChunkIds,
+  resolveSupersessionHead,
+  type ContradictionCandidate,
+} from '../../../../common/src/util/contradiction-detector'
+import type { ConceptCorpusEntry, ConceptExpansion } from './concept-index'
+
+export type RuntimeNeutralMemoryRepositoryV2 = MemoryRepositoryV2
+export type RuntimeNeutralMemoryEventV2 = MemoryEventEnvelope
+
+/**
+ * Store file schema version (PRAGMA user_version). Bumped 2 -> 3 by the P7
+ * mixed-version repair: a build whose own SCHEMA_VERSION is lower than the
+ * store's fails closed at open (its preflight/migrate reject version > their
+ * SCHEMA_VERSION), so a pre-P7 build sharing this store can never open it —
+ * closing the window where its GC selection (unaware of claim.reinforced)
+ * could archive a reinforced observation and where its projection rebuild
+ * could leave claim_dedup stale.
+ */
+const SCHEMA_VERSION = 3
+const DEFAULT_DATABASE_PATH = join('.openbuff', 'memory', 'memory-v2.sqlite')
+const DEFAULT_BUSY_TIMEOUT_MS = 2_500
+const MAX_BUSY_TIMEOUT_MS = 10_000
+const PAGE_SIZE = 250
+const MAX_QUERY_EVENTS = 10_000
+const MAX_QUERY_PAYLOAD_BYTES = 8 * 1024 * 1024
+const MAX_REPLAY_EVENTS = 10_000
+const GC_SELECT_LIMIT = 10_000
+const COMPACTION_APPLY_MAX = 100
+/** Metadata key tracking the claim_dedup cold-start backfill cursor. */
+const CLAIM_DEDUP_BACKFILL_KEY = 'claim_dedup_backfill'
+/** Event types the shared P6 compaction-eligibility selection consumes. */
+const GC_RELEVANT_EVENT_TYPES: readonly string[] = [
+  'observation.recorded',
+  'claim.forgotten',
+  'claim.superseded',
+  'claim.corrected',
+  'claim.consolidated',
+  'claim.pinned',
+  'claim.reinforced',
+  'evidence.attached',
+  'evidence.verified',
+  'evidence.invalidated',
+  'evidence.rebound',
+  'observation.reused',
+]
+/** Multi-referencing events that never belong to a single observation group. */
+const GC_SHARED_EVENT_TYPES: readonly string[] = [
+  'claim.forgotten',
+  'claim.consolidated',
+  'claim.corrected',
+  'observation.reused',
+]
+const DIGEST_PATTERN = /^[a-z0-9][a-z0-9+.-]{0,31}:[A-Fa-f0-9]{16,256}$/
+const NO_DELETE_TRIGGER_SQL = `CREATE TRIGGER memory_events_no_delete BEFORE DELETE ON memory_events BEGIN SELECT RAISE(ABORT, 'canonical memory events are append only'); END;`
+const CANONICAL_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'task.created',
+  'task.transitioned',
+  'session.started',
+  'session.ended',
+  'artifact.classified',
+  'observation.recorded',
+  'observation.reused',
+  'claim.consolidated',
+  'claim.corrected',
+  'claim.superseded',
+  'claim.forgotten',
+  'claim.pinned',
+  'claim.reinforced',
+  'claim.archived',
+  'evidence.attached',
+  'evidence.verified',
+  'evidence.invalidated',
+  'evidence.rebound',
+  'migration.v1.reserved',
+  'migration.v1.imported',
+  'coverage.recorded',
+  'query.started',
+  'query.completed',
+  'query.failed',
+  'projection.rebuild.requested',
+  'projection.rebuild.completed',
+  'projection.rebuild.failed',
+])
+
+export type MemoryV2FailureKind =
+  | 'busy'
+  | 'closed'
+  | 'conflict'
+  | 'corrupt'
+  | 'incompatible'
+  | 'invalid'
+  | 'io'
+  | 'unsupported-open'
+
+export interface MemoryV2Failure {
+  kind: MemoryV2FailureKind
+  message: string
+  retryable: boolean
+}
+
+export type MemoryV2Result<T> =
+  | ({ status: 'ok' } & T)
+  | { status: 'error'; error: MemoryV2Failure }
+
+/**
+ * The honest posture of a bun:sqlite store open. bun:sqlite accepts only a
+ * path string, and SQLite opens the main database plus its -wal/-shm sidecars
+ * by derived pathname inside its own VFS. The pathname hardening in this
+ * module is therefore best-effort defense-in-depth: it cannot prove that the
+ * files SQLite opened are the files that were validated beforehand.
+ */
+export type SQLiteOpenPosture = 'pathname-best-effort-unverified-open'
+
+/** The single posture every bun:sqlite open has; see SQLiteOpenPosture. */
+export const SQLITE_OPEN_POSTURE: SQLiteOpenPosture =
+  'pathname-best-effort-unverified-open'
+
+export interface MemoryV2EventInput {
+  eventId: string
+  idempotencyKey: string
+  eventType: string
+  occurredAt: string
+  payload: unknown
+  metadata?: unknown
+  taskId?: string
+  sessionId?: string
+  artifactId?: string
+}
+
+export interface MemoryV2StoredEvent extends MemoryV2EventInput {
+  sequence: number
+  metadata: unknown
+}
+
+export interface MemoryV2AppendEntry {
+  eventId: string
+  sequence: number
+  duplicate: boolean
+}
+
+export type MemoryV2AppendResult = MemoryV2Result<{
+  events: MemoryV2AppendEntry[]
+  appendedCount: number
+  duplicateCount: number
+  lastSequence: number
+}>
+
+export interface MemoryV2Capability {
+  name: string
+  available: boolean
+  fallback: string | null
+  value: string
+}
+
+export interface MemoryV2Health {
+  status: 'healthy' | 'degraded' | 'unavailable'
+  schemaVersion: number | null
+  journalMode: string | null
+  synchronous: string | null
+  projectionCursor: number | null
+  capabilities: MemoryV2Capability[]
+  /** Honest posture of the underlying open; never a proven-safe claim. */
+  openPosture?: SQLiteOpenPosture
+  failure?: MemoryV2Failure
+}
+
+export interface BunSQLiteMemoryRepositoryOptions {
+  repositoryRoot?: string
+  databasePath?: string
+  busyTimeoutMs?: number
+  /**
+   * Strict opt-in gate. When true, open() refuses every bun:sqlite store
+   * because this driver offers no descriptor-relative or no-follow/beneath
+   * open (see SQLITE_OPEN_POSTURE): it returns a typed, non-retryable
+   * 'unsupported-open' failure and performs no SQLite or filesystem mutation.
+   * Defaults to false, which keeps the store usable with the pathname
+   * hardening below as best-effort defense-in-depth.
+   */
+  requireSecureOpen?: boolean
+  /**
+   * Advisory semantic recall expansion. The expander receives the retrieval
+   * request plus a bounded corpus of active observations and may return extra
+   * observation ids appended AFTER the lexical ranking as a concept-advisory
+   * tail. The expander must degrade internally (never throw); when absent,
+   * recall expansion is off and results are purely lexical.
+   */
+  recallExpander?: (params: {
+    request: MemoryRetrievalRequest
+    corpus: ConceptCorpusEntry[]
+  }) => Promise<ConceptExpansion | null>
+}
+
+export type BunSQLiteMemoryRepositoryOpenResult =
+  | {
+      status: 'ok'
+      repository: BunSQLiteMemoryRepository
+      openPosture: SQLiteOpenPosture
+    }
+  | { status: 'error'; error: MemoryV2Failure }
+
+export interface ProjectionRow {
+  entityId: string
+  taskId: string | null
+  sessionId: string | null
+  state: unknown
+  sourceSequence: number
+  updatedAt: string
+}
+
+export interface MemoryV2ProjectionSnapshot {
+  cursor: number
+  tasks: ProjectionRow[]
+  sessions: ProjectionRow[]
+  artifacts: ProjectionRow[]
+  claims: ProjectionRow[]
+  evidence: ProjectionRow[]
+  discoveries: ProjectionRow[]
+}
+
+export interface MemoryV2UnsupportedResult {
+  status: 'unsupported'
+  capability: string
+  message: string
+}
+
+interface PreparedEvent {
+  eventId: string
+  idempotencyKey: string
+  eventType: string
+  occurredAt: string
+  payload: unknown
+  payloadJson: string
+  metadata: unknown
+  metadataJson: string
+  taskId: string | null
+  sessionId: string | null
+  artifactId: string | null
+}
+
+interface EventRow {
+  sequence: number
+  event_id: string
+  idempotency_key: string
+  event_type: string
+  occurred_at: string
+  payload_json: string
+  metadata_json: string
+  task_id: string | null
+  session_id: string | null
+  artifact_id: string | null
+}
+
+interface AppendTransactionResult {
+  events: MemoryV2AppendEntry[]
+  appendedCount: number
+  duplicateCount: number
+  lastSequence: number
+  lastEventId: string | null
+}
+
+interface AppendGuard {
+  projectId: string
+  expectedTail?: MemoryExpectedTail
+}
+
+interface ProjectionDefinition {
+  table: string
+  payloadId: string
+  explicitId:
+    | keyof Pick<PreparedEvent, 'taskId' | 'sessionId' | 'artifactId'>
+    | null
+}
+
+interface FileIdentity {
+  dev: number
+  ino: number
+}
+
+interface PreparedDatabasePath {
+  databasePath: string
+  realRoot: string
+  realParent: string
+  existingIdentity: FileIdentity | null
+}
+
+interface QueryAdmissionRow {
+  sequence: number
+  payload_bytes: number
+  metadata_bytes: number
+}
+
+interface UsageRow {
+  observation_id: string
+  used_count: number
+  ignored_count: number
+  staled_count: number
+  last_mechanism: string | null
+  last_turn_id: string | null
+  last_sequence: number
+}
+
+interface ClaimDedupRow {
+  claim_id: string
+  observation_id: string
+}
+
+interface ObservationStatusRow {
+  entity_id: string
+  task_id: string | null
+  state_json: string
+}
+
+/**
+ * memory_claims has no dedicated status column: retraction state lives in the
+ * projection state JSON's `lifecycle` field. upsertClaim writes
+ * 'forgotten'/'superseded'/'corrected' on the claim.forgotten/superseded/
+ * corrected folds, markProjectionLifecycle writes 'superseded' on
+ * consolidation sources, and claim.archived folds write 'archived'. Rows whose
+ * lifecycle is one of these retraction markers map to 'retracted'; a readable
+ * state with a recognized non-retraction lifecycle ('canonical',
+ * consolidation-head 'consolidated', 'pinned') maps to 'active'. A row whose
+ * state_json is unreadable, is not an object, or lacks a recognizable
+ * lifecycle maps to 'unknown' — the fail-closed branch: supersession-safety
+ * callers accept only 'active' targets, so a corrupted projection row can
+ * never be superseded. Observation ids absent from memory_claims are omitted
+ * entirely so unknown targets cannot be superseded either.
+ */
+const RETRACTED_CLAIM_LIFECYCLES: ReadonlySet<string> = new Set([
+  'forgotten',
+  'superseded',
+  'corrected',
+  'archived',
+])
+
+interface QueryScanResult {
+  rows: EventRow[]
+  eventCapReached: boolean
+  payloadBudgetReached: boolean
+}
+
+const PROJECTIONS: Record<string, ProjectionDefinition> = {
+  task: { table: 'memory_tasks', payloadId: 'taskId', explicitId: 'taskId' },
+  session: {
+    table: 'memory_sessions',
+    payloadId: 'sessionId',
+    explicitId: 'sessionId',
+  },
+  artifact: {
+    table: 'memory_artifacts',
+    payloadId: 'artifactId',
+    explicitId: 'artifactId',
+  },
+  claim: { table: 'memory_claims', payloadId: 'claimId', explicitId: null },
+  evidence: {
+    table: 'memory_evidence',
+    payloadId: 'evidenceId',
+    explicitId: null,
+  },
+  discovery: {
+    table: 'memory_discoveries',
+    payloadId: 'discoveryId',
+    explicitId: null,
+  },
+}
+
+const PROJECTION_TABLES = Object.values(PROJECTIONS).map(({ table }) => table)
+
+export class MemoryV2StorageError extends Error {
+  readonly failure: MemoryV2Failure
+
+  constructor(failure: MemoryV2Failure) {
+    super(failure.message)
+    this.name = 'MemoryV2StorageError'
+    this.failure = failure
+  }
+}
+
+export class BunSQLiteMemoryRepository implements MemoryRepositoryV2 {
+  readonly databasePath: string
+  private closed = false
+
+  private constructor(
+    private readonly database: Database,
+    databasePath: string,
+    private readonly recallExpander?: BunSQLiteMemoryRepositoryOptions['recallExpander'],
+  ) {
+    this.databasePath = databasePath
+  }
+
+  static async open(
+    options: BunSQLiteMemoryRepositoryOptions = {},
+  ): Promise<BunSQLiteMemoryRepositoryOpenResult> {
+    let database: Database | undefined
+
+    try {
+      // Strict mode refuses every bun:sqlite open before any filesystem or
+      // SQLite mutation: no descriptor-relative/no-follow open exists for
+      // this driver, so the requested guarantee cannot be met.
+      if (options.requireSecureOpen === true) {
+        throw new MemoryV2StorageError(insecureOpenUnavailableFailure())
+      }
+      const preparedPath = prepareDatabasePath(options)
+      const timeout = boundedBusyTimeout(options.busyTimeoutMs)
+      preflightExistingDatabase(preparedPath)
+      database = new Database(preparedPath.databasePath, {
+        create: true,
+        strict: true,
+      })
+      verifyOpenedDatabasePath(preparedPath)
+      database.exec(`PRAGMA busy_timeout = ${timeout}`)
+      database.exec('PRAGMA foreign_keys = ON')
+      migrate(database)
+      secureDatabaseFiles(preparedPath)
+      database.exec('PRAGMA synchronous = NORMAL')
+      const journalMode = readPragmaString(
+        database,
+        'PRAGMA journal_mode = WAL',
+        'journal_mode',
+      )
+      secureDatabaseFiles(preparedPath)
+      recordRuntimeCapabilities(database, journalMode)
+      secureDatabaseFiles(preparedPath)
+
+      return {
+        status: 'ok',
+        repository: new BunSQLiteMemoryRepository(
+          database,
+          preparedPath.databasePath,
+          options.recallExpander,
+        ),
+        openPosture: SQLITE_OPEN_POSTURE,
+      }
+    } catch (error) {
+      if (database) {
+        try {
+          database.close()
+        } catch {
+          // Opening already failed; preserve the classified opening failure.
+        }
+      }
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  async appendEvents(
+    inputs: readonly (MemoryV2EventInput | MemoryEventEnvelope)[],
+  ): Promise<MemoryV2AppendResult> {
+    const result = this.appendKernel(inputs)
+    if (result.status === 'error') return result
+    return {
+      status: 'ok',
+      events: result.events,
+      appendedCount: result.appendedCount,
+      duplicateCount: result.duplicateCount,
+      lastSequence: result.lastSequence,
+    }
+  }
+
+  async append(request: MemoryAppendRequest): Promise<MemoryAppendOutcome> {
+    const parsed = MemoryAppendRequestSchema.safeParse(request)
+    if (!parsed.success)
+      return rejectedOutcome('The memory append request is invalid.')
+    if (
+      parsed.data.events.some(
+        (event) => event.projectId !== parsed.data.projectId,
+      )
+    ) {
+      return rejectedOutcome(
+        'Every event must belong to the requested project.',
+      )
+    }
+
+    const result = this.appendKernel(parsed.data.events, {
+      projectId: parsed.data.projectId,
+      expectedTail:
+        parsed.data.expectedTail ??
+        (parsed.data.expectedLastEventId === undefined
+          ? undefined
+          : { kind: 'event', eventId: parsed.data.expectedLastEventId }),
+    })
+    if (result.status === 'error') return appendFailureOutcome(result.error)
+    if (
+      !result.lastEventId ||
+      result.events.length !== parsed.data.events.length
+    ) {
+      return failedOutcome(
+        'internal',
+        'The memory store did not return the appended events.',
+        false,
+      )
+    }
+    const lastEventId = MemoryEventIdSchema.safeParse(result.lastEventId)
+    if (!lastEventId.success) {
+      return failedOutcome(
+        'internal',
+        'The memory store returned an invalid last event ID.',
+        false,
+      )
+    }
+    return {
+      outcome: 'appended',
+      entries: result.events.map((entry, index) => ({
+        eventId: parsed.data.events[index]!.eventId,
+        sequence: entry.sequence,
+        duplicate: entry.duplicate,
+      })),
+      lastEventId: lastEventId.data,
+    }
+  }
+
+  private appendKernel(
+    inputs: readonly (
+      | MemoryV2EventInput
+      | MemoryEventDraft
+      | MemoryEventEnvelope
+    )[],
+    guard?: AppendGuard,
+  ): MemoryV2Result<AppendTransactionResult> {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    let events: PreparedEvent[]
+    try {
+      events = inputs.map((input) => prepareEvent(input))
+    } catch (error) {
+      return { status: 'error', error: invalidEventFailure(error) }
+    }
+
+    if (events.length === 0) {
+      return {
+        status: 'ok',
+        events: [],
+        appendedCount: 0,
+        duplicateCount: 0,
+        lastSequence: this.readProjectionCursor(),
+        lastEventId: this.readLastEventId(),
+      }
+    }
+
+    const eventIds = new Set<string>()
+    const idempotencyKeys = new Set<string>()
+    for (const event of events) {
+      if (
+        eventIds.has(event.eventId) ||
+        idempotencyKeys.has(event.idempotencyKey)
+      ) {
+        return {
+          status: 'error',
+          error: {
+            kind: 'invalid',
+            message:
+              'An append request cannot contain duplicate event IDs or idempotency keys.',
+            retryable: false,
+          },
+        }
+      }
+      eventIds.add(event.eventId)
+      idempotencyKeys.add(event.idempotencyKey)
+    }
+
+    let canonicalProjectId: string | null = null
+    for (const event of events) {
+      const metadata = objectValue(event.metadata)
+      if (metadata.schemaVersion !== 2) continue
+      const parsedProjectId = ProjectIdSchema.safeParse(metadata.projectId)
+      if (!parsedProjectId.success) {
+        return {
+          status: 'error',
+          error: invalidEventFailure(
+            new Error(
+              'Events that claim schemaVersion 2 must include a valid projectId.',
+            ),
+          ),
+        }
+      }
+      if (
+        canonicalProjectId !== null &&
+        canonicalProjectId !== parsedProjectId.data
+      ) {
+        return {
+          status: 'error',
+          error: invalidEventFailure(
+            new Error(
+              'Every canonical event in a batch must belong to the same project.',
+            ),
+          ),
+        }
+      }
+      canonicalProjectId = parsedProjectId.data
+    }
+
+    try {
+      const append = this.database.transaction((prepared: PreparedEvent[]) => {
+        const boundProjectId = this.readBoundProjectId()
+        if (
+          boundProjectId !== null &&
+          !ProjectIdSchema.safeParse(boundProjectId).success
+        ) {
+          throw invalidProjectStoreError()
+        }
+        const existingCanonicalProjects = this.database
+          .query(
+            `SELECT DISTINCT json_extract(metadata_json, '$.projectId') AS project_id,
+                           json_type(metadata_json, '$.projectId') AS project_type
+             FROM memory_events
+            WHERE json_extract(metadata_json, '$.schemaVersion') = 2
+            LIMIT 2`,
+          )
+          .all() as Array<{ project_id: unknown; project_type: string | null }>
+        let existingCanonicalProjectId: string | null = null
+        for (const row of existingCanonicalProjects) {
+          const parsedProjectId =
+            row.project_type === 'text'
+              ? ProjectIdSchema.safeParse(row.project_id)
+              : null
+          if (!parsedProjectId?.success) throw invalidProjectStoreError()
+          if (
+            existingCanonicalProjectId !== null &&
+            existingCanonicalProjectId !== parsedProjectId.data
+          ) {
+            throw invalidProjectStoreError()
+          }
+          existingCanonicalProjectId = parsedProjectId.data
+        }
+
+        const projectIds = [
+          boundProjectId,
+          existingCanonicalProjectId,
+          canonicalProjectId,
+          guard?.projectId ?? null,
+        ].filter((projectId): projectId is string => projectId !== null)
+        const projectId = projectIds[0] ?? null
+        if (projectIds.some((candidate) => candidate !== projectId)) {
+          throw new MemoryV2StorageError({
+            kind: 'invalid',
+            message: 'Every event must belong to the requested project.',
+            retryable: false,
+          })
+        }
+        if (
+          projectId !== null &&
+          prepared.some((event) => eventProjectId(event) !== projectId)
+        ) {
+          throw new MemoryV2StorageError({
+            kind: 'invalid',
+            message: 'Every event must belong to the requested project.',
+            retryable: false,
+          })
+        }
+
+        const results: MemoryV2AppendEntry[] = []
+        let hasNewEvent = false
+        for (const event of prepared) {
+          const existing = this.database
+            .query(
+              `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                      payload_json, metadata_json, task_id, session_id, artifact_id
+                 FROM memory_events
+                WHERE event_id = ?1 OR idempotency_key = ?2
+                ORDER BY sequence`,
+            )
+            .all(event.eventId, event.idempotencyKey) as EventRow[]
+          if (existing.length === 0) {
+            hasNewEvent = true
+          } else if (
+            existing.length !== 1 ||
+            !isIdempotentMatch(existing[0], event)
+          ) {
+            throw new MemoryV2StorageError({
+              kind: 'invalid',
+              message:
+                'The event ID or idempotency key conflicts with an existing event.',
+              retryable: false,
+            })
+          } else {
+            results.push({
+              eventId: existing[0].event_id,
+              sequence: existing[0].sequence,
+              duplicate: true,
+            })
+          }
+        }
+
+        const currentLastEventId = guard
+          ? this.readLastEventIdForProject(guard.projectId)
+          : this.readLastEventId()
+        const staleTail =
+          guard?.expectedTail?.kind === 'empty'
+            ? currentLastEventId !== null
+            : guard?.expectedTail?.kind === 'event'
+              ? guard.expectedTail.eventId !== currentLastEventId
+              : false
+        if (hasNewEvent && staleTail) {
+          throw new MemoryV2StorageError({
+            kind: 'conflict',
+            message: 'The memory store changed after the caller last read it.',
+            retryable: true,
+          })
+        }
+
+        if (projectId !== null) this.bindProject(projectId)
+        if (hasNewEvent) {
+          results.length = 0
+          for (const event of prepared) {
+            const existing = this.database
+              .query(
+                `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                        payload_json, metadata_json, task_id, session_id, artifact_id
+                   FROM memory_events WHERE event_id = ?1`,
+              )
+              .get(event.eventId) as EventRow | null
+            if (existing) {
+              results.push({
+                eventId: existing.event_id,
+                sequence: existing.sequence,
+                duplicate: true,
+              })
+              continue
+            }
+            const inserted = this.database
+              .query(
+                `INSERT INTO memory_events (
+                   event_id, idempotency_key, event_type, occurred_at, payload_json,
+                   metadata_json, task_id, session_id, artifact_id
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+              )
+              .run(
+                event.eventId,
+                event.idempotencyKey,
+                event.eventType,
+                event.occurredAt,
+                event.payloadJson,
+                event.metadataJson,
+                event.taskId,
+                event.sessionId,
+                event.artifactId,
+              )
+            const sequence = Number(inserted.lastInsertRowid)
+            applyProjection(this.database, event, sequence)
+            setProjectionCursor(this.database, sequence)
+            setClaimDedupBackfillCursor(this.database, sequence)
+            results.push({ eventId: event.eventId, sequence, duplicate: false })
+          }
+        }
+
+        const appendedCount = results.filter(
+          ({ duplicate }) => !duplicate,
+        ).length
+        const last = guard
+          ? (this.database
+              .query(
+                `SELECT sequence, event_id FROM memory_events
+                  WHERE json_extract(metadata_json, '$.projectId') = ?1
+                  ORDER BY sequence DESC LIMIT 1`,
+              )
+              .get(guard.projectId) as {
+              sequence: number
+              event_id: string
+            } | null)
+          : (this.database
+              .query(
+                'SELECT sequence, event_id FROM memory_events ORDER BY sequence DESC LIMIT 1',
+              )
+              .get() as { sequence: number; event_id: string } | null)
+        return {
+          events: results,
+          appendedCount,
+          duplicateCount: results.length - appendedCount,
+          lastSequence:
+            results.length > 0
+              ? Math.max(...results.map(({ sequence }) => sequence))
+              : (last?.sequence ?? 0),
+          lastEventId: last?.event_id ?? null,
+        }
+      })
+      return { status: 'ok', ...append.immediate(events) }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  async listEvents(
+    options: {
+      afterSequence?: number
+      limit?: number
+    } = {},
+  ): Promise<MemoryV2Result<{ events: MemoryV2StoredEvent[] }>> {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    const afterSequence = validNonNegativeInteger(options.afterSequence ?? 0)
+    const limit = Math.min(
+      validPositiveInteger(options.limit ?? PAGE_SIZE),
+      1_000,
+    )
+    try {
+      const rows = this.database
+        .query(
+          `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                  payload_json, metadata_json, task_id, session_id, artifact_id
+             FROM memory_events
+            WHERE sequence > ?1
+            ORDER BY sequence
+            LIMIT ?2`,
+        )
+        .all(afterSequence, limit) as EventRow[]
+      return { status: 'ok', events: rows.map(storedEventFromRow) }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  async *iterateEvents(
+    options: {
+      afterSequence?: number
+      limit?: number
+    } = {},
+  ): AsyncGenerator<MemoryV2StoredEvent, void> {
+    let cursor = validNonNegativeInteger(options.afterSequence ?? 0)
+    let remaining = Math.min(
+      validPositiveInteger(options.limit ?? 1_000),
+      10_000,
+    )
+
+    while (remaining > 0) {
+      const result = await this.listEvents({
+        afterSequence: cursor,
+        limit: Math.min(PAGE_SIZE, remaining),
+      })
+      if (result.status === 'error')
+        throw new MemoryV2StorageError(result.error)
+      if (result.events.length === 0) return
+      for (const event of result.events) {
+        yield event
+        cursor = event.sequence
+        remaining -= 1
+      }
+    }
+  }
+
+  async rebuildProjections(): Promise<
+    MemoryV2Result<{
+      cursor: number
+      projectedEvents: number
+      truncated: boolean
+    }>
+  > {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    try {
+      const rebuild = this.database.transaction(() => {
+        for (const table of PROJECTION_TABLES)
+          this.database.exec(`DELETE FROM ${table}`)
+        this.database.exec('DELETE FROM memory_usage')
+        // claim_dedup is rebuilt from the surviving log during the replay.
+        this.database.exec('DELETE FROM claim_dedup')
+        setProjectionCursor(this.database, 0)
+        return replayProjections(this.database)
+      })
+      return { status: 'ok', ...rebuild.immediate() }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  async getProjectionSnapshot(): Promise<
+    MemoryV2Result<MemoryV2ProjectionSnapshot>
+  > {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    try {
+      return {
+        status: 'ok',
+        cursor: this.readProjectionCursor(),
+        tasks: readProjectionRows(this.database, 'memory_tasks'),
+        sessions: readProjectionRows(this.database, 'memory_sessions'),
+        artifacts: readProjectionRows(this.database, 'memory_artifacts'),
+        claims: readProjectionRows(this.database, 'memory_claims'),
+        evidence: readProjectionRows(this.database, 'memory_evidence'),
+        discoveries: readProjectionRows(this.database, 'memory_discoveries'),
+      }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  /**
+   * Bounded read of the P4 usage projection. Filters by the bound project
+   * (single-project stores) and either the given observation ids (max 64) or
+   * up to 256 rows in code-point order of observation_id.
+   */
+  async getUsage(params: {
+    projectId: string
+    observationIds?: string[]
+  }): Promise<
+    MemoryV2Result<{
+      usage: Array<{
+        observationId: string
+        usedCount: number
+        ignoredCount: number
+        staledCount: number
+        lastMechanism: string | null
+        lastTurnId: string | null
+        lastSequence: number
+      }>
+    }>
+  > {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    try {
+      this.requireBoundProject(params.projectId)
+      const filtered = Array.isArray(params.observationIds)
+        ? params.observationIds
+            .filter(
+              (id): id is string =>
+                typeof id === 'string' && id.length > 0 && id.length <= 512,
+            )
+            .slice(0, 64)
+        : undefined
+      if (filtered !== undefined && filtered.length === 0) {
+        return { status: 'ok', usage: [] }
+      }
+      const rows =
+        filtered !== undefined
+          ? (this.database
+              .query(
+                `SELECT observation_id, used_count, ignored_count, staled_count,
+                        last_mechanism, last_turn_id, last_sequence
+                   FROM memory_usage
+                  WHERE observation_id IN (${filtered
+                    .map((_, index) => `?${index + 1}`)
+                    .join(', ')})
+                  ORDER BY observation_id
+                  LIMIT 256`,
+              )
+              .all(...filtered) as UsageRow[])
+          : (this.database
+              .query(
+                `SELECT observation_id, used_count, ignored_count, staled_count,
+                        last_mechanism, last_turn_id, last_sequence
+                   FROM memory_usage
+                  ORDER BY observation_id
+                  LIMIT 256`,
+              )
+              .all() as UsageRow[])
+      return {
+        status: 'ok',
+        usage: rows.map((row) => ({
+          observationId: row.observation_id,
+          usedCount: row.used_count,
+          ignoredCount: row.ignored_count,
+          staledCount: row.staled_count,
+          lastMechanism: row.last_mechanism ?? null,
+          lastTurnId: row.last_turn_id ?? null,
+          lastSequence: row.last_sequence,
+        })),
+      }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  /**
+   * Bounded read of the P7 claim-dedup projection. Filters by the bound
+   * project (single-project stores) and either the given claim ids (max 64)
+   * or up to 256 rows in code-point order of claim_id.
+   */
+  async getClaimDedup(params: {
+    projectId: string
+    claimIds?: string[]
+  }): Promise<
+    MemoryV2Result<{
+      entries: Array<{
+        claimId: string
+        observationId: string
+      }>
+    }>
+  > {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    try {
+      this.requireBoundProject(params.projectId)
+      const filtered = Array.isArray(params.claimIds)
+        ? params.claimIds
+            .filter(
+              (id): id is string =>
+                typeof id === 'string' && id.length >= 1 && id.length <= 64,
+            )
+            .slice(0, 64)
+        : undefined
+      if (filtered !== undefined && filtered.length === 0) {
+        return { status: 'ok', entries: [] }
+      }
+      const rows =
+        filtered !== undefined
+          ? (this.database
+              .query(
+                `SELECT claim_id, observation_id
+                   FROM claim_dedup
+                  WHERE claim_id IN (${filtered
+                    .map((_, index) => `?${index + 1}`)
+                    .join(', ')})
+                  ORDER BY claim_id
+                  LIMIT 256`,
+              )
+              .all(...filtered) as ClaimDedupRow[])
+          : (this.database
+              .query(
+                `SELECT claim_id, observation_id
+                   FROM claim_dedup
+                  ORDER BY claim_id
+                  LIMIT 256`,
+              )
+              .all() as ClaimDedupRow[])
+      return {
+        status: 'ok',
+        entries: rows.map((row) => ({
+          claimId: row.claim_id,
+          observationId: row.observation_id,
+        })),
+      }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  /**
+   * Bounded read of the P7 observation lifecycle status projection. Filters
+   * by the bound project (single-project stores) and the given observation
+   * ids (max 64), returning up to 256 rows in code-point order of
+   * observation_id. Targets absent from memory_claims are omitted from the
+   * result so callers fail closed on unknown ids.
+   */
+  async getObservationStatus(
+    params: MemoryObservationStatusReadRequest,
+  ): Promise<MemoryV2Result<{ entries: MemoryObservationStatusEntry[] }>> {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+
+    try {
+      this.requireBoundProject(params.projectId)
+      const filtered = Array.isArray(params.observationIds)
+        ? [...new Set(params.observationIds)]
+            .filter(
+              (id): id is string =>
+                typeof id === 'string' && id.length >= 1 && id.length <= 128,
+            )
+            .slice(0, 64)
+        : []
+      if (filtered.length === 0) {
+        return { status: 'ok', entries: [] }
+      }
+      const rows = this.database
+        .query(
+          `SELECT entity_id, task_id, state_json
+             FROM memory_claims
+            WHERE entity_id IN (${filtered
+              .map((_, index) => `?${index + 1}`)
+              .join(', ')})
+            ORDER BY entity_id
+            LIMIT 256`,
+        )
+        .all(...filtered) as ObservationStatusRow[]
+      return {
+        status: 'ok',
+        entries: rows
+          .map((row) => {
+            let state: unknown
+            let readable = true
+            try {
+              state = JSON.parse(row.state_json) as unknown
+            } catch {
+              // Unreadable or malformed projection state fails closed: the
+              // row maps to 'unknown', which supersession-safety callers
+              // (accepting only 'active' targets) treat as ineligible.
+              readable = false
+              state = undefined
+            }
+            const lifecycle = nestedValue(state, 'lifecycle')
+            return {
+              observationId: row.entity_id,
+              taskId: row.task_id ?? '',
+              status: !readable
+                ? ('unknown' as const)
+                : typeof lifecycle === 'string' &&
+                    RETRACTED_CLAIM_LIFECYCLES.has(lifecycle)
+                  ? ('retracted' as const)
+                  : typeof lifecycle === 'string'
+                    ? ('active' as const)
+                    : ('unknown' as const),
+            }
+          })
+          .sort((left, right) =>
+            compareUnicodeCodePoints(left.observationId, right.observationId),
+          ),
+      }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  async getCapabilities(): Promise<
+    MemoryV2Result<{ capabilities: MemoryV2Capability[] }>
+  > {
+    const unavailable = this.requireOpen()
+    if (unavailable) return unavailable
+    try {
+      return { status: 'ok', capabilities: readCapabilities(this.database) }
+    } catch (error) {
+      return { status: 'error', error: classifyStorageError(error) }
+    }
+  }
+
+  async query(request: MemoryRetrievalRequest): Promise<MemoryQueryOutcome> {
+    const parsed = MemoryRetrievalRequestSchema.safeParse(request)
+    if (!parsed.success)
+      return rejectedOutcome('The memory query request is invalid.')
+    const unavailable = this.requireOpen()
+    if (unavailable) return operationFailureOutcome(unavailable.error)
+
+    try {
+      this.requireBoundProject(parsed.data.projectId)
+      const scan = scanQueryRows(this.database, parsed.data.projectId)
+      const events = scan.rows
+        .reverse()
+        .filter((row) => CANONICAL_EVENT_TYPES.has(row.event_type))
+        .map(envelopeFromRow)
+      return {
+        outcome: 'result',
+        result: await buildLexicalResult(
+          parsed.data,
+          events,
+          scan.eventCapReached,
+          scan.payloadBudgetReached,
+          this.recallExpander,
+        ),
+      }
+    } catch (error) {
+      const failure = classifyStorageError(error)
+      return failure.kind === 'invalid'
+        ? rejectedOutcome(failure.message)
+        : operationFailureOutcome(failure)
+    }
+  }
+
+  async verify(request: MemoryVerifyRequest): Promise<MemoryVerifyOutcome> {
+    const parsed = MemoryVerifyRequestSchema.safeParse(request)
+    if (!parsed.success)
+      return rejectedOutcome('The memory verify request is invalid.')
+    const action = parsed.data.action
+    if (
+      action.kind === 'verify' &&
+      'path' in action.selector &&
+      !action.observedDigest
+    ) {
+      return rejectedOutcome(
+        'Path-backed evidence verification requires an observed digest.',
+      )
+    }
+    const identity = stableJson({
+      projectId: parsed.data.projectId,
+      sessionId: parsed.data.sessionId,
+      workspaceRevision: parsed.data.workspaceRevision,
+      workspaceSnapshotId: parsed.data.workspaceSnapshotId,
+      action,
+    })
+    const hash = createHash('sha256').update(identity).digest('hex')
+    const timestamp = new Date(
+      Date.UTC(2020, 0, 1) + Number.parseInt(hash.slice(0, 8), 16) * 1_000,
+    ).toISOString()
+    const eventType =
+      action.kind === 'verify'
+        ? 'evidence.verified'
+        : action.kind === 'invalidate'
+          ? 'evidence.invalidated'
+          : 'evidence.rebound'
+    const payload =
+      action.kind === 'verify'
+        ? {
+            payloadSchemaVersion: 1 as const,
+            observationId: action.observationId,
+            selector: action.selector,
+            verifier: 'bun-sqlite-memory-v2',
+            verifiedAt: timestamp,
+            ...(action.observedDigest
+              ? { observedDigest: action.observedDigest }
+              : {}),
+            ...(parsed.data.workspaceRevision
+              ? { workspaceRevision: parsed.data.workspaceRevision }
+              : {}),
+            ...(parsed.data.workspaceSnapshotId
+              ? { workspaceSnapshotId: parsed.data.workspaceSnapshotId }
+              : {}),
+          }
+        : action.kind === 'invalidate'
+          ? {
+              payloadSchemaVersion: 1 as const,
+              observationId: action.observationId,
+              selector: action.selector,
+              reason: action.reason,
+              detail: action.detail,
+              invalidatedAt: timestamp,
+            }
+          : {
+              payloadSchemaVersion: 1 as const,
+              observationId: action.observationId,
+              previousSelector: action.previousSelector,
+              evidence: action.evidence,
+              reason: action.reason,
+            }
+    const draft = MemoryEventDraftSchema.parse({
+      schemaVersion: 2,
+      eventSchemaVersion: 1,
+      eventType,
+      eventId: `verify:${hash.slice(0, 40)}`,
+      projectId: parsed.data.projectId,
+      sessionId: parsed.data.sessionId,
+      occurredAt: timestamp,
+      payload,
+    })
+    const appended = await this.append(
+      MemoryAppendRequestSchema.parse({
+        schemaVersion: 2,
+        projectId: parsed.data.projectId,
+        events: [draft],
+      }),
+    )
+    if (appended.outcome !== 'appended')
+      return MemoryVerifyOutcomeSchema.parse(appended)
+    try {
+      const row = this.database
+        .query(
+          `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                  payload_json, metadata_json, task_id, session_id, artifact_id
+             FROM memory_events
+            WHERE event_id = ?1
+              AND json_extract(metadata_json, '$.projectId') = ?2
+            LIMIT 1`,
+        )
+        .get(draft.eventId, parsed.data.projectId) as EventRow | null
+      if (!row)
+        return failedOutcome(
+          'internal',
+          'The committed verification event was not found.',
+          false,
+        )
+      return MemoryVerifyOutcomeSchema.parse({
+        outcome: 'recorded',
+        event: envelopeFromRow(row),
+      })
+    } catch (error) {
+      return MemoryVerifyOutcomeSchema.parse(
+        operationFailureOutcome(classifyStorageError(error)),
+      )
+    }
+  }
+
+  async rebuild(request: MemoryRebuildRequest): Promise<MemoryRebuildOutcome> {
+    const parsed = MemoryRebuildRequestSchema.safeParse(request)
+    if (!parsed.success)
+      return rejectedOutcome('The memory rebuild request is invalid.')
+    if (parsed.data.fromEventId !== undefined) {
+      return rejectedOutcome('Partial projection rebuilds are not supported.')
+    }
+    try {
+      this.requireBoundProject(parsed.data.projectId)
+    } catch (error) {
+      return rejectedOutcome(classifyStorageError(error).message)
+    }
+    const result = await this.rebuildProjections()
+    if (result.status === 'error') return operationFailureOutcome(result.error)
+    return {
+      outcome: 'rebuilt',
+      rebuildId: parsed.data.rebuildId,
+      processedEvents: result.projectedEvents,
+    }
+  }
+
+  async health(request: MemoryHealthRequest): Promise<MemoryHealth> {
+    const parsed = MemoryHealthRequestSchema.safeParse(request)
+    if (!parsed.success) {
+      return commonHealth('unavailable', [
+        'The memory health request is invalid.',
+      ])
+    }
+    if (this.closed)
+      return commonHealth('unavailable', ['The memory store is closed.'])
+
+    try {
+      const schemaVersion = readPragmaNumber(
+        this.database,
+        'PRAGMA user_version',
+        'user_version',
+      )
+      const check = readPragmaString(
+        this.database,
+        'PRAGMA quick_check(1)',
+        'quick_check',
+      )
+      const journalMode = readPragmaString(
+        this.database,
+        'PRAGMA journal_mode',
+        'journal_mode',
+      )
+      const issues: string[] = []
+      if (schemaVersion !== SCHEMA_VERSION)
+        issues.push('The memory store schema is incompatible.')
+      if (check !== 'ok')
+        issues.push('The memory store failed its integrity check.')
+      if (journalMode.toLowerCase() !== 'wal')
+        issues.push('The memory store is not using WAL mode.')
+      return commonHealth(
+        schemaVersion !== SCHEMA_VERSION || check !== 'ok'
+          ? 'unavailable'
+          : issues.length > 0
+            ? 'degraded'
+            : 'healthy',
+        issues,
+      )
+    } catch (error) {
+      return commonHealth('unavailable', [classifyStorageError(error).message])
+    }
+  }
+
+  async export(request: MemoryExportRequest): Promise<MemoryExportOutcome> {
+    const parsed = MemoryExportRequestSchema.safeParse(request)
+    if (!parsed.success)
+      return rejectedOutcome('The memory export request is invalid.')
+    const unavailable = this.requireOpen()
+    if (unavailable) return operationFailureOutcome(unavailable.error)
+
+    try {
+      this.requireBoundProject(parsed.data.projectId)
+      let afterSequence = 0
+      if (parsed.data.afterEventId !== undefined) {
+        const cursor = this.database
+          .query(
+            `SELECT sequence FROM memory_events
+              WHERE event_id = ?1
+                AND json_extract(metadata_json, '$.projectId') = ?2`,
+          )
+          .get(parsed.data.afterEventId, parsed.data.projectId) as {
+          sequence: number
+        } | null
+        if (!cursor)
+          return rejectedOutcome(
+            'The export cursor was not found.',
+            'not-found',
+          )
+        afterSequence = cursor.sequence
+      }
+      // Tolerant reader: `skippedUnknownCount` counts rows whose event_type is
+      // not a recognized canonical type (unknown/future types), which are
+      // skipped so a future additive event type never bricks an older reader.
+      // A KNOWN canonical type that fails strict decode is a hard error
+      // (surfaced as a failed/rejected export outcome), never silently dropped.
+      // export() issues exactly ONE raw query per call and builds the page from
+      // that single raw page:
+      // - `nextAfterEventId` is the authoritative opaque cursor, driven by the
+      //   RAW rows (never recomputed from the filtered events), and a `null`
+      //   cursor is the only terminal signal. It can advance past skipped tail
+      //   rows, so an empty `events[]` MAY be paired with a non-null cursor
+      //   when the whole raw page was dropped; consumers must guard
+      //   loop-termination on the cursor, never on `events.length`.
+      // - `rawTailEventId` is the id of the last RAW row in the page
+      //   (decodable or not) and is the authoritative source for
+      //   store-tail/CAS derivation; it is omitted only when the page observed
+      //   zero raw rows.
+      const rows = this.database
+        .query(
+          `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                  payload_json, metadata_json, task_id, session_id, artifact_id
+             FROM memory_events
+            WHERE sequence > ?1
+              AND json_extract(metadata_json, '$.projectId') = ?2
+            ORDER BY sequence
+            LIMIT ?3`,
+        )
+        .all(
+          afterSequence,
+          parsed.data.projectId,
+          parsed.data.limit,
+        ) as EventRow[]
+      const events: MemoryEventEnvelope[] = []
+      let skippedUnknownCount = 0
+      for (const row of rows) {
+        if (!CANONICAL_EVENT_TYPES.has(row.event_type)) {
+          skippedUnknownCount += 1
+          continue
+        }
+        events.push(envelopeFromRow(row))
+      }
+      const lastRow = rows[rows.length - 1]
+      const nextAfterEventId: MemoryEventEnvelope['eventId'] | null =
+        rows.length === parsed.data.limit
+          ? (lastRow!.event_id as MemoryEventEnvelope['eventId'])
+          : null
+      return {
+        outcome: 'page',
+        events,
+        nextAfterEventId,
+        ...(rows.length > 0
+          ? {
+              rawTailEventId:
+                lastRow!.event_id as MemoryEventEnvelope['eventId'],
+            }
+          : {}),
+        skippedUnknownCount,
+      }
+    } catch (error) {
+      const failure = classifyStorageError(error)
+      return failure.kind === 'invalid'
+        ? rejectedOutcome(failure.message)
+        : operationFailureOutcome(failure)
+    }
+  }
+
+  async kernelHealth(): Promise<MemoryV2Health> {
+    if (this.closed) {
+      return unavailableHealth({
+        kind: 'closed',
+        message: 'The memory store is closed.',
+        retryable: false,
+      })
+    }
+
+    try {
+      const schemaVersion = readPragmaNumber(
+        this.database,
+        'PRAGMA user_version',
+        'user_version',
+      )
+      if (schemaVersion !== SCHEMA_VERSION) {
+        return unavailableHealth(
+          {
+            kind: 'incompatible',
+            message: 'The memory store schema is incompatible with this CLI.',
+            retryable: false,
+          },
+          schemaVersion,
+        )
+      }
+      const check = readPragmaString(
+        this.database,
+        'PRAGMA quick_check(1)',
+        'quick_check',
+      )
+      if (check !== 'ok') {
+        return unavailableHealth(
+          {
+            kind: 'corrupt',
+            message: 'The memory store failed its integrity check.',
+            retryable: false,
+          },
+          schemaVersion,
+        )
+      }
+
+      const journalMode = readPragmaString(
+        this.database,
+        'PRAGMA journal_mode',
+        'journal_mode',
+      )
+      const synchronous = String(
+        readPragmaNumber(this.database, 'PRAGMA synchronous', 'synchronous'),
+      )
+      return {
+        status: journalMode.toLowerCase() === 'wal' ? 'healthy' : 'degraded',
+        schemaVersion,
+        journalMode,
+        synchronous,
+        openPosture: SQLITE_OPEN_POSTURE,
+        projectionCursor: this.readProjectionCursor(),
+        capabilities: readCapabilities(this.database),
+      }
+    } catch (error) {
+      return unavailableHealth(classifyStorageError(error))
+    }
+  }
+
+  async search(): Promise<MemoryV2UnsupportedResult> {
+    return unsupported('semantic-search')
+  }
+
+  async getStoreStats(request: { projectId: string }): Promise<MemoryStoreStats> {
+    const unavailable = this.requireOpen()
+    if (unavailable) throw new MemoryV2StorageError(unavailable.error)
+    try {
+      this.requireBoundProject(request.projectId)
+      const count = (
+        this.database
+          .query(
+            `SELECT COUNT(*) AS count FROM memory_events
+              WHERE json_extract(metadata_json, '$.projectId') = ?1`,
+          )
+          .get(request.projectId) as { count: number }
+      ).count
+      const pageCount = readPragmaNumber(this.database, 'PRAGMA page_count', 'page_count')
+      const pageSize = readPragmaNumber(this.database, 'PRAGMA page_size', 'page_size')
+      return { eventCount: count, bytes: pageCount * pageSize }
+    } catch (error) {
+      if (error instanceof MemoryV2StorageError) throw error
+      throw new MemoryV2StorageError(classifyStorageError(error))
+    }
+  }
+
+  async selectGCandidates(request: {
+    projectId: string
+    olderThanDays: number
+    maxEvents: number
+  }): Promise<GcCandidateSelection> {
+    const unavailable = this.requireOpen()
+    if (unavailable) throw new MemoryV2StorageError(unavailable.error)
+    try {
+      this.requireBoundProject(request.projectId)
+      if (
+        !Number.isInteger(request.olderThanDays) ||
+        request.olderThanDays < 1 ||
+        request.olderThanDays > 365
+      ) {
+        throw new MemoryV2StorageError({
+          kind: 'invalid',
+          message: 'The GC olderThanDays must be an integer between 1 and 365.',
+          retryable: false,
+        })
+      }
+      if (
+        !Number.isInteger(request.maxEvents) ||
+        request.maxEvents < 1 ||
+        request.maxEvents > GC_SELECT_LIMIT
+      ) {
+        throw new MemoryV2StorageError({
+          kind: 'invalid',
+          message: 'The GC maxEvents must be an integer between 1 and 10000.',
+          retryable: false,
+        })
+      }
+      const eventTypePlaceholders = GC_RELEVANT_EVENT_TYPES.map(
+        (_, index) => `?${index + 3}`,
+      ).join(',')
+      const rows = this.database
+        .query(
+          `SELECT event_id, event_type, sequence, occurred_at, payload_json FROM memory_events
+            WHERE json_extract(metadata_json, '$.projectId') = ?1
+              AND event_type IN (${eventTypePlaceholders})
+            ORDER BY sequence ASC
+            LIMIT ?2`,
+        )
+        .all(
+          request.projectId,
+          GC_SELECT_LIMIT,
+          ...GC_RELEVANT_EVENT_TYPES,
+        ) as Array<{
+        event_id: string
+        event_type: string
+        sequence: number
+        occurred_at: string
+        payload_json: string
+      }>
+      const envelopes: GCRelevantEnvelope[] = []
+      let asOfTurnWall = '1970-01-01T00:00:00.000Z'
+      for (const row of rows) {
+        let payload: unknown
+        try {
+          payload = JSON.parse(row.payload_json) as unknown
+        } catch {
+          // Malformed payload rows are skipped; selection is best-effort.
+          // The privileged compaction pre-check remains fail-closed.
+          continue
+        }
+        envelopes.push({
+          eventType: row.event_type,
+          eventId: row.event_id,
+          sequence: Number(row.sequence),
+          occurredAt: row.occurred_at,
+          payload,
+        })
+        if (row.occurred_at > asOfTurnWall) asOfTurnWall = row.occurred_at
+      }
+      const selection = selectCompactionCandidates({
+        envelopes,
+        maxEvents: request.maxEvents,
+        asOfTurnWall,
+      })
+      return {
+        eventIds: selection.eventIds as GcCandidateSelection['eventIds'],
+      }
+    } catch (error) {
+      if (error instanceof MemoryV2StorageError) throw error
+      throw new MemoryV2StorageError(classifyStorageError(error))
+    }
+  }
+
+  async inspectForGC(request: {
+    projectId: string
+    olderThanDays: number
+    maxEvents: number
+  }): Promise<GcCandidateSelection> {
+    return this.selectGCandidates(request)
+  }
+
+  async privilegedCompact(
+    input: PrivilegedCompactionInput,
+  ): Promise<PrivilegedCompactionResult> {
+    const unavailable = this.requireOpen()
+    if (unavailable) throw new MemoryV2StorageError(unavailable.error)
+    try {
+      this.requireBoundProject(input.projectId)
+    } catch (error) {
+      throw error instanceof MemoryV2StorageError
+        ? error
+        : new MemoryV2StorageError(classifyStorageError(error))
+    }
+    const fail = (message: string): never => {
+      throw new MemoryV2StorageError({ kind: 'invalid', message, retryable: false })
+    }
+    if (
+      !Array.isArray(input.eventIds) ||
+      input.eventIds.length < 1 ||
+      input.eventIds.length > COMPACTION_APPLY_MAX
+    ) {
+      fail('The privileged compaction event list must contain 1 to 100 event IDs.')
+    }
+    for (const id of input.eventIds) {
+      if (!MemoryEventIdSchema.safeParse(id).success)
+        fail('The privileged compaction event IDs are invalid.')
+    }
+    if (!Array.isArray(input.archiveLines) || input.archiveLines.length !== input.eventIds.length) {
+      fail('The privileged compaction archive lines must match the event list.')
+    }
+    if (typeof input.archiveHash !== 'string' || !DIGEST_PATTERN.test(input.archiveHash)) {
+      fail('The privileged compaction archive hash is invalid.')
+    }
+    if (
+      typeof input.archivePath !== 'string' ||
+      input.archivePath.length < 1 ||
+      input.archivePath.length > 1024
+    ) {
+      fail('The privileged compaction archive path is invalid.')
+    }
+    const draft = MemoryEventDraftSchema.safeParse(input.archiveClaimDraft)
+    if (!draft.success || draft.data.eventType !== 'claim.archived') {
+      fail('The privileged compaction archive claim is invalid.')
+    }
+    const claim = draft.data as Extract<typeof draft.data, { eventType: 'claim.archived' }>
+    if (claim.projectId !== input.projectId) {
+      fail('The privileged compaction archive claim project does not match.')
+    }
+    if (
+      claim.payload.archivedEventIds.length !== input.eventIds.length ||
+      claim.payload.archivedEventIds.some((id, index) => id !== input.eventIds[index])
+    ) {
+      fail('The privileged compaction archive claim events do not match.')
+    }
+    if (
+      claim.payload.archiveHash !== input.archiveHash ||
+      claim.payload.archivePath !== input.archivePath
+    ) {
+      fail('The privileged compaction archive claim hash or path does not match.')
+    }
+    const expectedHash = `sha256:${createHash('sha256').update(stableJson(input.archiveLines)).digest('hex')}`
+    if (expectedHash !== input.archiveHash) {
+      fail('The privileged compaction archive hash does not match the archive lines.')
+    }
+    const before = await this.getStoreStats({ projectId: input.projectId })
+    const placeholders = input.eventIds.map(() => '?').join(',')
+    const projectParamIndex = input.eventIds.length + 1
+    this.database.exec('BEGIN IMMEDIATE')
+    try {
+      const existing = this.database
+        .query(
+          `SELECT event_id FROM memory_events
+            WHERE event_id IN (${placeholders})
+              AND json_extract(metadata_json, '$.projectId') = ?${projectParamIndex}`,
+        )
+        .all(...input.eventIds, input.projectId) as Array<{ event_id: string }>
+      if (existing.length !== input.eventIds.length) {
+        fail('The privileged compaction events were not found for this project.')
+      }
+      // P6 fail-closed closure verification BEFORE the delete trigger is
+      // dropped: every observation referenced by a batch event must have its
+      // anchor 'observation.recorded' inside the batch (group closure), and
+      // no shared event outside the batch may reference an archived
+      // observation (resurrection / shared-event corruption gate).
+      const batchRows = this.database
+        .query(
+          `SELECT event_id, event_type, sequence, occurred_at, payload_json FROM memory_events
+            WHERE event_id IN (${placeholders})
+              AND json_extract(metadata_json, '$.projectId') = ?${projectParamIndex}`,
+        )
+        .all(...input.eventIds, input.projectId) as Array<{
+        event_id: string
+        event_type: string
+        sequence: number
+        occurred_at: string
+        payload_json: string
+      }>
+      const batchEnvelopes: GCRelevantEnvelope[] = []
+      for (const row of batchRows) {
+        let payload: unknown
+        try {
+          payload = JSON.parse(row.payload_json) as unknown
+        } catch {
+          fail('The privileged compaction batch contains a malformed event payload.')
+        }
+        batchEnvelopes.push({
+          eventType: row.event_type,
+          eventId: row.event_id,
+          sequence: Number(row.sequence),
+          occurredAt: row.occurred_at,
+          payload,
+        })
+      }
+      const referencedObservationIds = new Set<string>()
+      const batchAnchoredObservationIds = new Set<string>()
+      const batchEventIdSet = new Set(batchEnvelopes.map((envelope) => envelope.eventId))
+      for (const envelope of batchEnvelopes) {
+        for (const id of observationIdsReferencedBy(envelope.eventType, envelope.payload)) {
+          referencedObservationIds.add(id)
+        }
+        if (envelope.eventType === 'observation.recorded') {
+          for (const id of observationIdsReferencedBy(envelope.eventType, envelope.payload)) {
+            batchAnchoredObservationIds.add(id)
+          }
+        }
+      }
+      for (const id of referencedObservationIds) {
+        if (!batchAnchoredObservationIds.has(id)) {
+          fail(
+            `The privileged compaction batch does not close the observation group for ${id}: the observation.recorded anchor is missing.`,
+          )
+        }
+      }
+      const batchEventTypePlaceholders = GC_RELEVANT_EVENT_TYPES.map(
+        (_, index) => `?${input.eventIds.length + 1 + index}`,
+      ).join(',')
+      const sharedOutside = this.database
+        .query(
+          `SELECT event_id, event_type, payload_json FROM memory_events
+            WHERE event_id NOT IN (${placeholders})
+              AND event_type IN (${batchEventTypePlaceholders})
+              AND json_extract(metadata_json, '$.projectId') = ?${
+                input.eventIds.length + GC_RELEVANT_EVENT_TYPES.length + 1
+              }`,
+        )
+        .all(
+          ...input.eventIds,
+          ...GC_RELEVANT_EVENT_TYPES,
+          input.projectId,
+        ) as Array<{
+        event_id: string
+        event_type: string
+        payload_json: string
+      }>
+      for (const row of sharedOutside) {
+        if (!GC_SHARED_EVENT_TYPES.includes(row.event_type)) continue
+        if (batchEventIdSet.has(row.event_id)) continue
+        let payload: unknown
+        try {
+          payload = JSON.parse(row.payload_json) as unknown
+        } catch {
+          // Outside rows keep selection's tolerant posture; only batch rows
+          // are fail-closed here.
+          continue
+        }
+        const references = observationIdsReferencedBy(row.event_type, payload)
+        const conflict = references.find((id) => referencedObservationIds.has(id))
+        if (conflict !== undefined) {
+          fail(
+            `Privileged compaction closure violated: shared event ${row.event_id} outside the batch references archived observation ${conflict}.`,
+          )
+        }
+      }
+      this.database.exec('DROP TRIGGER IF EXISTS memory_events_no_delete')
+      const deleted = this.database
+        .query(
+          `DELETE FROM memory_events
+            WHERE event_id IN (${placeholders})
+              AND json_extract(metadata_json, '$.projectId') = ?${projectParamIndex}`,
+        )
+        .run(...input.eventIds, input.projectId) as unknown as { changes: unknown }
+      if (Number(deleted.changes) !== input.eventIds.length) {
+        fail('The privileged compaction delete did not remove every event.')
+      }
+      this.database.exec(NO_DELETE_TRIGGER_SQL)
+      const prepared = prepareEvent(claim)
+      const duplicate = this.database
+        .query('SELECT event_id FROM memory_events WHERE event_id = ?1')
+        .get(prepared.eventId) as { event_id: string } | null
+      if (duplicate) {
+        fail('The privileged compaction archive claim already exists.')
+      }
+      this.database
+        .query(
+          `INSERT INTO memory_events (
+             event_id, idempotency_key, event_type, occurred_at, payload_json,
+             metadata_json, task_id, session_id, artifact_id
+           ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+        )
+        .run(
+          prepared.eventId,
+          prepared.idempotencyKey,
+          prepared.eventType,
+          prepared.occurredAt,
+          prepared.payloadJson,
+          prepared.metadataJson,
+          prepared.taskId,
+          prepared.sessionId,
+          prepared.artifactId,
+        )
+      for (const table of PROJECTION_TABLES) this.database.exec(`DELETE FROM ${table}`)
+      // The usage projection must stay consistent with the surviving event log:
+      // clearing the canonical events (including archived 'observation.reused'
+      // events) invalidates their usage counters, so memory_usage is rebuilt
+      // from scratch exactly like every other projection table (matches
+      // rebuildProjections).
+      this.database.exec('DELETE FROM memory_usage')
+      // claim_dedup is rebuilt from the surviving log during the replay.
+      this.database.exec('DELETE FROM claim_dedup')
+      setProjectionCursor(this.database, 0)
+      replayProjections(this.database, Number.MAX_SAFE_INTEGER)
+      this.database.exec('COMMIT')
+    } catch (error) {
+      try {
+        this.database.exec('ROLLBACK')
+      } catch {
+        // Preserve the primary compaction failure.
+      }
+      if (error instanceof MemoryV2StorageError) throw error
+      throw new MemoryV2StorageError(classifyStorageError(error))
+    }
+    try {
+      this.database.exec('VACUUM')
+    } catch (error) {
+      throw new MemoryV2StorageError(classifyStorageError(error))
+    }
+    const after = await this.getStoreStats({ projectId: input.projectId })
+    return {
+      archivedEventIds: [...input.eventIds] as PrivilegedCompactionResult['archivedEventIds'],
+      beforeCount: before.eventCount,
+      afterCount: after.eventCount,
+      beforeBytes: before.bytes,
+      afterBytes: after.bytes,
+    }
+  }
+
+  async compact(): Promise<MemoryV2UnsupportedResult> {
+    return unsupported('compaction')
+  }
+
+  async deleteEvents(): Promise<MemoryV2UnsupportedResult> {
+    return unsupported('canonical-event-deletion')
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return
+    this.closed = true
+    this.database.close()
+  }
+
+  private requireOpen(): { status: 'error'; error: MemoryV2Failure } | null {
+    return this.closed
+      ? {
+          status: 'error',
+          error: {
+            kind: 'closed',
+            message: 'The memory store is closed.',
+            retryable: false,
+          },
+        }
+      : null
+  }
+
+  private bindProject(projectId: string): void {
+    const bound = this.readBoundProjectId()
+    if (bound !== null && bound !== projectId) {
+      throw new MemoryV2StorageError({
+        kind: 'invalid',
+        message:
+          'This memory database is already bound to a different project.',
+        retryable: false,
+      })
+    }
+    if (bound === null) {
+      this.database
+        .query(
+          "INSERT INTO memory_projection_metadata(key, value) VALUES ('project_id', ?1)",
+        )
+        .run(projectId)
+    }
+  }
+
+  private requireBoundProject(projectId: string): void {
+    const bound = this.readBoundProjectId()
+    if (bound === null) {
+      const eventful = this.database
+        .query('SELECT 1 AS present FROM memory_events LIMIT 1')
+        .get() as { present: number } | null
+      if (eventful) {
+        throw new MemoryV2StorageError({
+          kind: 'invalid',
+          message:
+            'This eventful memory database is not bound to a valid project.',
+          retryable: false,
+        })
+      }
+      return
+    }
+    if (bound !== projectId) {
+      throw new MemoryV2StorageError({
+        kind: 'invalid',
+        message: 'This memory database is bound to a different project.',
+        retryable: false,
+      })
+    }
+  }
+
+  private readBoundProjectId(): string | null {
+    const row = this.database
+      .query(
+        "SELECT value FROM memory_projection_metadata WHERE key = 'project_id'",
+      )
+      .get() as { value: string } | null
+    return row?.value ?? null
+  }
+
+  private readLastEventIdForProject(projectId: string): string | null {
+    const row = this.database
+      .query(
+        `SELECT event_id FROM memory_events
+          WHERE json_extract(metadata_json, '$.projectId') = ?1
+          ORDER BY sequence DESC LIMIT 1`,
+      )
+      .get(projectId) as { event_id: string } | null
+    return row?.event_id ?? null
+  }
+
+  private readLastEventId(): string | null {
+    const row = this.database
+      .query(
+        'SELECT event_id FROM memory_events ORDER BY sequence DESC LIMIT 1',
+      )
+      .get() as { event_id: string } | null
+    return row?.event_id ?? null
+  }
+
+  private readProjectionCursor(): number {
+    const row = this.database
+      .query(
+        "SELECT value FROM memory_projection_metadata WHERE key = 'cursor'",
+      )
+      .get() as { value: string } | null
+    return row ? Number(row.value) : 0
+  }
+}
+
+export async function openBunSQLiteMemoryRepository(
+  options: BunSQLiteMemoryRepositoryOptions = {},
+): Promise<BunSQLiteMemoryRepositoryOpenResult> {
+  return BunSQLiteMemoryRepository.open(options)
+}
+
+function prepareDatabasePath(
+  options: BunSQLiteMemoryRepositoryOptions,
+): PreparedDatabasePath {
+  const root = resolve(options.repositoryRoot ?? process.cwd())
+  const requested = options.databasePath ?? DEFAULT_DATABASE_PATH
+  const databasePath = isAbsolute(requested)
+    ? resolve(requested)
+    : resolve(root, requested)
+  if (!isContainedPath(root, databasePath)) throw containedDatabaseError()
+
+  mkdirSync(root, { recursive: true, mode: 0o700 })
+  assertSafeDirectory(root)
+  const realRoot = realpathSync(root)
+  const parent = dirname(databasePath)
+  const parentRelation = relative(root, parent)
+  let current = root
+  for (const component of parentRelation.split(/[\\/]/).filter(Boolean)) {
+    current = join(current, component)
+    if (existsSync(current)) assertSafeDirectory(current)
+    else mkdirSync(current, { mode: 0o700 })
+    chmodSync(current, 0o700)
+  }
+
+  const realParent = realpathSync(parent)
+  if (!isContainedPath(realRoot, realParent)) throw containedDatabaseError()
+  const entries = databasePaths(databasePath).map((path) => ({
+    path,
+    entry: lstatExisting(path),
+  }))
+  for (const { entry } of entries) if (entry) assertSafeFileEntry(entry)
+  const existingIdentity = entries[0]!.entry ? fileIdentity(databasePath) : null
+  return { databasePath, realRoot, realParent, existingIdentity }
+}
+
+function databasePaths(databasePath: string): string[] {
+  return [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]
+}
+
+function assertOwned(entry: Stats): void {
+  if (typeof process.getuid === 'function' && entry.uid !== process.getuid())
+    throw unsafeFilesystemError()
+}
+
+function assertSafeDirectory(path: string): void {
+  const entry = lstatSync(path)
+  if (entry.isSymbolicLink() || !entry.isDirectory())
+    throw unsafeFilesystemError()
+  assertOwned(entry)
+}
+
+function lstatExisting(path: string): Stats | null {
+  try {
+    return lstatSync(path)
+  } catch (error) {
+    if (
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      (error as { code: unknown }).code === 'ENOENT'
+    )
+      return null
+    throw error
+  }
+}
+
+function assertSafeFileEntry(entry: Stats): void {
+  if (entry.isSymbolicLink() || !entry.isFile()) throw unsafeFilesystemError()
+  assertOwned(entry)
+}
+
+function assertSafeFile(path: string): void {
+  const entry = lstatExisting(path)
+  if (!entry) throw unsafeFilesystemError()
+  assertSafeFileEntry(entry)
+}
+
+function fileIdentity(path: string): FileIdentity {
+  const entry = statSync(path)
+  return { dev: entry.dev, ino: entry.ino }
+}
+
+function verifyOpenedDatabasePath(prepared: PreparedDatabasePath): void {
+  const realDatabase = realpathSync(prepared.databasePath)
+  if (
+    !isContainedPath(prepared.realRoot, realDatabase) ||
+    !isContainedPath(prepared.realParent, realDatabase) ||
+    realpathSync(dirname(prepared.databasePath)) !== prepared.realParent
+  )
+    throw containedDatabaseError()
+  assertSafeFile(prepared.databasePath)
+  if (prepared.existingIdentity) {
+    const opened = fileIdentity(prepared.databasePath)
+    if (
+      opened.dev !== prepared.existingIdentity.dev ||
+      opened.ino !== prepared.existingIdentity.ino
+    ) {
+      throw unsafeFilesystemError()
+    }
+  }
+  for (const path of databasePaths(prepared.databasePath).slice(1)) {
+    const entry = lstatExisting(path)
+    if (entry) assertSafeFileEntry(entry)
+  }
+}
+
+function secureDatabaseFiles(prepared: PreparedDatabasePath): void {
+  verifyOpenedDatabasePath(prepared)
+  for (const path of databasePaths(prepared.databasePath)) {
+    const entry = lstatExisting(path)
+    if (!entry) continue
+    assertSafeFileEntry(entry)
+    chmodSync(path, 0o600)
+  }
+}
+
+function preflightExistingDatabase(prepared: PreparedDatabasePath): void {
+  if (!prepared.existingIdentity) return
+  for (const path of databasePaths(prepared.databasePath)) {
+    const entry = lstatExisting(path)
+    if (entry) assertSafeFileEntry(entry)
+  }
+  let database: Database | undefined
+  try {
+    database = new Database(prepared.databasePath, {
+      readonly: true,
+      strict: true,
+    })
+    const version = readPragmaNumber(
+      database,
+      'PRAGMA user_version',
+      'user_version',
+    )
+    if (
+      readPragmaString(database, 'PRAGMA quick_check(1)', 'quick_check') !==
+      'ok'
+    )
+      throw corruptStoreError()
+    if (version > SCHEMA_VERSION) {
+      throw new MemoryV2StorageError({
+        kind: 'incompatible',
+        message: 'The memory store was created by a newer, incompatible CLI.',
+        retryable: false,
+      })
+    }
+    if (version >= 1 && version <= SCHEMA_VERSION)
+      validateSchemaShape(database, version)
+    else if (version !== 0) throw incompatibleSchemaError()
+  } finally {
+    database?.close()
+  }
+}
+
+function validateSchemaShape(database: Database, version: number): void {
+  const requiredTables = [
+    'memory_events',
+    'memory_projection_metadata',
+    'memory_store_capabilities',
+  ]
+  if (version >= 2) requiredTables.push(...PROJECTION_TABLES)
+  const tables = database
+    .query(
+      `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (${requiredTables.map(() => '?').join(',')})`,
+    )
+    .all(...requiredTables) as Array<{ name: string }>
+  if (tables.length !== requiredTables.length) throw incompatibleSchemaError()
+
+  assertTableColumns(database, 'memory_events', [
+    'sequence',
+    'event_id',
+    'idempotency_key',
+    'event_type',
+    'occurred_at',
+    'payload_json',
+    'metadata_json',
+    'task_id',
+    'session_id',
+    'artifact_id',
+  ])
+  assertTableColumns(database, 'memory_projection_metadata', ['key', 'value'])
+  assertTableColumns(database, 'memory_store_capabilities', [
+    'name',
+    'available',
+    'fallback',
+    'value',
+  ])
+  if (version >= 2) {
+    for (const table of PROJECTION_TABLES) {
+      assertTableColumns(database, table, [
+        'entity_id',
+        'task_id',
+        'session_id',
+        'state_json',
+        'source_sequence',
+        'updated_at',
+      ])
+    }
+  }
+
+  const triggers = database
+    .query(
+      `SELECT name, sql FROM sqlite_master
+      WHERE type = 'trigger' AND name IN ('memory_events_no_update', 'memory_events_no_delete')`,
+    )
+    .all() as Array<{ name: string; sql: string | null }>
+  if (triggers.length !== 2) throw incompatibleSchemaError()
+  for (const [name, operation] of [
+    ['memory_events_no_update', 'update'],
+    ['memory_events_no_delete', 'delete'],
+  ] as const) {
+    const sql = triggers
+      .find((trigger) => trigger.name === name)
+      ?.sql?.toLowerCase()
+      .replace(/\s+/g, ' ')
+    if (
+      !sql?.includes(`before ${operation} on memory_events`) ||
+      !sql.includes("raise(abort, 'canonical memory events are append only')")
+    ) {
+      throw incompatibleSchemaError()
+    }
+  }
+}
+
+function assertTableColumns(
+  database: Database,
+  table: string,
+  required: readonly string[],
+): void {
+  const columns = database.query(`PRAGMA table_info(${table})`).all() as Array<{
+    name: string
+  }>
+  const names = new Set(columns.map(({ name }) => name))
+  if (required.some((name) => !names.has(name))) throw incompatibleSchemaError()
+}
+
+function unsafeFilesystemError(): MemoryV2StorageError {
+  return new MemoryV2StorageError({
+    kind: 'incompatible',
+    message: 'The memory store contains an unsafe filesystem entry.',
+    retryable: false,
+  })
+}
+
+function incompatibleSchemaError(): MemoryV2StorageError {
+  return new MemoryV2StorageError({
+    kind: 'incompatible',
+    message: 'The memory store schema is incompatible with this CLI.',
+    retryable: false,
+  })
+}
+
+function corruptStoreError(): MemoryV2StorageError {
+  return new MemoryV2StorageError({
+    kind: 'corrupt',
+    message: 'The memory store failed its integrity check.',
+    retryable: false,
+  })
+}
+
+/**
+ * The typed outcome of a refused strict open. bun:sqlite opens the database
+ * and its -wal/-shm sidecars by pathname and cannot accept a descriptor, so a
+ * descriptor-relative/no-follow open cannot be proven for any path and the
+ * store is left unopened.
+ */
+function insecureOpenUnavailableFailure(): MemoryV2Failure {
+  return {
+    kind: 'unsupported-open',
+    message:
+      'SQLite secure open is not available: bun:sqlite opens the database and its -wal/-shm sidecars by pathname; a descriptor-relative/no-follow open cannot be proven, so the store is left unopened (fail-closed).',
+    retryable: false,
+  }
+}
+
+function isContainedPath(parent: string, child: string): boolean {
+  const relation = relative(parent, child)
+  return (
+    relation !== '..' &&
+    !relation.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) &&
+    !isAbsolute(relation)
+  )
+}
+
+function containedDatabaseError(): MemoryV2StorageError {
+  return new MemoryV2StorageError({
+    kind: 'incompatible',
+    message: 'The memory database must be contained within the repository.',
+    retryable: false,
+  })
+}
+
+function boundedBusyTimeout(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_BUSY_TIMEOUT_MS
+  if (!Number.isInteger(value) || value < 0) {
+    throw new MemoryV2StorageError({
+      kind: 'invalid',
+      message: 'The SQLite busy timeout must be a non-negative integer.',
+      retryable: false,
+    })
+  }
+  return Math.min(Math.max(value, 1), MAX_BUSY_TIMEOUT_MS)
+}
+
+function migrate(database: Database): void {
+  const version = readPragmaNumber(
+    database,
+    'PRAGMA user_version',
+    'user_version',
+  )
+  if (version > SCHEMA_VERSION) throw incompatibleSchemaError()
+
+  database.exec('BEGIN IMMEDIATE')
+  try {
+    if (version < 1) database.exec(MIGRATION_1)
+    if (version < 2) database.exec(MIGRATION_2)
+    // Additive P4 projection table: created idempotently on every open so
+    // existing stores gain it without a structural migration.
+    database.exec(MEMORY_USAGE_DDL)
+    // Additive P7 projection table: created idempotently on every open so
+    // existing stores gain it without a structural migration. This build
+    // also bumps PRAGMA user_version to SCHEMA_VERSION (3) below, so a
+    // pre-P7 build sharing the file fails closed at its own open (version
+    // > its SCHEMA_VERSION) instead of compacting/rebuilding a store whose
+    // claim.reinforced protection it cannot see.
+    database.exec(CLAIM_DEDUP_DDL)
+    inferAndBindProject(database)
+    // A v1->v2 migration replay must stay correct-and-complete: truncating it
+    // would leave the projections partially applied while the migration commits,
+    // so it intentionally replays fully (no total-event budget). Failure still
+    // rolls the whole migration back. replayProjections advances the claim_dedup
+    // backfill marker to the replay tail itself.
+    if (version === 1) {
+      replayProjections(database, Number.MAX_SAFE_INTEGER)
+    } else {
+      // P7 cold-start backfill: pre-existing v2 stores gain the claim_dedup
+      // projection additively (no user_version bump), so it is derived here
+      // from the surviving canonical log on open instead of staying empty
+      // until the first duplicate arrives or an explicit
+      // rebuildProjections()/privilegedCompact() runs. Incremental: a recorded
+      // marker bounds the replay to events appended since the last backfill,
+      // covering histories written by builds that never maintained it.
+      backfillClaimDedup(database)
+    }
+    // stale-claim-dedup-after-legacy-compaction repair (defense in depth
+    // behind the user_version gate above): any path that deletes canonical
+    // events and rebuilds the projections without maintaining claim_dedup
+    // (e.g. a pre-P7 build that pre-dates the gate) leaves dedup rows whose
+    // anchor observations no longer exist in memory_claims. A stale row
+    // would make a later record_decision dedup-hit the deleted observation
+    // and replace the capture with a claim.reinforced event that folds to
+    // nothing — silently losing the new decision text. Drop every dedup row
+    // whose observation is absent from memory_claims; the incremental
+    // backfill above already folded the surviving log, so this removes only
+    // genuinely stale anchors.
+    database.exec(
+      'DELETE FROM claim_dedup WHERE observation_id NOT IN (SELECT entity_id FROM memory_claims)',
+    )
+    if (version !== SCHEMA_VERSION)
+      database.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+    database.exec('COMMIT')
+  } catch (error) {
+    database.exec('ROLLBACK')
+    throw error
+  }
+}
+
+function inferAndBindProject(database: Database): void {
+  const bound = database
+    .query(
+      "SELECT value FROM memory_projection_metadata WHERE key = 'project_id'",
+    )
+    .get() as { value: string } | null
+  const parsedBound = bound ? ProjectIdSchema.safeParse(bound.value) : null
+  if (parsedBound && !parsedBound.success) throw invalidProjectStoreError()
+
+  const count = (
+    database.query('SELECT COUNT(*) AS count FROM memory_events').get() as {
+      count: number
+    }
+  ).count
+  if (count === 0) return
+  const rows = database
+    .query(
+      `SELECT json_extract(metadata_json, '$.projectId') AS project_id,
+            json_type(metadata_json, '$.projectId') AS project_type
+       FROM memory_events
+      WHERE json_extract(metadata_json, '$.schemaVersion') = 2`,
+    )
+    .all() as Array<{ project_id: unknown; project_type: string | null }>
+  if (rows.length === 0) return
+
+  const projects = new Set<string>()
+  for (const row of rows) {
+    const parsedProjectId =
+      row.project_type === 'text'
+        ? ProjectIdSchema.safeParse(row.project_id)
+        : null
+    if (!parsedProjectId?.success) throw invalidProjectStoreError()
+    projects.add(parsedProjectId.data)
+    if (projects.size > 1) throw invalidProjectStoreError()
+  }
+  const projectId = [...projects][0]
+  if (!projectId) throw invalidProjectStoreError()
+  if (parsedBound?.success && parsedBound.data !== projectId)
+    throw invalidProjectStoreError()
+  if (!bound)
+    database
+      .query(
+        "INSERT INTO memory_projection_metadata(key, value) VALUES ('project_id', ?1)",
+      )
+      .run(projectId)
+}
+
+function invalidProjectStoreError(): MemoryV2StorageError {
+  return new MemoryV2StorageError({
+    kind: 'incompatible',
+    message: 'The memory store contains invalid or mixed project identities.',
+    retryable: false,
+  })
+}
+
+function replayProjections(
+  database: Database,
+  maxEvents: number = MAX_REPLAY_EVENTS,
+): {
+  cursor: number
+  projectedEvents: number
+  truncated: boolean
+} {
+  let cursor = 0
+  let projectedEvents = 0
+  let truncated = false
+  // A full replay rebuilds every projection (claim_dedup included) from
+  // scratch, so the claim_dedup backfill marker restarts together with the
+  // projection cursor and is advanced to the replay tail on every exit —
+  // otherwise the next store open would re-fold the whole log.
+  setClaimDedupBackfillCursor(database, 0)
+  while (true) {
+    if (projectedEvents >= maxEvents) {
+      truncated = true
+      break
+    }
+    const rows = database
+      .query(
+        `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                payload_json, metadata_json, task_id, session_id, artifact_id
+           FROM memory_events
+          WHERE sequence > ?1
+          ORDER BY sequence
+          LIMIT ?2`,
+      )
+      .all(
+        cursor,
+        Math.min(PAGE_SIZE, maxEvents - projectedEvents),
+      ) as EventRow[]
+    if (rows.length === 0) break
+    for (const row of rows) {
+      validateCanonicalProjectionRow(row)
+      applyProjection(database, preparedEventFromRow(row), row.sequence)
+      cursor = row.sequence
+      projectedEvents += 1
+    }
+  }
+  const tail = (
+    database
+      .query('SELECT COALESCE(MAX(sequence), 0) AS sequence FROM memory_events')
+      .get() as { sequence: number }
+  ).sequence
+  if (truncated && cursor < tail) {
+    // The replay budget was exhausted before reaching the canonical tail. Record
+    // the last replayed sequence as the cursor (not the tail, which would falsely
+    // claim the projections are complete) and surface the truncation signal.
+    setProjectionCursor(database, cursor)
+    // claim_dedup was folded exactly through `cursor`, so the incremental
+    // backfill marker must advance to the same point.
+    setClaimDedupBackfillCursor(database, cursor)
+    return { cursor, projectedEvents, truncated: true }
+  }
+  if (cursor !== tail)
+    throw new Error('Projection replay did not reach the canonical tail.')
+  setProjectionCursor(database, tail)
+  setClaimDedupBackfillCursor(database, tail)
+  return { cursor: tail, projectedEvents, truncated: false }
+}
+
+const MIGRATION_1 = `
+  CREATE TABLE memory_events (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+    task_id TEXT,
+    session_id TEXT,
+    artifact_id TEXT
+  );
+  CREATE INDEX memory_events_task_sequence ON memory_events(task_id, sequence);
+  CREATE INDEX memory_events_session_sequence ON memory_events(session_id, sequence);
+  CREATE TRIGGER memory_events_no_update BEFORE UPDATE ON memory_events
+  BEGIN SELECT RAISE(ABORT, 'canonical memory events are append only'); END;
+  CREATE TRIGGER memory_events_no_delete BEFORE DELETE ON memory_events
+  BEGIN SELECT RAISE(ABORT, 'canonical memory events are append only'); END;
+  CREATE TABLE memory_projection_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  ) WITHOUT ROWID;
+  INSERT INTO memory_projection_metadata(key, value) VALUES ('cursor', '0');
+  CREATE TABLE memory_store_capabilities (
+    name TEXT PRIMARY KEY,
+    available INTEGER NOT NULL CHECK (available IN (0, 1)),
+    fallback TEXT,
+    value TEXT NOT NULL
+  ) WITHOUT ROWID;
+`
+
+const MIGRATION_2 = `
+  CREATE TABLE memory_tasks (
+    entity_id TEXT PRIMARY KEY, task_id TEXT, session_id TEXT, state_json TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL, updated_at TEXT NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE memory_sessions (
+    entity_id TEXT PRIMARY KEY, task_id TEXT, session_id TEXT, state_json TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL, updated_at TEXT NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE memory_artifacts (
+    entity_id TEXT PRIMARY KEY, task_id TEXT, session_id TEXT, state_json TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL, updated_at TEXT NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE memory_claims (
+    entity_id TEXT PRIMARY KEY, task_id TEXT, session_id TEXT, state_json TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL, updated_at TEXT NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE memory_evidence (
+    entity_id TEXT PRIMARY KEY, task_id TEXT, session_id TEXT, state_json TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL, updated_at TEXT NOT NULL
+  ) WITHOUT ROWID;
+  CREATE TABLE memory_discoveries (
+    entity_id TEXT PRIMARY KEY, task_id TEXT, session_id TEXT, state_json TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL, updated_at TEXT NOT NULL
+  ) WITHOUT ROWID;
+`
+
+const MEMORY_USAGE_DDL = `
+  CREATE TABLE IF NOT EXISTS memory_usage (
+    observation_id TEXT PRIMARY KEY,
+    used_count INTEGER NOT NULL DEFAULT 0,
+    ignored_count INTEGER NOT NULL DEFAULT 0,
+    staled_count INTEGER NOT NULL DEFAULT 0,
+    last_mechanism TEXT,
+    last_turn_id TEXT,
+    last_sequence INTEGER NOT NULL DEFAULT -1
+  ) WITHOUT ROWID;
+`
+
+const CLAIM_DEDUP_DDL = `
+  CREATE TABLE IF NOT EXISTS claim_dedup (
+    claim_id TEXT PRIMARY KEY,
+    observation_id TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS claim_dedup_observation ON claim_dedup(observation_id);
+`
+
+function recordRuntimeCapabilities(
+  database: Database,
+  journalMode: string,
+): void {
+  let fts5 = false
+  try {
+    database.exec(
+      'CREATE VIRTUAL TABLE temp.memory_v2_fts_probe USING fts5(value)',
+    )
+    database.exec('DROP TABLE temp.memory_v2_fts_probe')
+    fts5 = true
+  } catch {
+    fts5 = false
+  }
+
+  const write = database.query(
+    `INSERT INTO memory_store_capabilities(name, available, fallback, value)
+     VALUES (?1, ?2, ?3, ?4)
+     ON CONFLICT(name) DO UPDATE SET
+       available = excluded.available,
+       fallback = excluded.fallback,
+       value = excluded.value
+     WHERE available IS NOT excluded.available
+       OR fallback IS NOT excluded.fallback
+       OR value IS NOT excluded.value`,
+  )
+  write.run(
+    'fts5',
+    fts5 ? 1 : 0,
+    fts5 ? null : 'lexical-scan-v1',
+    fts5 ? 'fts5' : 'lexical-scan-v1',
+  )
+  write.run(
+    'journal_mode',
+    journalMode.toLowerCase() === 'wal' ? 1 : 0,
+    journalMode.toLowerCase() === 'wal' ? null : journalMode,
+    journalMode,
+  )
+  write.run('lexical_fallback', 1, null, 'unicode-codepoint-order-v1')
+  write.run('query', 1, null, 'bounded-lexical-v1')
+  write.run('verify', 1, null, 'append-only-v1')
+}
+
+function prepareEvent(
+  input: MemoryV2EventInput | MemoryEventDraft | MemoryEventEnvelope,
+): PreparedEvent {
+  if (!input || typeof input !== 'object')
+    throw new Error('Event must be an object.')
+  const value = input as unknown as Record<string, unknown>
+  const eventId = requiredString(value.eventId ?? value.id, 'eventId', 512)
+  const isEnvelope = value.schemaVersion === 2 && value.eventSchemaVersion === 1
+  const idempotencyKey = requiredString(
+    value.idempotencyKey ?? (isEnvelope ? `event:${eventId}` : value.eventId),
+    'idempotencyKey',
+    512,
+  )
+  const eventType = requiredString(
+    value.eventType ?? value.type,
+    'eventType',
+    256,
+  )
+  const occurredAt = requiredString(
+    value.occurredAt ?? value.timestamp,
+    'occurredAt',
+    64,
+  )
+  if (Number.isNaN(Date.parse(occurredAt)))
+    throw new Error('occurredAt must be an ISO timestamp.')
+  const payload = value.payload ?? {}
+  const payloadRecord =
+    payload && typeof payload === 'object'
+      ? (payload as Record<string, unknown>)
+      : {}
+  const metadata =
+    value.metadata ??
+    compactObject({
+      schemaVersion: value.schemaVersion,
+      eventSchemaVersion: value.eventSchemaVersion,
+      projectId: value.projectId,
+      sessionId: value.sessionId,
+    })
+
+  return {
+    eventId,
+    idempotencyKey,
+    eventType,
+    occurredAt,
+    payload,
+    payloadJson: stableJson(payload),
+    metadata,
+    metadataJson: stableJson(metadata),
+    taskId: optionalString(value.taskId ?? payloadRecord.taskId, 'taskId', 512),
+    sessionId: optionalString(value.sessionId, 'sessionId', 512),
+    artifactId: optionalString(
+      value.artifactId ?? payloadRecord.artifactId,
+      'artifactId',
+      512,
+    ),
+  }
+}
+
+function compactObject(
+  record: Record<string, unknown>,
+): Record<string, unknown> {
+  return Object.fromEntries(
+    Object.entries(record).filter(([, value]) => value !== undefined),
+  )
+}
+
+function stableJson(value: unknown): string {
+  const seen = new Set<object>()
+  const normalize = (item: unknown): unknown => {
+    if (item === null || typeof item === 'string' || typeof item === 'boolean')
+      return item
+    if (typeof item === 'number') {
+      if (!Number.isFinite(item))
+        throw new Error('JSON numbers must be finite.')
+      return item
+    }
+    if (Array.isArray(item)) {
+      if (seen.has(item)) throw new Error('JSON values cannot contain cycles.')
+      seen.add(item)
+      const result = item.map(normalize)
+      seen.delete(item)
+      return result
+    }
+    if (typeof item === 'object') {
+      if (seen.has(item)) throw new Error('JSON values cannot contain cycles.')
+      seen.add(item)
+      const record = item as Record<string, unknown>
+      const result: Record<string, unknown> = {}
+      for (const key of Object.keys(record).sort(compareUnicodeCodePoints)) {
+        if (record[key] !== undefined) result[key] = normalize(record[key])
+      }
+      seen.delete(item)
+      return result
+    }
+    throw new Error('Event payload and metadata must be JSON values.')
+  }
+  return JSON.stringify(normalize(value))
+}
+
+function applyProjection(
+  database: Database,
+  event: PreparedEvent,
+  sequence: number,
+): void {
+  const payload =
+    event.payload && typeof event.payload === 'object'
+      ? (event.payload as Record<string, unknown>)
+      : {}
+  const canonical =
+    event.metadata &&
+    typeof event.metadata === 'object' &&
+    (event.metadata as Record<string, unknown>).schemaVersion === 2
+
+  switch (event.eventType) {
+    case 'task.created':
+      upsertProjection(
+        database,
+        'memory_tasks',
+        projectionId(payload.taskId),
+        event,
+        sequence,
+        payload.taskId,
+        {
+          ...payload,
+          status: payload.initialStatus,
+        },
+      )
+      return
+    case 'task.transitioned': {
+      const taskId = projectionId(payload.taskId)
+      upsertProjection(
+        database,
+        'memory_tasks',
+        taskId,
+        event,
+        sequence,
+        payload.taskId,
+        {
+          ...readProjectionState(database, 'memory_tasks', taskId),
+          ...payload,
+          status: payload.toStatus,
+        },
+      )
+      return
+    }
+    case 'session.started':
+    case 'session.ended': {
+      const sessionId = event.sessionId
+      upsertProjection(
+        database,
+        'memory_sessions',
+        sessionId,
+        event,
+        sequence,
+        payload.taskId,
+        {
+          ...readProjectionState(database, 'memory_sessions', sessionId),
+          ...payload,
+          sessionId,
+          status:
+            event.eventType === 'session.ended' ? payload.status : 'active',
+        },
+      )
+      return
+    }
+    case 'artifact.classified':
+      upsertProjection(
+        database,
+        'memory_artifacts',
+        projectionId(
+          payload.artifactId ?? nestedValue(payload.artifact, 'artifactId'),
+        ),
+        event,
+        sequence,
+        payload.taskId,
+        payload,
+      )
+      return
+    case 'observation.recorded': {
+      const observation = objectValue(payload.observation)
+      const observationId = projectionId(observation.observationId)
+      upsertProjection(
+        database,
+        'memory_discoveries',
+        observationId,
+        event,
+        sequence,
+        observation.taskId,
+        observation,
+      )
+      upsertClaim(
+        database,
+        event,
+        sequence,
+        observationId,
+        'canonical',
+        observation,
+      )
+      const provenance = objectValue(observation.provenance)
+      const claimId = nestedValue(objectValue(provenance.metadata), 'claimId')
+      upsertClaimDedup(database, claimId, observationId, sequence)
+      return
+    }
+    case 'claim.consolidated': {
+      for (const sourceId of stringArray(payload.sourceObservationIds)) {
+        markProjectionLifecycle(
+          database,
+          'memory_discoveries',
+          sourceId,
+          event,
+          sequence,
+          'superseded',
+        )
+        markProjectionLifecycle(
+          database,
+          'memory_claims',
+          sourceId,
+          event,
+          sequence,
+          'superseded',
+        )
+        database
+          .query('DELETE FROM claim_dedup WHERE observation_id = ?1')
+          .run(sourceId)
+      }
+      const observation = objectValue(payload.canonicalObservation)
+      const observationId = projectionId(observation.observationId)
+      upsertProjection(
+        database,
+        'memory_discoveries',
+        observationId,
+        event,
+        sequence,
+        observation.taskId,
+        observation,
+      )
+      upsertClaim(
+        database,
+        event,
+        sequence,
+        observationId,
+        'consolidated',
+        observation,
+      )
+      // claim-dedup-not-seeded-for-replacement-observations repair: seed the
+      // dedup projection from the canonical head's provenance exactly like
+      // the observation.recorded fold, so a duplicate record for the same
+      // derived claim reinforces the surviving claim instead of creating a
+      // fresh observation row (first-wins semantics keep replay determinism).
+      const consolidatedProvenance = objectValue(observation.provenance)
+      const consolidatedClaimId = nestedValue(
+        objectValue(consolidatedProvenance.metadata),
+        'claimId',
+      )
+      upsertClaimDedup(database, consolidatedClaimId, observationId, sequence)
+      return
+    }
+    case 'claim.corrected':
+      upsertClaim(
+        database,
+        event,
+        sequence,
+        projectionId(payload.observationId),
+        'corrected',
+        payload,
+      )
+      upsertClaim(
+        database,
+        event,
+        sequence,
+        projectionId(nestedValue(payload.correction, 'observationId')),
+        'canonical',
+        objectValue(payload.correction),
+      )
+      database
+        .query('DELETE FROM claim_dedup WHERE observation_id = ?1')
+        .run(projectionId(payload.observationId))
+      {
+        // claim-dedup-not-seeded-for-replacement-observations repair: seed
+        // the dedup projection from the correction observation's provenance
+        // exactly like the observation.recorded fold, so a duplicate record
+        // for the same derived claim reinforces the surviving correction
+        // instead of creating a fresh observation row (first-wins semantics
+        // keep replay determinism).
+        const correction = objectValue(payload.correction)
+        const correctionProvenance = objectValue(correction.provenance)
+        const correctionClaimId = nestedValue(
+          objectValue(correctionProvenance.metadata),
+          'claimId',
+        )
+        upsertClaimDedup(
+          database,
+          correctionClaimId,
+          projectionId(correction.observationId),
+          sequence,
+        )
+      }
+      return
+    case 'claim.superseded':
+      upsertClaim(
+        database,
+        event,
+        sequence,
+        projectionId(payload.observationId),
+        'superseded',
+        payload,
+      )
+      database
+        .query('DELETE FROM claim_dedup WHERE observation_id = ?1')
+        .run(projectionId(payload.observationId))
+      return
+    case 'claim.forgotten':
+      for (const observationId of stringArray(payload.observationIds)) {
+        upsertClaim(
+          database,
+          event,
+          sequence,
+          observationId,
+          'forgotten',
+          payload,
+        )
+        database
+          .query('DELETE FROM claim_dedup WHERE observation_id = ?1')
+          .run(observationId)
+      }
+      return
+    case 'claim.pinned':
+      upsertClaim(
+        database,
+        event,
+        sequence,
+        projectionId(payload.observationId),
+        'pinned',
+        payload,
+      )
+      return
+    case 'claim.archived':
+      for (const archivedEventId of stringArray(payload.archivedEventIds)) {
+        upsertClaim(
+          database,
+          event,
+          sequence,
+          projectionId(archivedEventId),
+          'archived',
+          payload,
+        )
+      }
+      return
+    case 'evidence.attached':
+      for (const evidence of objectArray(payload.evidence)) {
+        upsertEvidence(
+          database,
+          event,
+          sequence,
+          projectionId(payload.observationId),
+          evidence,
+          'attached',
+        )
+      }
+      return
+    case 'coverage.recorded':
+      upsertProjection(
+        database,
+        'memory_discoveries',
+        projectionId(payload.taskId + ':' + payload.dimension),
+        event,
+        sequence,
+        payload.taskId,
+        payload,
+      )
+      return
+    case 'observation.reused': {
+      const usageTurnId = projectionId(payload.turnId)
+      for (const entry of objectArray(payload.used)) {
+        upsertUsage(
+          database,
+          entry.observationId,
+          sequence,
+          entry.mechanism,
+          usageTurnId,
+          'used_count',
+        )
+      }
+      for (const entry of objectArray(payload.ignored)) {
+        upsertUsage(
+          database,
+          entry.observationId,
+          sequence,
+          entry.mechanism,
+          usageTurnId,
+          'ignored_count',
+        )
+      }
+      return
+    }
+    case 'evidence.verified':
+      upsertEvidence(
+        database,
+        event,
+        sequence,
+        projectionId(payload.observationId),
+        payload,
+        'verified',
+      )
+      return
+    case 'evidence.invalidated':
+      upsertEvidence(
+        database,
+        event,
+        sequence,
+        projectionId(payload.observationId),
+        payload,
+        'invalidated',
+      )
+      return
+    case 'evidence.rebound': {
+      const observationId = projectionId(payload.observationId)
+      const previousSelector = objectValue(payload.previousSelector)
+      const replacement = objectValue(payload.evidence)
+      upsertEvidence(
+        database,
+        event,
+        sequence,
+        observationId,
+        { selector: previousSelector },
+        'rebound',
+      )
+      upsertEvidence(
+        database,
+        event,
+        sequence,
+        observationId,
+        replacement,
+        'attached',
+      )
+      return
+    }
+    default:
+      if (canonical) return
+  }
+
+  const kind = event.eventType.split(/[.:/]/, 1)[0].toLowerCase()
+  const definition = PROJECTIONS[kind]
+  if (!definition) return
+  const explicit = definition.explicitId ? event[definition.explicitId] : null
+  const candidate = projectionId(
+    explicit ?? payload[definition.payloadId] ?? payload.id,
+  )
+  upsertProjection(
+    database,
+    definition.table,
+    candidate,
+    event,
+    sequence,
+    event.taskId,
+    payload,
+  )
+}
+
+function readProjectionState(
+  database: Database,
+  table: string,
+  entityId: string | null,
+): Record<string, unknown> {
+  if (!entityId) return {}
+  const row = database
+    .query(`SELECT state_json FROM ${table} WHERE entity_id = ?1`)
+    .get(entityId) as { state_json: string } | null
+  return row ? objectValue(JSON.parse(row.state_json) as unknown) : {}
+}
+
+function markProjectionLifecycle(
+  database: Database,
+  table: string,
+  entityId: string,
+  event: PreparedEvent,
+  sequence: number,
+  lifecycle: string,
+): void {
+  const prior = readProjectionState(database, table, entityId)
+  if (Object.keys(prior).length > 0)
+    upsertProjection(database, table, entityId, event, sequence, prior.taskId, {
+      ...prior,
+      lifecycle,
+    })
+}
+
+function upsertClaim(
+  database: Database,
+  event: PreparedEvent,
+  sequence: number,
+  observationId: string | null,
+  lifecycle: string,
+  value: Record<string, unknown>,
+): void {
+  const prior = readProjectionState(database, 'memory_claims', observationId)
+  upsertProjection(
+    database,
+    'memory_claims',
+    observationId,
+    event,
+    sequence,
+    value.taskId,
+    {
+      ...prior,
+      lifecycle,
+      observationId,
+      value: { ...objectValue(prior.value), ...value },
+    },
+  )
+}
+
+function upsertEvidence(
+  database: Database,
+  event: PreparedEvent,
+  sequence: number,
+  observationId: string | null,
+  value: Record<string, unknown>,
+  lifecycle: string,
+): void {
+  const selector = objectValue(value.selector)
+  if (!observationId || Object.keys(selector).length === 0) return
+  const entityId = `${observationId}:${stableJson(selector)}`
+  const prior = readProjectionState(database, 'memory_evidence', entityId)
+  const evidence =
+    Object.keys(objectValue(prior.evidence)).length > 0
+      ? objectValue(prior.evidence)
+      : lifecycle === 'attached'
+        ? value
+        : {}
+  upsertProjection(
+    database,
+    'memory_evidence',
+    entityId,
+    event,
+    sequence,
+    value.taskId,
+    {
+      ...prior,
+      lifecycle,
+      observationId,
+      evidence,
+      freshness: lifecycle === 'attached' ? {} : value,
+    },
+  )
+}
+
+function upsertProjection(
+  database: Database,
+  table: string,
+  entityId: string | null,
+  event: PreparedEvent,
+  sequence: number,
+  taskId: unknown,
+  state: unknown,
+): void {
+  if (!entityId) return
+  database
+    .query(
+      `INSERT INTO ${table} (
+         entity_id, task_id, session_id, state_json, source_sequence, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+       ON CONFLICT(entity_id) DO UPDATE SET
+         task_id = excluded.task_id,
+         session_id = excluded.session_id,
+         state_json = excluded.state_json,
+         source_sequence = excluded.source_sequence,
+         updated_at = excluded.updated_at`,
+    )
+    .run(
+      entityId,
+      projectionId(taskId) ?? event.taskId,
+      event.sessionId,
+      stableJson(state),
+      sequence,
+      event.occurredAt,
+    )
+}
+
+/**
+ * Monotonic usage projection for 'observation.reused' events: increments one
+ * counter per entry, guarded by the event sequence so duplicate replays never
+ * double-count. Never deletes; staled_count stays reserved (P4 never emits
+ * 'staled').
+ */
+function upsertUsage(
+  database: Database,
+  observationId: unknown,
+  sequence: number,
+  mechanism: unknown,
+  turnId: string | null,
+  column: 'used_count' | 'ignored_count',
+): void {
+  const id = projectionId(observationId)
+  if (!id) return
+  const prior = database
+    .query(
+      `SELECT used_count, ignored_count, last_sequence
+         FROM memory_usage WHERE observation_id = ?1`,
+    )
+    .get(id) as
+    | { used_count: number; ignored_count: number; last_sequence: number }
+    | null
+  if (prior && sequence <= prior.last_sequence) return
+  const usedCount = (prior?.used_count ?? 0) + (column === 'used_count' ? 1 : 0)
+  const ignoredCount =
+    (prior?.ignored_count ?? 0) + (column === 'ignored_count' ? 1 : 0)
+  database
+    .query(
+      `INSERT INTO memory_usage (
+         observation_id, used_count, ignored_count, staled_count,
+         last_mechanism, last_turn_id, last_sequence
+       ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+       ON CONFLICT(observation_id) DO UPDATE SET
+         used_count = excluded.used_count,
+         ignored_count = excluded.ignored_count,
+         staled_count = excluded.staled_count,
+         last_mechanism = excluded.last_mechanism,
+         last_turn_id = excluded.last_turn_id,
+         last_sequence = excluded.last_sequence`,
+    )
+    .run(
+      id,
+      usedCount,
+      ignoredCount,
+      projectionId(mechanism),
+      turnId,
+      sequence,
+    )
+}
+
+/**
+ * First-wins claim-dedup projection (P7): records the claim id an observation's
+ * provenance carries, mapping it to the observation that first introduced it.
+ * Replay-deterministic: a claim id already present is skipped regardless of
+ * sequence, so replays never rebind a claim to a later observation.
+ */
+function upsertClaimDedup(
+  database: Database,
+  claimId: unknown,
+  observationId: string | null,
+  _sequence: number,
+): void {
+  const id =
+    typeof claimId === 'string' && /^[0-9a-f]{64}$/.test(claimId) ? claimId : null
+  if (!id || !observationId) return
+  const existing = database
+    .query('SELECT observation_id FROM claim_dedup WHERE claim_id = ?1')
+    .get(id) as { observation_id: string } | null
+  if (existing) return
+  database
+    .query('INSERT INTO claim_dedup (claim_id, observation_id) VALUES (?1, ?2)')
+    .run(id, observationId)
+}
+
+function projectionId(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 && value.length <= 512
+    ? value
+    : null
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+}
+
+function nestedValue(value: unknown, key: string): unknown {
+  return objectValue(value)[key]
+}
+
+function objectArray(value: unknown): Record<string, unknown>[] {
+  return Array.isArray(value) ? value.map(objectValue) : []
+}
+
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.map(projectionId).filter((item): item is string => item !== null)
+    : []
+}
+
+function setProjectionCursor(database: Database, sequence: number): void {
+  database
+    .query(
+      "UPDATE memory_projection_metadata SET value = ?1 WHERE key = 'cursor'",
+    )
+    .run(String(sequence))
+}
+
+function readClaimDedupBackfillCursor(database: Database): number {
+  const row = database
+    .query(
+      'SELECT value FROM memory_projection_metadata WHERE key = ?1',
+    )
+    .get(CLAIM_DEDUP_BACKFILL_KEY) as { value: string } | null
+  const parsed = row ? Number(row.value) : 0
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+}
+
+function setClaimDedupBackfillCursor(
+  database: Database,
+  sequence: number,
+): void {
+  database
+    .query(
+      `INSERT INTO memory_projection_metadata(key, value) VALUES (?1, ?2)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+    .run(CLAIM_DEDUP_BACKFILL_KEY, String(sequence))
+}
+
+/**
+ * Cold-start backfill of the P7 claim-dedup projection: pre-existing v2
+ * stores gain claim_dedup additively on open (no user_version bump), so the
+ * projection is derived here from the surviving canonical log instead of
+ * staying empty until the first duplicate arrives or an explicit
+ * rebuildProjections()/privilegedCompact() runs. Incremental: a recorded
+ * metadata marker bounds the replay to events appended since the last
+ * backfill, so mixed-version histories (written by builds that never
+ * maintained the marker) are folded exactly once and steady-state opens do
+ * no work. The fold is the same first-wins + lifecycle-delete replay the
+ * projection applies per event, so a suffix replay yields exactly the
+ * full-replay state. Fail-closed parity with replayProjections: every row
+ * passes validateCanonicalProjectionRow before folding, so a malformed
+ * canonical event fails the open exactly as a rebuild would instead of
+ * silently diverging the dedup state. Runs inside the migrate()
+ * transaction: failure rolls the whole open back.
+ */
+function backfillClaimDedup(database: Database): void {
+  let cursor = readClaimDedupBackfillCursor(database)
+  while (true) {
+    const rows = database
+      .query(
+        `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+                payload_json, metadata_json, task_id, session_id, artifact_id
+           FROM memory_events
+          WHERE sequence > ?1
+          ORDER BY sequence
+          LIMIT ?2`,
+      )
+      .all(cursor, PAGE_SIZE) as EventRow[]
+    if (rows.length === 0) break
+    for (const row of rows) {
+      validateCanonicalProjectionRow(row)
+      applyProjection(database, preparedEventFromRow(row), row.sequence)
+      cursor = row.sequence
+    }
+  }
+  setClaimDedupBackfillCursor(database, cursor)
+}
+
+function isIdempotentMatch(row: EventRow, event: PreparedEvent): boolean {
+  return (
+    row.event_id === event.eventId &&
+    row.idempotency_key === event.idempotencyKey &&
+    row.event_type === event.eventType &&
+    row.occurred_at === event.occurredAt &&
+    row.payload_json === event.payloadJson &&
+    row.metadata_json === event.metadataJson &&
+    row.task_id === event.taskId &&
+    row.session_id === event.sessionId &&
+    row.artifact_id === event.artifactId
+  )
+}
+
+function validateCanonicalProjectionRow(row: EventRow): void {
+  const metadata = objectValue(JSON.parse(row.metadata_json) as unknown)
+  if (
+    metadata.schemaVersion !== 2 ||
+    !CANONICAL_EVENT_TYPES.has(row.event_type)
+  )
+    return
+  try {
+    envelopeFromRow(row)
+  } catch {
+    throw new MemoryV2StorageError({
+      kind: 'incompatible',
+      message: 'The memory store contains an invalid canonical event.',
+      retryable: false,
+    })
+  }
+}
+
+function preparedEventFromRow(row: EventRow): PreparedEvent {
+  const payload = JSON.parse(row.payload_json) as unknown
+  const metadata = JSON.parse(row.metadata_json) as unknown
+  return {
+    eventId: row.event_id,
+    idempotencyKey: row.idempotency_key,
+    eventType: row.event_type,
+    occurredAt: row.occurred_at,
+    payload,
+    payloadJson: row.payload_json,
+    metadata,
+    metadataJson: row.metadata_json,
+    taskId: row.task_id,
+    sessionId: row.session_id,
+    artifactId: row.artifact_id,
+  }
+}
+
+function eventProjectId(event: PreparedEvent): string | null {
+  if (!event.metadata || typeof event.metadata !== 'object') return null
+  const projectId = (event.metadata as Record<string, unknown>).projectId
+  return typeof projectId === 'string' ? projectId : null
+}
+
+function envelopeFromRow(row: EventRow): MemoryEventEnvelope {
+  const event = preparedEventFromRow(row)
+  if (!event.metadata || typeof event.metadata !== 'object') {
+    throw new Error('Stored canonical event metadata is invalid.')
+  }
+  const metadata = event.metadata as Record<string, unknown>
+  const parsed = MemoryEventEnvelopeSchema.safeParse({
+    schemaVersion: metadata.schemaVersion,
+    eventSchemaVersion: metadata.eventSchemaVersion,
+    eventType: event.eventType,
+    eventId: event.eventId,
+    projectId: metadata.projectId,
+    sessionId: metadata.sessionId,
+    sequence: row.sequence,
+    occurredAt: event.occurredAt,
+    payload: event.payload,
+  })
+  if (!parsed.success) throw new Error('Stored canonical event is invalid.')
+  return parsed.data
+}
+
+function storedEventFromRow(row: EventRow): MemoryV2StoredEvent {
+  const event = preparedEventFromRow(row)
+  return {
+    sequence: row.sequence,
+    eventId: event.eventId,
+    idempotencyKey: event.idempotencyKey,
+    eventType: event.eventType,
+    occurredAt: event.occurredAt,
+    payload: event.payload,
+    metadata: event.metadata,
+    taskId: event.taskId ?? undefined,
+    sessionId: event.sessionId ?? undefined,
+    artifactId: event.artifactId ?? undefined,
+  }
+}
+
+function readProjectionRows(
+  database: Database,
+  table: string,
+): ProjectionRow[] {
+  const rows = database
+    .query(
+      `SELECT entity_id, task_id, session_id, state_json, source_sequence, updated_at
+         FROM ${table} ORDER BY entity_id`,
+    )
+    .all() as Array<{
+    entity_id: string
+    task_id: string | null
+    session_id: string | null
+    state_json: string
+    source_sequence: number
+    updated_at: string
+  }>
+  return rows.map((row) => ({
+    entityId: row.entity_id,
+    taskId: row.task_id,
+    sessionId: row.session_id,
+    state: JSON.parse(row.state_json) as unknown,
+    sourceSequence: row.source_sequence,
+    updatedAt: row.updated_at,
+  }))
+}
+
+function selectorKey(selector: MemorySelector): string {
+  if (selector.kind === 'uri-fragment')
+    return `${selector.uri.toLowerCase()}#${selector.fragment.toLowerCase()}`
+  const base = selector.path.replaceAll('\\', '/').toLowerCase()
+  if (selector.kind === 'symbol')
+    return `${base}#${selector.symbol.toLowerCase()}`
+  if (selector.kind === 'json-pointer')
+    return `${base}#${selector.pointer.toLowerCase()}`
+  if (selector.kind === 'line-range')
+    return `${base}:${selector.startLine}-${selector.endLine}`
+  if (selector.kind === 'chunk')
+    return `${base}#chunk:${selector.chunkId.toLowerCase()}:${selector.startLine}-${selector.endLine}`
+  return base
+}
+
+function scanQueryRows(database: Database, projectId: string): QueryScanResult {
+  const admission = database
+    .query(
+      `SELECT sequence,
+            length(CAST(payload_json AS BLOB)) AS payload_bytes,
+            length(CAST(metadata_json AS BLOB)) AS metadata_bytes
+       FROM memory_events
+      WHERE json_extract(metadata_json, '$.projectId') = ?1
+      ORDER BY sequence DESC
+      LIMIT ?2`,
+    )
+    .all(projectId, MAX_QUERY_EVENTS + 1) as QueryAdmissionRow[]
+  const sequences: number[] = []
+  let bytes = 0
+  let payloadBudgetReached = false
+  for (const row of admission.slice(0, MAX_QUERY_EVENTS)) {
+    const rowBytes = row.payload_bytes + row.metadata_bytes
+    if (bytes + rowBytes > MAX_QUERY_PAYLOAD_BYTES) {
+      payloadBudgetReached = true
+      break
+    }
+    sequences.push(row.sequence)
+    bytes += rowBytes
+  }
+  if (sequences.length === 0) {
+    return {
+      rows: [],
+      eventCapReached: admission.length > MAX_QUERY_EVENTS,
+      payloadBudgetReached,
+    }
+  }
+  const rows = database
+    .query(
+      `SELECT sequence, event_id, idempotency_key, event_type, occurred_at,
+            payload_json, metadata_json, task_id, session_id, artifact_id
+       FROM memory_events
+      WHERE sequence IN (${sequences.map(() => '?').join(',')})
+      ORDER BY sequence DESC`,
+    )
+    .all(...sequences) as EventRow[]
+  return {
+    rows,
+    eventCapReached: admission.length > MAX_QUERY_EVENTS,
+    payloadBudgetReached,
+  }
+}
+
+function lexicalTokens(value: string): Set<string> {
+  return new Set(
+    value
+      .toLowerCase()
+      .split(/[^a-z0-9._:/-]+/)
+      .filter((token) => token.length > 1)
+      .slice(0, 128),
+  )
+}
+
+function reason(
+  code: RankingReason['code'],
+  contribution: number,
+  detail: string,
+): RankingReason {
+  return { code, contribution, detail }
+}
+
+async function buildLexicalResult(
+  request: MemoryRetrievalRequest,
+  events: MemoryEventEnvelope[],
+  eventCapReached: boolean,
+  payloadBudgetReached: boolean,
+  recallExpander?: BunSQLiteMemoryRepositoryOptions['recallExpander'],
+) {
+  type ObservationState = {
+    observation: MemoryObservation
+    sourceSequence: number
+    sourceEventId: string
+    forgotten: boolean
+    superseded: boolean
+    corrected: boolean
+    pinned: boolean
+    used: number
+    ignored: number
+    reinforced: number
+    freshness: Map<
+      string,
+      {
+        state: 'verified' | 'invalid'
+        at: string
+        reason?: string
+        observedDigest?: string
+        workspaceRevision?: number
+        workspaceSnapshotId?: string
+      }
+    >
+  }
+  type TaskState = {
+    taskId: string
+    title: string
+    objective: string
+    status:
+      | 'created'
+      | 'active'
+      | 'blocked'
+      | 'completed'
+      | 'failed'
+      | 'cancelled'
+    sourceSequence: number
+    eventId: string
+  }
+  const observations = new Map<string, ObservationState>()
+  const tasks = new Map<string, TaskState>()
+  // P7 supersession head map: observation id -> the observation id that
+  // superseded it, folded from claim.superseded events during the replay so
+  // historicalContext can resolve the tail of a supersession chain.
+  const supersededBy = new Map<string, string>()
+
+  for (const event of events) {
+    if (event.eventType === 'task.created') {
+      tasks.set(event.payload.taskId, {
+        taskId: event.payload.taskId,
+        title: event.payload.title,
+        objective: event.payload.objective,
+        status: event.payload.initialStatus,
+        sourceSequence: event.sequence,
+        eventId: event.eventId,
+      })
+    } else if (event.eventType === 'task.transitioned') {
+      const task = tasks.get(event.payload.taskId)
+      if (task)
+        tasks.set(task.taskId, {
+          ...task,
+          status: event.payload.toStatus,
+          sourceSequence: event.sequence,
+          eventId: event.eventId,
+        })
+    } else if (event.eventType === 'observation.recorded') {
+      observations.set(event.payload.observation.observationId, {
+        observation: event.payload.observation,
+        sourceSequence: event.sequence,
+        sourceEventId: event.eventId,
+        forgotten: false,
+        superseded: false,
+        corrected: false,
+        pinned: false,
+        used: 0,
+        ignored: 0,
+        reinforced: 0,
+        freshness: new Map(),
+      })
+    } else if (event.eventType === 'evidence.attached') {
+      const state = observations.get(event.payload.observationId)
+      if (state)
+        state.observation = {
+          ...state.observation,
+          evidence: [
+            ...state.observation.evidence,
+            ...event.payload.evidence,
+          ].slice(0, 32),
+        }
+    } else if (event.eventType === 'claim.consolidated') {
+      for (const id of event.payload.sourceObservationIds) {
+        const source = observations.get(id)
+        if (source) source.superseded = true
+      }
+      observations.set(event.payload.canonicalObservation.observationId, {
+        observation: event.payload.canonicalObservation,
+        sourceSequence: event.sequence,
+        sourceEventId: event.eventId,
+        forgotten: false,
+        superseded: false,
+        corrected: false,
+        pinned: false,
+        used: 0,
+        ignored: 0,
+        reinforced: 0,
+        freshness: new Map(),
+      })
+    } else if (event.eventType === 'claim.corrected') {
+      const prior = observations.get(event.payload.observationId)
+      if (prior) prior.corrected = true
+      observations.set(event.payload.correction.observationId, {
+        observation: event.payload.correction,
+        sourceSequence: event.sequence,
+        sourceEventId: event.eventId,
+        forgotten: false,
+        superseded: false,
+        corrected: false,
+        pinned: prior?.pinned ?? false,
+        used: 0,
+        ignored: 0,
+        reinforced: 0,
+        freshness: new Map(),
+      })
+    } else if (event.eventType === 'claim.forgotten') {
+      for (const id of event.payload.observationIds) {
+        const state = observations.get(id)
+        if (state) state.forgotten = true
+      }
+    } else if (event.eventType === 'claim.superseded') {
+      const state = observations.get(event.payload.observationId)
+      if (state) state.superseded = true
+      supersededBy.set(
+        event.payload.observationId,
+        event.payload.supersededByObservationId,
+      )
+    } else if (event.eventType === 'claim.pinned') {
+      const state = observations.get(event.payload.observationId)
+      if (state) state.pinned = true
+    } else if (event.eventType === 'evidence.verified') {
+      const state = observations.get(event.payload.observationId)
+      state?.freshness.set(selectorKey(event.payload.selector), {
+        state: 'verified',
+        at: event.payload.verifiedAt,
+        observedDigest: event.payload.observedDigest,
+        workspaceRevision: event.payload.workspaceRevision,
+        workspaceSnapshotId: event.payload.workspaceSnapshotId,
+      })
+    } else if (event.eventType === 'evidence.invalidated') {
+      const state = observations.get(event.payload.observationId)
+      state?.freshness.set(selectorKey(event.payload.selector), {
+        state: 'invalid',
+        at: event.payload.invalidatedAt,
+        reason: event.payload.reason,
+      })
+    } else if (event.eventType === 'evidence.rebound') {
+      const state = observations.get(event.payload.observationId)
+      if (state) {
+        state.observation = {
+          ...state.observation,
+          evidence: [
+            ...state.observation.evidence.filter(
+              (e) =>
+                selectorKey(e.selector) !==
+                selectorKey(event.payload.previousSelector),
+            ),
+            event.payload.evidence,
+          ],
+        }
+        state.freshness.delete(selectorKey(event.payload.previousSelector))
+      }
+    } else if (event.eventType === 'observation.reused') {
+      // Fold the P4 usage counters into observation state so retrieval can
+      // score reusability without ever reading the memory_usage projection
+      // table directly (fold events, never tables). Unknown observation ids
+      // are ignored and malformed payloads are tolerated objectArray-style.
+      for (const entry of objectArray(event.payload.used)) {
+        const state = observations.get(
+          typeof entry.observationId === 'string'
+            ? entry.observationId
+            : String(entry.observationId ?? ''),
+        )
+        if (state) state.used += 1
+      }
+      for (const entry of objectArray(event.payload.ignored)) {
+        const state = observations.get(
+          typeof entry.observationId === 'string'
+            ? entry.observationId
+            : String(entry.observationId ?? ''),
+        )
+        if (state) state.ignored += 1
+      }
+    } else if (event.eventType === 'claim.reinforced') {
+      // Fold the P7 reinforcement counter so retrieval usefulness scoring
+      // credits reinforced claims. Unknown observation ids are ignored,
+      // mirroring the observation.reused fold branch above.
+      const state = observations.get(event.payload.observationId)
+      if (state) state.reinforced += 1
+    }
+  }
+
+  // P8 wave 2a concept corpus: a bounded snapshot of ACTIVE observations
+  // (never forgotten/superseded/corrected) offered to the advisory recall
+  // expander. observationId code-point order and the 256-entry cap keep the
+  // corpus deterministic and bounded; claimId is carried only as a strict
+  // 64-hex value from the canonical provenance metadata key.
+  const conceptCorpus: ConceptCorpusEntry[] = [...observations.values()]
+    .filter(
+      (state) => !state.forgotten && !state.superseded && !state.corrected,
+    )
+    .map((state) => {
+      const entry: ConceptCorpusEntry = {
+        observationId: state.observation.observationId,
+        kind: state.observation.kind,
+        summary: state.observation.summary,
+      }
+      if (
+        typeof state.observation.detail === 'string' &&
+        state.observation.detail.length > 0
+      )
+        entry.detail = state.observation.detail
+      const claimId = state.observation.provenance?.metadata?.claimId
+      if (typeof claimId === 'string' && /^[0-9a-f]{64}$/.test(claimId))
+        entry.claimId = claimId
+      return entry
+    })
+    .sort((left, right) =>
+      compareUnicodeCodePoints(left.observationId, right.observationId),
+    )
+    .slice(0, 256)
+
+  // Deterministic as-of wall clock: the latest occurredAt across the admitted
+  // event page (never Date.now), so usefulness age buckets are reproducible.
+  const asOfTurnWall = events.reduce(
+    (max, e) => (e.occurredAt > max ? e.occurredAt : max),
+    '1970-01-01T00:00:00.000Z',
+  )
+
+  const queryTokens = lexicalTokens(
+    [request.query, ...request.selectors.map(selectorKey)].join(' '),
+  )
+  const requestedSelectors = new Set(request.selectors.map(selectorKey))
+  const contextMatches = (
+    evidence: MemoryObservation['evidence'][number],
+    freshness: ObservationState['freshness'] extends Map<string, infer F>
+      ? F
+      : never,
+  ) => {
+    if (freshness.state !== 'verified') return false
+    // Strict honesty gate for every path-bearing selector (file, line-range,
+    // symbol, json-pointer, chunk): the observed digest must equal the
+    // evidence contentDigest (for chunk selectors this is chunk.hash, not the
+    // file hash). Digest-less path evidence never counts as verified so
+    // verifiedKnowledge cannot carry a path selector without a digest.
+    if ('path' in evidence.selector) {
+      if (evidence.contentDigest === undefined) return false
+      if (freshness.observedDigest !== evidence.contentDigest) return false
+    }
+    const requestHasContext =
+      request.workspaceRevision !== undefined ||
+      request.workspaceSnapshotId !== undefined
+    const verificationHasContext =
+      freshness.workspaceRevision !== undefined ||
+      freshness.workspaceSnapshotId !== undefined
+    if (requestHasContext || verificationHasContext) {
+      return (
+        request.workspaceRevision === freshness.workspaceRevision &&
+        request.workspaceSnapshotId === freshness.workspaceSnapshotId
+      )
+    }
+    return true
+  }
+  // Bounded-lexical-v1 weight table (deterministic core, score capped at 1.0
+  // via Math.min(1, ...)): task-match 0.25 + selector-match 0.25 +
+  // chunk selector-match 0.05 + lexical-match (query) <= 0.24 (0.06/token) +
+  // excerpt-token overlap (lexical-match code) <= 0.06 (0.02/token, max 3
+  // tokens, only when an evidence excerpt is present; combined lexical
+  // family <= 0.30, preserving the original lexical cap) +
+  // verified-evidence 0.12 + digest-freshness (verified-evidence code)
+  // <= 0.03 (only when verified evidence has matching contentDigest +
+  // exact revision/snapshot; combined verified family <= 0.15, preserving
+  // the original verified cap) + reusability (pinned) 0.04 + reusability
+  // (usage) <= 0.05 (bounded P4 usefulness correlation, display-only; the
+  // score itself stays Math.min(1, ...)) + recency 0.01.
+  // New-weight sum 0.06 + 0.03 + 0.05 = 0.14 <= 1; worst-case raw sum stays
+  // bounded and the final score is capped at 1.0. Tiebreak stays
+  // exact > token > verified > pinned > sequence (see compare below);
+  // observation ordering additionally applies retraction, freshness class,
+  // tier, and usefulness via compareObservations — the age/tier reordering
+  // (agent-explicit decisions outranking discovery at equal lexical weight)
+  // is intended S3 behavior, not a regression. Reasons stay within 1..16
+  // entries.
+  const rank = (
+    text: string,
+    taskId: string | undefined,
+    selectors: MemorySelector[],
+    verified: boolean,
+    pinned: boolean,
+    sourceSequence: number,
+    excerptOverlap = 0,
+    digestFresh = false,
+    usefulness = 0,
+  ) => {
+    const candidateTokens = lexicalTokens(text)
+    let tokenMatches = 0
+    for (const token of queryTokens)
+      if (candidateTokens.has(token)) tokenMatches++
+    const selectorMatch = selectors.some((selector) =>
+      requestedSelectors.has(selectorKey(selector)),
+    )
+    const taskMatch = request.taskId !== undefined && request.taskId === taskId
+    const reasons: RankingReason[] = []
+    if (taskMatch)
+      reasons.push(
+        reason(
+          'task-match',
+          0.25,
+          'The task ID exactly matches the requested task.',
+        ),
+      )
+    if (selectorMatch)
+      reasons.push(
+        reason(
+          'selector-match',
+          0.25,
+          'A selector exactly matches the request.',
+        ),
+      )
+    const chunkSelectorMatch = selectors.some(
+      (selector) =>
+        selector.kind === 'chunk' &&
+        requestedSelectors.has(selectorKey(selector)),
+    )
+    if (chunkSelectorMatch)
+      reasons.push(
+        reason(
+          'selector-match',
+          0.05,
+          'Chunk selector exactly matches the request.',
+        ),
+      )
+    if (tokenMatches > 0)
+      reasons.push(
+        reason(
+          'lexical-match',
+          Math.min(0.24, tokenMatches * 0.06),
+          `${tokenMatches} lexical token match(es).`,
+        ),
+      )
+    if (excerptOverlap > 0)
+      reasons.push(
+        reason(
+          'lexical-match',
+          Math.min(0.06, excerptOverlap * 0.02),
+          `${excerptOverlap} excerpt token overlap(s).`,
+        ),
+      )
+    if (verified)
+      reasons.push(
+        reason(
+          'verified-evidence',
+          0.12,
+          'The observation has current verified evidence.',
+        ),
+      )
+    if (verified && digestFresh)
+      reasons.push(
+        reason(
+          'verified-evidence',
+          0.03,
+          'Digest and workspace revision/snapshot exactly match.',
+        ),
+      )
+    if (pinned)
+      reasons.push(reason('reusability', 0.04, 'The observation is pinned.'))
+    if (usefulness > 0)
+      reasons.push(
+        reason(
+          'reusability',
+          Math.min(0.05, (usefulness / 1000) * 0.05),
+          'P4 usage correlation score.',
+        ),
+      )
+    reasons.push(
+      reason('recency', 0.01, `Canonical source sequence ${sourceSequence}.`),
+    )
+    return {
+      score: Math.min(
+        1,
+        reasons.reduce((sum, item) => sum + Math.max(0, item.contribution), 0),
+      ),
+      reasons,
+      exact: Number(taskMatch) + Number(selectorMatch),
+      tokenMatches,
+      verified: Number(verified),
+      pinned: Number(pinned),
+      sourceSequence,
+    }
+  }
+  const compare = <T extends { ranking: ReturnType<typeof rank>; id: string }>(
+    left: T,
+    right: T,
+  ) =>
+    right.ranking.exact - left.ranking.exact ||
+    right.ranking.tokenMatches - left.ranking.tokenMatches ||
+    right.ranking.verified - left.ranking.verified ||
+    right.ranking.pinned - left.ranking.pinned ||
+    right.ranking.sourceSequence - left.ranking.sourceSequence ||
+    compareUnicodeCodePoints(left.id, right.id)
+  // Observation-specific deterministic ordering: retraction first, then
+  // freshness class, agent-explicit tier, P4 usefulness (integer score), and
+  // only then the lexical core. The old verified key is dropped as redundant
+  // with freshnessClass. Tasks keep `compare` unchanged.
+  const tierRank = (t: UsefulnessTier) =>
+    t === 'explicit' ? 2 : t === 'outcome' ? 1 : 0
+  const compareObservations = <
+    T extends {
+      ranking: ReturnType<typeof rank>
+      id: string
+      tier: UsefulnessTier
+      usefulness: number
+      conceptRank: number
+      freshnessClass: number
+      retracted: boolean
+    },
+  >(
+    left: T,
+    right: T,
+  ) =>
+    Number(left.retracted) - Number(right.retracted) ||
+    right.freshnessClass - left.freshnessClass ||
+    tierRank(right.tier) - tierRank(left.tier) ||
+    right.usefulness - left.usefulness ||
+    right.conceptRank - left.conceptRank ||
+    right.ranking.exact - left.ranking.exact ||
+    right.ranking.tokenMatches - left.ranking.tokenMatches ||
+    right.ranking.pinned - left.ranking.pinned ||
+    right.ranking.sourceSequence - left.ranking.sourceSequence ||
+    compareUnicodeCodePoints(left.id, right.id)
+
+  const taskCandidates = [...tasks.values()]
+    .filter((task) => !request.taskId || task.taskId === request.taskId)
+    .map((task) => ({
+      id: task.taskId,
+      task,
+      ranking: rank(
+        `${task.taskId} ${task.title} ${task.objective}`,
+        task.taskId,
+        [],
+        false,
+        false,
+        task.sourceSequence,
+      ),
+    }))
+    .filter((item) => item.ranking.tokenMatches > 0 || item.ranking.exact > 0)
+    .sort(compare)
+  const observationCandidates = [...observations.values()]
+    .map((state) => {
+      const selectors =
+        state.observation.selectors ??
+        state.observation.evidence.map(({ selector }) => selector)
+      const verified = state.observation.evidence.some((evidence) => {
+        const freshness = state.freshness.get(selectorKey(evidence.selector))
+        return freshness !== undefined && contextMatches(evidence, freshness)
+      })
+      // Digest-freshness: true only when verified evidence carries a matching
+      // contentDigest (chunk.hash for chunk selectors, not the file hash) plus
+      // exact revision/snapshot equality already enforced by contextMatches.
+      const digestFresh = state.observation.evidence.some((evidence) => {
+        const freshness = state.freshness.get(selectorKey(evidence.selector))
+        return (
+          freshness !== undefined &&
+          contextMatches(evidence, freshness) &&
+          evidence.contentDigest !== undefined &&
+          freshness.observedDigest === evidence.contentDigest
+        )
+      })
+      // Excerpt-token overlap: distinct request queryTokens found in the union
+      // of present evidence.excerpt tokens; zero when no excerpt is present.
+      const excerptTokens = new Set<string>()
+      for (const evidence of state.observation.evidence) {
+        if (typeof evidence.excerpt === 'string' && evidence.excerpt.length > 0) {
+          for (const token of lexicalTokens(evidence.excerpt))
+            excerptTokens.add(token)
+        }
+      }
+      let excerptOverlap = 0
+      if (excerptTokens.size > 0) {
+        for (const token of queryTokens)
+          if (excerptTokens.has(token)) excerptOverlap++
+      }
+      // Usefulness-v1 scoring: tier from kind + provenance, integer score
+      // from folded usage counters against the deterministic as-of clock.
+      const tier = deriveUsefulnessTier({
+        kind: state.observation.kind,
+        provenance: state.observation.provenance,
+      })
+      const usefulness = scoreUsefulness({
+        used: state.used,
+        ignored: state.ignored,
+        staled: 0,
+        reinforced: state.reinforced,
+        pinned: state.pinned ? 1 : 0,
+        createdAtWall: state.observation.observedAt,
+        asOfTurnWall,
+        tier,
+      }).score
+      const freshnessClass =
+        verified && digestFresh
+          ? 3
+          : verified
+            ? 2
+            : [...state.freshness.values()].some(
+                  (freshness) => freshness.state === 'invalid',
+                )
+              ? 1
+              : 0
+      const retracted =
+        state.forgotten || state.superseded || state.corrected
+      return {
+        id: state.observation.observationId,
+        state,
+        selectors,
+        tier,
+        usefulness,
+        conceptRank: 0,
+        freshnessClass,
+        retracted,
+        ranking: rank(
+          `${state.observation.taskId} ${state.observation.kind} ${state.observation.summary} ${state.observation.detail} ${selectors.map(selectorKey).join(' ')}`,
+          state.observation.taskId,
+          selectors,
+          verified,
+          state.pinned,
+          state.sourceSequence,
+          excerptOverlap,
+          digestFresh,
+          usefulness,
+        ),
+      }
+    })
+    .filter(
+      (item) =>
+        (!request.taskId || item.state.observation.taskId === request.taskId) &&
+        (request.artifactKinds.length === 0 ||
+          item.state.observation.evidence.some(({ artifact }) =>
+            request.artifactKinds.includes(artifact.classification.kind),
+          )) &&
+        (item.ranking.tokenMatches > 0 ||
+          item.ranking.exact > 0 ||
+          item.state.pinned),
+    )
+    .sort(compareObservations)
+
+  const limit = request.maxResultsPerCategory
+  const verifiedCandidates = observationCandidates.filter(
+    ({ state }) =>
+      !state.forgotten &&
+      !state.superseded &&
+      !state.corrected &&
+      state.observation.evidence.some((evidence) => {
+        const freshness = state.freshness.get(selectorKey(evidence.selector))
+        return freshness !== undefined && contextMatches(evidence, freshness)
+      }),
+  )
+  const reusableCandidates = observationCandidates.filter(
+    ({ state }) =>
+      !state.forgotten &&
+      !state.superseded &&
+      !state.corrected &&
+      state.observation.kind === 'discovery',
+  )
+  const rereadCandidates = observationCandidates
+    .filter(
+      ({ state }) => !state.forgotten && !state.superseded && !state.corrected,
+    )
+    .flatMap(({ state, selectors, ranking }) =>
+      selectors
+        .map((selector) => {
+          const freshness = state.freshness.get(selectorKey(selector))
+          const evidence = state.observation.evidence.find(
+            (item) => selectorKey(item.selector) === selectorKey(selector),
+          )
+          if (freshness && evidence && contextMatches(evidence, freshness))
+            return null
+          const rereadReason =
+            freshness?.reason === 'missing'
+              ? 'missing'
+              : freshness?.reason === 'expired'
+                ? 'expired'
+                : freshness?.state === 'invalid'
+                  ? 'changed'
+                  : 'never-verified'
+          return {
+            observationId: state.observation.observationId,
+            selector,
+            reason: rereadReason as
+              | 'never-verified'
+              | 'changed'
+              | 'missing'
+              | 'expired'
+              | 'contradiction-suspected',
+            detail:
+              freshness?.state === 'invalid'
+                ? 'The latest evidence state is invalidated; reread before use.'
+                : 'This selector requires verification in the current workspace context.',
+            score: ranking.score,
+            reasons: [
+              ...ranking.reasons,
+              reason(
+                'stale-evidence',
+                -0.2,
+                'Current evidence is unavailable.',
+              ),
+            ].slice(0, 16),
+          }
+        })
+        .filter((item): item is NonNullable<typeof item> => item !== null),
+    )
+  const historicalCandidates = request.includeHistorical
+    ? observationCandidates.filter(
+        ({ state }) => state.forgotten || state.superseded || state.corrected,
+      )
+    : []
+  // P7 contradiction flagging: group live decision/constraint observations by
+  // stable chunk ids carried under the canonical `stableChunkId` key in
+  // evidence provenance metadata — the exact key and value shape the capture
+  // writer persists (extractStableChunkIds), never a value-shape scan over
+  // arbitrary metadata keys. Then append additive reread entries for each
+  // flagged member not already scheduled by the staleness pass. Zero-selector
+  // observations are skipped, entries reuse the existing reread shape, and the
+  // merge happens before the existing reread cap so determinism and bounds are
+  // preserved.
+  const contradictionCandidates: ContradictionCandidate[] =
+    observationCandidates.flatMap(({ state }) => {
+      const stableChunkIds = [
+        ...new Set(
+          state.observation.evidence.flatMap((evidence) =>
+            extractStableChunkIds(evidence.provenance.metadata),
+          ),
+        ),
+      ]
+      return [
+        {
+          observationId: state.observation.observationId,
+          kind: state.observation.kind,
+          stableChunkIds,
+          forgotten: state.forgotten,
+          superseded: state.superseded,
+          corrected: state.corrected,
+        },
+      ]
+    })
+  const flaggedContradictionIds = new Set(
+    detectContradictions({
+      observations: contradictionCandidates,
+    }).flatMap(({ observationIds }) => observationIds),
+  )
+  const existingRereadIds = new Set(
+    rereadCandidates.map(({ observationId }) => observationId),
+  )
+  for (const candidate of observationCandidates) {
+    if (!flaggedContradictionIds.has(candidate.id)) continue
+    if (existingRereadIds.has(candidate.id)) continue
+    const firstSelector = candidate.selectors[0]
+    if (firstSelector === undefined) continue
+    rereadCandidates.push({
+      observationId: candidate.id,
+      selector: firstSelector,
+      reason: 'contradiction-suspected' as const,
+      detail:
+        'contradiction_suspected: reconcile — resolve via record_decision(supersedes:[...])',
+      score: 0,
+      reasons: [
+        ...candidate.ranking.reasons,
+        reason(
+          'stale-evidence',
+          -0.2,
+          'Contradiction suspected against another live observation.',
+        ),
+      ].slice(0, 16),
+    })
+  }
+  const matchedTasks = taskCandidates
+    .slice(0, limit)
+    .map(({ task, ranking }) => ({
+      taskId: task.taskId,
+      title: task.title,
+      status: task.status,
+      summary: task.objective,
+      score: ranking.score,
+      reasons: ranking.reasons,
+    }))
+  const verifiedKnowledge = verifiedCandidates
+    .slice(0, limit)
+    .map(({ state, ranking }) => {
+      const verifiedSelectors = [...state.freshness].filter(
+        ([key, freshness]) => {
+          const evidence = state.observation.evidence.find(
+            (item) => selectorKey(item.selector) === key,
+          )
+          return evidence !== undefined && contextMatches(evidence, freshness)
+        },
+      )
+      const verifiedEvidence = verifiedSelectors
+        .map(([key]) =>
+          state.observation.evidence.find(
+            (evidence) => selectorKey(evidence.selector) === key,
+          ),
+        )
+        .filter(
+          (evidence): evidence is MemoryObservation['evidence'][number] =>
+            evidence !== undefined,
+        )
+      const verifiedAt = verifiedSelectors
+        .map(([, freshness]) => freshness.at)
+        .sort(compareUnicodeCodePoints)
+        .at(-1)!
+      return {
+        observation: state.observation,
+        verifiedEvidence,
+        verifiedAt,
+        score: ranking.score,
+        reasons: ranking.reasons,
+      }
+    })
+    .filter(({ verifiedEvidence }) => verifiedEvidence.length > 0)
+  const reusableDiscovery = reusableCandidates
+    .slice(0, limit)
+    .map(({ state, ranking }) => ({
+      observation: state.observation,
+      reuseGuidance: state.pinned
+        ? 'Pinned discovery; verify selectors before reuse.'
+        : 'Verify selectors before reusing this discovery.',
+      score: ranking.score,
+      reasons: ranking.reasons,
+    }))
+  // P8 wave 2a concept-advisory tail: appended AFTER the lexical
+  // reusableDiscovery array is final, so it never reorders or displaces the
+  // lexical prefix. The expander is strictly advisory: a null or degraded
+  // expansion and any thrown error leave the lexical result untouched, and
+  // appended entries are capped at 8 active, non-duplicate observations.
+  if (recallExpander) {
+    try {
+      const expansion = await recallExpander({ request, corpus: conceptCorpus })
+      if (expansion && !expansion.degraded) {
+        let appended = 0
+        for (const id of expansion.observationIds) {
+          // The result schema caps reusableDiscovery at 100 entries; never
+          // push past that bound, or the final parse would fail the query.
+          if (appended >= 8 || reusableDiscovery.length >= 100) break
+          const state = observations.get(id)
+          if (!state || state.forgotten || state.superseded || state.corrected)
+            continue
+          if (reusableDiscovery.some((e) => e.observation.observationId === id))
+            continue
+          reusableDiscovery.push({
+            observation: state.observation,
+            reuseGuidance: 'Verify selectors before reusing this discovery.',
+            score: 0,
+            reasons: [
+              reason(
+                'concept-advisory',
+                0,
+                'Advisory semantic recall expansion matched this observation.',
+              ),
+            ],
+          })
+          appended += 1
+        }
+      }
+    } catch {
+      // Advisory only: expansion failures never fail the query.
+    }
+  }
+  const rereadRequired = rereadCandidates.slice(0, limit)
+  const historicalContext = historicalCandidates
+    .slice(0, limit)
+    .map(({ state, ranking }) => {
+      // P7 supersession head: for a retracted predecessor, resolve the tail of
+      // its supersession chain and include the head observation's source event
+      // id when it is known, keeping the own event first and the list within
+      // the schema's 1..100 bound.
+      const headId = resolveSupersessionHead(
+        state.observation.observationId,
+        supersededBy,
+      )
+      const headSourceEventId =
+        headId !== state.observation.observationId
+          ? observationCandidates.find(({ id }) => id === headId)?.state
+              .sourceEventId
+          : undefined
+      const eventIds = [
+        ...new Set(
+          headSourceEventId
+            ? [state.sourceEventId, headSourceEventId]
+            : [state.sourceEventId],
+        ),
+      ].slice(0, 100)
+      return {
+        taskId: state.observation.taskId,
+        summary: state.observation.summary,
+        eventIds,
+        score: ranking.score,
+        reasons: [
+          ...ranking.reasons,
+          reason(
+            'historical-only',
+            -0.1,
+            'This observation is historical only.',
+          ),
+        ].slice(0, 16),
+      }
+    })
+  const latestCoverageByKey = new Map<
+    string,
+    {
+      payload: Extract<
+        MemoryEventEnvelope,
+        { eventType: 'coverage.recorded' }
+      >['payload']
+      sequence: number
+    }
+  >()
+  for (const event of events) {
+    if (event.eventType !== 'coverage.recorded') continue
+    const key = `${event.payload.taskId}:${event.payload.dimension}`
+    const prior = latestCoverageByKey.get(key)
+    if (!prior || event.sequence > prior.sequence) {
+      latestCoverageByKey.set(key, {
+        payload: event.payload,
+        sequence: event.sequence,
+      })
+    }
+  }
+  const currentCoverage = [...latestCoverageByKey.entries()]
+    .filter(([, entry]) => {
+      if (
+        request.taskId !== undefined &&
+        entry.payload.taskId !== request.taskId
+      )
+        return false
+      const requestHasContext =
+        request.workspaceRevision !== undefined ||
+        request.workspaceSnapshotId !== undefined
+      const payloadHasContext =
+        entry.payload.workspaceRevision !== undefined ||
+        entry.payload.workspaceSnapshotId !== undefined
+      if (requestHasContext || payloadHasContext) {
+        return (
+          request.workspaceRevision === entry.payload.workspaceRevision &&
+          request.workspaceSnapshotId === entry.payload.workspaceSnapshotId
+        )
+      }
+      return true
+    })
+    .sort(([leftKey], [rightKey]) =>
+      compareUnicodeCodePoints(leftKey, rightKey),
+    )
+    .slice(0, 5)
+    .map(([, entry]) => {
+      const item: {
+        dimension: typeof entry.payload.dimension
+        state: typeof entry.payload.state
+        taskId: typeof entry.payload.taskId
+        notes?: string
+        workspaceRevision?: number
+        workspaceSnapshotId?: string
+      } = {
+        dimension: entry.payload.dimension,
+        state: entry.payload.state,
+        taskId: entry.payload.taskId,
+        notes: entry.payload.notes.slice(0, 1024),
+      }
+      if (entry.payload.workspaceRevision !== undefined)
+        item.workspaceRevision = entry.payload.workspaceRevision
+      if (entry.payload.workspaceSnapshotId !== undefined)
+        item.workspaceSnapshotId = entry.payload.workspaceSnapshotId
+      return item
+    })
+  const categories = {
+    matchedTasks,
+    verifiedKnowledge,
+    reusableDiscovery,
+    rereadRequired,
+    historicalContext,
+  }
+  const rankingReasons = [
+    ...matchedTasks.map((value) => ({
+      category: 'matchedTasks' as const,
+      targetId: value.taskId,
+      reasons: value.reasons,
+    })),
+    ...verifiedKnowledge.map((value) => ({
+      category: 'verifiedKnowledge' as const,
+      targetId: value.observation.observationId,
+      reasons: value.reasons,
+    })),
+    ...reusableDiscovery.map((value) => ({
+      category: 'reusableDiscovery' as const,
+      targetId: value.observation.observationId,
+      reasons: value.reasons,
+    })),
+    ...rereadRequired.map((value) => ({
+      category: 'rereadRequired' as const,
+      targetId: value.observationId,
+      reasons: value.reasons,
+    })),
+    ...historicalContext.map((value) => ({
+      category: 'historicalContext' as const,
+      targetId: value.taskId ?? value.eventIds[0]!,
+      reasons: value.reasons,
+    })),
+  ]
+  const resultCapReached =
+    eventCapReached ||
+    taskCandidates.length > limit ||
+    verifiedCandidates.length > limit ||
+    reusableCandidates.length > limit ||
+    rereadCandidates.length > limit ||
+    historicalCandidates.length > limit
+  const degradationReasons = [
+    ...(resultCapReached
+      ? [
+          {
+            code: 'result-cap-reached' as const,
+            detail: 'The deterministic result or event cap was reached.',
+            retryable: false,
+          },
+        ]
+      : []),
+    ...(payloadBudgetReached
+      ? [
+          {
+            code: 'resource-budget' as const,
+            detail: 'The deterministic query resource budget was reached.',
+            retryable: false,
+          },
+        ]
+      : []),
+  ]
+  return MemoryRetrievalResultSchema.parse({
+    schemaVersion: 2,
+    queryId: request.queryId,
+    projectId: request.projectId,
+    generatedAt: events.at(-1)?.occurredAt ?? '1970-01-01T00:00:00.000Z',
+    ...categories,
+    currentCoverage,
+    degradation:
+      degradationReasons.length > 0
+        ? { state: 'degraded', reasons: degradationReasons }
+        : { state: 'none' },
+    rankingReasons: rankingReasons.slice(0, limit * 5),
+  })
+}
+
+function compareUnicodeCodePoints(left: string, right: string): number {
+  const leftPoints = Array.from(left, (character) => character.codePointAt(0)!)
+  const rightPoints = Array.from(
+    right,
+    (character) => character.codePointAt(0)!,
+  )
+  const length = Math.min(leftPoints.length, rightPoints.length)
+  for (let index = 0; index < length; index++) {
+    const difference = leftPoints[index]! - rightPoints[index]!
+    if (difference !== 0) return difference
+  }
+  return leftPoints.length - rightPoints.length
+}
+
+function readCapabilities(database: Database): MemoryV2Capability[] {
+  const rows = database
+    .query(
+      'SELECT name, available, fallback, value FROM memory_store_capabilities ORDER BY name',
+    )
+    .all() as Array<{
+    name: string
+    available: number
+    fallback: string | null
+    value: string
+  }>
+  return rows.map((row) => ({ ...row, available: row.available === 1 }))
+}
+
+function readPragmaString(
+  database: Database,
+  sql: string,
+  key: string,
+): string {
+  const row = database.query(sql).get() as Record<string, unknown> | null
+  const value = row?.[key] ?? (row ? Object.values(row)[0] : undefined)
+  if (typeof value !== 'string')
+    throw new Error('Unexpected SQLite pragma response.')
+  return value
+}
+
+function readPragmaNumber(
+  database: Database,
+  sql: string,
+  key: string,
+): number {
+  const row = database.query(sql).get() as Record<string, unknown> | null
+  const value = row?.[key] ?? (row ? Object.values(row)[0] : undefined)
+  if (typeof value !== 'number')
+    throw new Error('Unexpected SQLite pragma response.')
+  return value
+}
+
+function requiredString(value: unknown, name: string, max: number): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length > max ||
+    value.includes('\0')
+  ) {
+    throw new Error(`${name} must be a non-empty bounded string.`)
+  }
+  return value
+}
+
+function optionalString(
+  value: unknown,
+  name: string,
+  max: number,
+): string | null {
+  if (value === undefined || value === null) return null
+  return requiredString(value, name, max)
+}
+
+function validNonNegativeInteger(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 0)
+    throw new MemoryV2StorageError({
+      kind: 'invalid',
+      message: 'The event cursor must be a non-negative integer.',
+      retryable: false,
+    })
+  return value
+}
+
+function validPositiveInteger(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1)
+    throw new MemoryV2StorageError({
+      kind: 'invalid',
+      message: 'The event limit must be a positive integer.',
+      retryable: false,
+    })
+  return value
+}
+
+function operationError(
+  code: MemoryOperationError['code'],
+  message: string,
+  retryable: boolean,
+): MemoryOperationError {
+  return { code, message, retryable }
+}
+
+function rejectedOutcome(
+  message: string,
+  code: MemoryOperationError['code'] = 'invalid-request',
+): { outcome: 'rejected'; error: MemoryOperationError } {
+  return { outcome: 'rejected', error: operationError(code, message, false) }
+}
+
+function failedOutcome(
+  code: MemoryOperationError['code'],
+  message: string,
+  retryable: boolean,
+): { outcome: 'failed'; error: MemoryOperationError } {
+  return { outcome: 'failed', error: operationError(code, message, retryable) }
+}
+
+function operationFailureOutcome(failure: MemoryV2Failure): {
+  outcome: 'failed'
+  error: MemoryOperationError
+} {
+  return failedOutcome(
+    failure.kind === 'busy' ||
+      failure.kind === 'closed' ||
+      failure.kind === 'io' ||
+      failure.kind === 'unsupported-open'
+      ? 'unavailable'
+      : 'internal',
+    failure.message,
+    failure.retryable,
+  )
+}
+
+function appendFailureOutcome(failure: MemoryV2Failure): MemoryAppendOutcome {
+  if (failure.kind === 'conflict') {
+    return {
+      outcome: 'rejected',
+      error: operationError('conflict', failure.message, true),
+    }
+  }
+  if (failure.kind === 'invalid') return rejectedOutcome(failure.message)
+  return operationFailureOutcome(failure)
+}
+
+function commonHealth(
+  status: MemoryHealth['status'],
+  issues: string[],
+): MemoryHealth {
+  return {
+    schemaVersion: 2,
+    status,
+    checkedAt: new Date().toISOString(),
+    authority:
+      status === 'unavailable'
+        ? {
+            kind: 'unavailable',
+            writable: false,
+            reason: issues[0] ?? 'The memory store is unavailable.',
+          }
+        : {
+            kind: 'authoritative',
+            writable: true,
+            source: 'Bun SQLite Memory V2',
+          },
+    backend: {
+      backendId: 'bun-sqlite-memory-v2',
+      kind: 'local-persistent',
+      persistence: 'durable',
+      capabilities: [
+        'append',
+        'query',
+        'verify',
+        'rebuild',
+        'health',
+        'export',
+      ],
+    },
+    issues,
+  }
+}
+
+function invalidEventFailure(error: unknown): MemoryV2Failure {
+  return {
+    kind: 'invalid',
+    message: error instanceof Error ? error.message : 'The event is invalid.',
+    retryable: false,
+  }
+}
+
+function classifyStorageError(error: unknown): MemoryV2Failure {
+  if (error instanceof MemoryV2StorageError) return error.failure
+  const code =
+    typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code: unknown }).code).toUpperCase()
+      : ''
+  const message = error instanceof Error ? error.message.toUpperCase() : ''
+  const signature = `${code} ${message}`
+
+  if (
+    signature.includes('SQLITE_BUSY') ||
+    signature.includes('SQLITE_LOCKED') ||
+    signature.includes('DATABASE IS LOCKED') ||
+    code === '5' ||
+    code === '6'
+  ) {
+    return {
+      kind: 'busy',
+      message: 'The memory store is busy; retry shortly.',
+      retryable: true,
+    }
+  }
+  if (
+    signature.includes('SQLITE_CORRUPT') ||
+    signature.includes('SQLITE_NOTADB') ||
+    signature.includes('NOT A DATABASE') ||
+    signature.includes('MALFORMED')
+  ) {
+    return {
+      kind: 'corrupt',
+      message: 'The memory store is corrupt or unreadable.',
+      retryable: false,
+    }
+  }
+  if (
+    signature.includes('SQLITE_SCHEMA') ||
+    signature.includes('SQLITE_MISMATCH')
+  ) {
+    return {
+      kind: 'incompatible',
+      message: 'The memory store schema is incompatible with this CLI.',
+      retryable: false,
+    }
+  }
+  return {
+    kind: 'io',
+    message: 'The memory store could not complete a local I/O operation.',
+    retryable: false,
+  }
+}
+
+function unavailableHealth(
+  failure: MemoryV2Failure,
+  schemaVersion: number | null = null,
+): MemoryV2Health {
+  return {
+    status: 'unavailable',
+    schemaVersion,
+    journalMode: null,
+    synchronous: null,
+    projectionCursor: null,
+    capabilities: [],
+    failure,
+  }
+}
+
+function unsupported(capability: string): MemoryV2UnsupportedResult {
+  return {
+    status: 'unsupported',
+    capability,
+    message: `Memory V2 ${capability} is not implemented by the Bun SQLite kernel.`,
+  }
+}

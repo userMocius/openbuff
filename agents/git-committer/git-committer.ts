@@ -86,6 +86,16 @@ const definition: SecretAgentDefinition = {
 11. Never commit secrets, .env files, credentials, generated artifacts without their source, or unrelated changes. No eligible changes → report and stop.`.trim(),
 
   handleSteps: function* ({ params }) {
+    // POSIX single-quote shell escaping. JSON.stringify is NOT shell
+    // quoting: inside double quotes '$(cmd)', '`cmd`' and '$VAR' remain
+    // active when the string runs via bash -c. Wrap every path in single
+    // quotes using the canonical POSIX escape form: each literal ' becomes
+    // '\'' (close quote, escaped quote, reopen quote).
+    // Single quotes cannot appear inside a single-quoted segment by
+    // construction, so quoting composes safely into a larger bash -c string.
+    const shellQuote = (value: string) =>
+      `'${value.replace(/'/g, "'\\''")}'`
+
     const { toolResult: statusResult } = yield {
       toolName: 'run_terminal_command',
       input: { command: 'git status --short --branch' },
@@ -168,7 +178,7 @@ const definition: SecretAgentDefinition = {
       yield {
         toolName: 'run_terminal_command',
         input: {
-          command: `git add -- ${ownedPaths.map((path: string) => JSON.stringify(path)).join(' ')}`,
+          command: `git add -- ${ownedPaths.map((path: string) => shellQuote(path)).join(' ')}`,
         },
       } as ToolCall<'run_terminal_command'>
 
@@ -288,6 +298,19 @@ const definition: SecretAgentDefinition = {
         } satisfies StepText
         return
       }
+      // Git-ref-safe guard: `branch` comes from `git branch --show-current`
+      // and is interpolated into the rev-list/push commands below, so refuse
+      // anything outside the git-ref-safe charset (or with a leading '-')
+      // rather than running it.
+      const branchRefSafe =
+        /^[A-Za-z0-9._/\\/-]+$/.test(branch) && !branch.startsWith('-')
+      if (!branchRefSafe) {
+        yield {
+          type: 'STEP_TEXT',
+          text: `Push refused: branch name '${branch}' fails the git-ref-safe charset guard /^[A-Za-z0-9._\\/-]+$/ (or has a leading '-'); nothing was pushed.`,
+        } satisfies StepText
+        return
+      }
       yield {
         toolName: 'run_terminal_command',
         input: { command: `git fetch --prune ${remote}` },
@@ -305,6 +328,19 @@ const definition: SecretAgentDefinition = {
           ? defaultValue.stdout.trim()
           : ''
       const defaultBranch = defaultRef.split('/').at(-1) ?? ''
+      // M1-T6 (fail closed): when `${remote}/HEAD` cannot be resolved the
+      // default-branch comparison is meaningless — an empty defaultBranch used
+      // to silently satisfy the guard for every branch, turning the
+      // default-branch push protection off exactly when the remote state is
+      // unknown. Refuse the push instead; the user can repair the remote HEAD
+      // with `git remote set-head <remote> --auto`.
+      if (!defaultBranch) {
+        yield {
+          type: 'STEP_TEXT',
+          text: `Push refused: could not resolve the default branch from '${remote}/HEAD' (empty output); nothing was pushed. Repair the remote HEAD with \`git remote set-head ${remote} --auto\` and retry.`,
+        } satisfies StepText
+        return
+      }
       if (branch === defaultBranch) {
         yield {
           type: 'STEP_TEXT',

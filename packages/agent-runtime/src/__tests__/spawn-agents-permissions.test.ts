@@ -192,7 +192,7 @@ describe('Spawn Agents Permissions', () => {
     ).toContain('server/src/__tests__')
   })
 
-  it('does not retain partial discovery claims when a batch has duplicates', async () => {
+  it('serves existing discovery receipt when a batch has duplicates', async () => {
     const parentAgent = createMockAgent('parent', ['file-picker'])
     const childAgent = createMockAgent('file-picker')
     const sessionState = getInitialSessionState(mockFileContext)
@@ -203,23 +203,35 @@ describe('Spawn Agents Permissions', () => {
       },
     }
 
-    await expect(
-      handleSpawnAgents({
-        ...handleSpawnAgentsBaseParams,
-        agentState: sessionState.mainAgentState,
-        agentTemplate: parentAgent,
-        localAgentTemplates: { 'file-picker': childAgent },
-        toolCall: {
-          toolName: 'spawn_agents',
-          toolCallId: 'spawn-duplicate-file-pickers',
-          input: { agents: [duplicate, duplicate] },
-        },
-      }),
-    ).rejects.toThrow('Duplicate discovery shard')
+    const { output } = await handleSpawnAgents({
+      ...handleSpawnAgentsBaseParams,
+      agentState: sessionState.mainAgentState,
+      agentTemplate: parentAgent,
+      localAgentTemplates: { 'file-picker': childAgent },
+      toolCall: {
+        toolName: 'spawn_agents',
+        toolCallId: 'spawn-duplicate-file-pickers',
+        input: { agents: [duplicate, duplicate] },
+      },
+    })
 
+    const reports =
+      output[0]?.type === 'json' ? (output[0].value as unknown[]) : undefined
+    expect(Array.isArray(reports)).toBe(true)
+    expect(reports).toHaveLength(2)
+    for (const report of reports as unknown[]) {
+      expect(JSON.stringify(report)).toContain('Mock agent response')
+    }
+
+    expect(sessionState.mainAgentState.discoveryCoverage?.shards).toHaveLength(
+      1,
+    )
     expect(
-      sessionState.mainAgentState.discoveryCoverage?.shards ?? [],
-    ).toHaveLength(0)
+      sessionState.mainAgentState.discoveryCoverage?.shards[0],
+    ).toMatchObject({
+      agentType: 'file-picker',
+      status: 'completed',
+    })
   })
 
   it('attenuates terminal authority throughout plan-only spawn ancestry', () => {
@@ -386,6 +398,38 @@ describe('Spawn Agents Permissions', () => {
     // Empty readablePaths must preserve unrestricted static scope, not emit [].
     expect(derived.filesystemScope?.read).toBeUndefined()
     expect(derived.filesystemScope?.write).toBeUndefined()
+  })
+
+  // M2-T2 empty-permission semantics: an empty allowedTools list means "no
+  // change" — the same convention as empty paths — never a zero-tool child.
+  it('preserves the static tool set when handoff allowedTools is empty', () => {
+    const parentAgent = createMockAgent('orchestrator', ['repair-editor'])
+    const childAgent = createMockAgent('repair-editor')
+    childAgent.toolNames = ['edit_transaction', 'code_search']
+
+    const derived = deriveSpawnTemplateCapabilities({
+      agentTemplate: childAgent,
+      parentAgentTemplate: parentAgent,
+      handoff: createVersionedHandoff([]),
+      projectRoot: mockFileContext.projectRoot,
+    })
+
+    expect(derived.toolNames).toEqual(['edit_transaction', 'code_search'])
+  })
+
+  it('still narrows static tools when handoff allowedTools lists a subset', () => {
+    const parentAgent = createMockAgent('orchestrator', ['repair-editor'])
+    const childAgent = createMockAgent('repair-editor')
+    childAgent.toolNames = ['edit_transaction', 'code_search']
+
+    const derived = deriveSpawnTemplateCapabilities({
+      agentTemplate: childAgent,
+      parentAgentTemplate: parentAgent,
+      handoff: createVersionedHandoff(['code_search']),
+      projectRoot: mockFileContext.projectRoot,
+    })
+
+    expect(derived.toolNames).toEqual(['code_search'])
   })
 
   it('still narrows filesystem scope when handoff lists non-empty paths', () => {
@@ -752,14 +796,46 @@ describe('editor implementation brief validation', () => {
 
     const compatibilityTemplate = {
       id: 'compatibility-reviewer',
-      inputSchema: { params: z.object({ snapshot_id: z.string().min(1) }) },
+      inputSchema: {
+        params: z.object({
+          snapshot_id: z.string().regex(/^v3:[a-f0-9]{64}$/),
+        }),
+      },
     } as unknown as AgentTemplate
+    // No snapshot_id key supplied: a single omit-and-wait directive.
     expect(() =>
       validateAgentInput(
         compatibilityTemplate,
         'compatibility-reviewer',
         'Review compatibility.',
         {},
+      ),
+    ).toThrow('manual spawns omit `params.snapshot_id` entirely')
+    try {
+      validateAgentInput(
+        compatibilityTemplate,
+        'compatibility-reviewer',
+        'Review compatibility.',
+        {},
+      )
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      expect(message).toContain('params.files')
+      expect(message).toContain('wait for the gate')
+      expect(message).not.toContain('set params.snapshot_id')
+      expect(message).not.toContain('gate-assigned opaque v3:')
+      expect(message).not.toMatch(
+        /exact current snapshot fingerprint from get_change_review_bundle/i,
+      )
+    }
+
+    // Supplied-but-invalid snapshot_id: a single no-self-minting directive.
+    expect(() =>
+      validateAgentInput(
+        compatibilityTemplate,
+        'compatibility-reviewer',
+        'Review compatibility.',
+        { snapshot_id: 'v3:' + 'a'.repeat(63) },
       ),
     ).toThrow(
       // Gate-assigned opaque v3 token — bare bundle hex is evidence-only.
@@ -770,17 +846,53 @@ describe('editor implementation brief validation', () => {
         compatibilityTemplate,
         'compatibility-reviewer',
         'Review compatibility.',
-        {},
+        { snapshot_id: 'v3:' + 'a'.repeat(63) },
       )
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      expect(message).toContain('"snapshot_id": "v3:<64-hex>"')
-      expect(message).toContain('specialistCreditFingerprint')
+      expect(message).toContain('the supplied params.snapshot_id is invalid')
       expect(message).toContain('evidence-only')
+      // No-self-minting: the hint never names a caller-side recompute path.
+      expect(message).not.toMatch(/hashGateSnapshotDetails/i)
+      expect(message).not.toMatch(/recompute|re-mint/i)
+      // A manual caller that supplied an invalid token gets the
+      // omit-for-manual contract, not a recipe for sourcing a replacement.
+      expect(message).toContain('omit params.snapshot_id entirely')
+      expect(message).toContain('wait for the runtime-owned gate')
       expect(message).not.toMatch(
         /exact current snapshot fingerprint from get_change_review_bundle/i,
       )
     }
+  })
+
+  it('accepts a manual security-reviewer spawn with both schema-required keys (omit-for-manual exception)', () => {
+    // security-reviewer is the documented exception to the omit-for-manual
+    // contract: its schema hard-requires changed_files + snapshot_fingerprint
+    // on manual spawns too, and imposes no v3 pattern on the fingerprint, so
+    // the manual pre-edit security-review path stays usable with a
+    // caller-supplied stable value.
+    const securityReviewerTemplate = {
+      id: 'security-reviewer',
+      inputSchema: {
+        params: z
+          .object({
+            changed_files: z.array(z.string()),
+            snapshot_fingerprint: z.string(),
+          })
+          .strict(),
+      },
+    } as unknown as AgentTemplate
+    expect(() =>
+      validateAgentInput(
+        securityReviewerTemplate,
+        'security-reviewer',
+        'Review the auth change.',
+        {
+          changed_files: ['src/auth/login.ts'],
+          snapshot_fingerprint: 'pre-edit-review-fingerprint',
+        },
+      ),
+    ).not.toThrow()
   })
 
   it('accepts a concrete prose brief with actionable target files', () => {

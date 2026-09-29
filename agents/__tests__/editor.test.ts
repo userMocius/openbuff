@@ -2,11 +2,23 @@ import { describe, test, expect } from 'bun:test'
 import { readFileSync } from 'node:fs'
 
 import editor, { createCodeEditor } from '../editor/editor'
+import repairEditor from '../editor/repair-editor'
 import { extractInlineFunctionSource } from './helpers/extract-inline-function-source'
 
 import type { AgentState } from '../types/agent-definition'
 
 describe('editor agent', () => {
+  test('editor and repair-editor declare an explicit output token ceiling', () => {
+    // Without an explicit ceiling, provider defaults (the Anthropic path
+    // defaults to ~4k output tokens) truncate large multi-edit
+    // edit_transaction payloads mid-JSON before the editor can finish. 32k
+    // still truncated the largest multi-file transactions plus the think-tag
+    // preamble, so the ceiling is the opus-4.7 output maximum.
+    expect(createCodeEditor({ model: 'opus' }).maxOutputTokens).toBe(64000)
+    expect(editor.maxOutputTokens).toBe(64000)
+    expect(repairEditor.maxOutputTokens).toBe(64000)
+  })
+
   const withCommittedReceipt = (value: any) => {
     const receiptId = `${value.operationId}:receipt`
     return {
@@ -1095,7 +1107,7 @@ describe('editor agent', () => {
       expect((result.value as any).input.output.status).toBe('blocked')
     })
 
-    test('does not attest findings from committed edits covering every finding file', () => {
+    test('attests only handoff findings backed by committed edits', () => {
       const generator = editor.handleSteps!({
         agentState: createMockAgentState([]),
         logger: noopLogger as any,
@@ -1105,6 +1117,10 @@ describe('editor agent', () => {
               {
                 id: 'review-finding',
                 files: ['src/finding.ts', 'src/finding.test.ts'],
+              },
+              {
+                id: 'unrelated-finding',
+                files: ['src/unrelated.ts'],
               },
             ],
           },
@@ -1159,7 +1175,61 @@ describe('editor agent', () => {
         'src/finding.ts',
         'src/finding.test.ts',
       ])
-      expect((result.value as any).input.output.findingsAddressed).toEqual([])
+      expect((result.value as any).input.output.findingsAddressed).toEqual([
+        'review-finding',
+      ])
+    })
+
+    test('repair-editor attests its handoff findings after a committed repair', () => {
+      const generator = repairEditor.handleSteps!({
+        agentState: createMockAgentState([]),
+        logger: noopLogger as any,
+        params: {
+          handoff: {
+            findings: [{ id: 'repair-finding', files: ['src/repaired.ts'] }],
+          },
+        },
+      } as any)
+      generator.next()
+
+      const result = generator.next({
+        agentState: createMockAgentState([
+          {
+            role: 'tool',
+            toolName: 'edit_transaction',
+            content: [
+              {
+                type: 'json',
+                value: withCommittedReceipt({
+                  kind: 'file_mutation_result',
+                  version: 1,
+                  operationId: 'repair-finding',
+                  outcome: 'applied',
+                  authorityTier: 'portable_path',
+                  actions: [
+                    {
+                      actionId: 'repair',
+                      index: 0,
+                      action: 'update',
+                      path: 'src/repaired.ts',
+                      outcome: 'applied',
+                      afterHash: 'repaired-after',
+                    },
+                  ],
+                  errors: [],
+                  freshCapabilities: [],
+                }),
+              },
+            ],
+          },
+        ]),
+        toolResult: undefined,
+        stepsComplete: true,
+      })
+
+      expect((result.value as any).input.output.findingsAddressed).toEqual([
+        'repair-finding',
+      ])
     })
 
     test('works with empty initial message history', () => {
@@ -1501,6 +1571,87 @@ describe('editor agent', () => {
       expect(output.requestedValidation).toEqual([
         'cd packages/foo && bun run typecheck && bun test',
       ])
+    })
+
+    test('bounds oversized tool-result strings in the receipt messages', () => {
+      // The receipt historically inlined full read_files contents, making it
+      // the largest payload of the run and prone to transport truncation.
+      const generator = editor.handleSteps!({
+        agentState: createMockAgentState([]),
+        logger: noopLogger as any,
+        params: {},
+      })
+      generator.next()
+
+      const huge = 'x'.repeat(3000)
+      const result = generator.next({
+        agentState: createMockAgentState([
+          {
+            role: 'tool',
+            toolName: 'read_files',
+            content: [
+              { type: 'json', value: { stdout: huge } },
+            ],
+          },
+        ]),
+        toolResult: undefined,
+        stepsComplete: true,
+      })
+
+      const serialized = JSON.stringify(
+        (result.value as any).input.output.messages,
+      )
+      expect(serialized).toContain('[truncated 3000 chars]')
+      expect(serialized.length).toBeLessThan(5000)
+    })
+
+    test('retries the receipt with tighter bounds while output is unset', () => {
+      // A rejected receipt leaves agentState.output unset; the generator must
+      // retry with progressively tighter bounds instead of delivering nothing.
+      const generator = editor.handleSteps!({
+        agentState: createMockAgentState([]),
+        logger: noopLogger as any,
+        params: {},
+      })
+      generator.next()
+
+      const huge = 'x'.repeat(3000)
+      const history = [
+        {
+          role: 'tool' as const,
+          toolName: 'read_files',
+          content: [{ type: 'json' as const, value: { stdout: huge } }],
+        },
+      ]
+
+      const first = generator.next({
+        agentState: createMockAgentState(history),
+        toolResult: undefined,
+        stepsComplete: true,
+      })
+      expect((first.value as any).toolName).toBe('set_output')
+      const firstText = JSON.stringify((first.value as any).input.output)
+
+      // Output still unset → first retry with tighter bounds.
+      const retry = generator.next({
+        agentState: createMockAgentState(history),
+        toolResult: undefined,
+        stepsComplete: true,
+      })
+      expect((retry.value as any).toolName).toBe('set_output')
+      const retryText = JSON.stringify((retry.value as any).input.output)
+      expect(retryText.length).toBeLessThan(firstText.length)
+
+      // Output set → the generator completes without further retries.
+      const final = generator.next({
+        agentState: {
+          ...createMockAgentState([]),
+          output: { status: 'completed' },
+        },
+        toolResult: undefined,
+        stepsComplete: true,
+      })
+      expect(final.done).toBe(true)
     })
   })
 

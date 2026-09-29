@@ -2,6 +2,7 @@ import { AnalyticsEvent } from '@codebuff/common/constants/analytics-events'
 import { supportsCacheControl } from '@codebuff/common/old-constants'
 import { TOOLS_WHICH_WONT_FORCE_NEXT_STEP } from '@codebuff/common/tools/constants'
 import { buildArray } from '@codebuff/common/util/array'
+import { MemoryTurnContextV2Schema } from '@codebuff/common/types/memory-v2'
 import {
   AbortError,
   extractApiErrorDetails,
@@ -9,6 +10,7 @@ import {
   isAbortError,
 } from '@codebuff/common/util/error'
 import { serializeCacheDebugCorrelation } from '@codebuff/common/util/cache-debug'
+import { redactSecretValues } from '@codebuff/common/util/redact-secrets'
 import { assistantMessage, userMessage } from '@codebuff/common/util/messages'
 import { type ToolSet } from 'ai'
 import { cloneDeep, mapValues } from 'lodash'
@@ -40,10 +42,6 @@ import { getToolSet } from './tools/prompts'
 import { processStream } from './tools/stream-parser'
 import { getAgentOutput } from './util/agent-output'
 import {
-  evaluateRepeatedStepLoop,
-  REPEATED_STEP_LOOP_LIMIT,
-} from './util/step-loop-guard'
-import {
   initBudgetFromTemplate,
   checkBudgetExceeded,
 } from './util/budget-enforcement'
@@ -65,14 +63,32 @@ import {
   getConfirmedAppliedActionsV1,
   isFileMutationResultV1,
 } from '@codebuff/common/tools/results/filesystem'
-import { countTokensJson } from './util/token-counter'
+import {
+  countTokensJson,
+  IncrementalTokenCounter,
+} from './util/token-counter'
 import {
   COMPACTION_NO_PROGRESS_FRACTION,
   DEFAULT_MAX_CONTEXT_TOKENS,
+  advanceGovernorIteration,
+  createSemanticCompactionGovernor,
   getEffectiveContextLimits,
   getSemanticCompactionBudget,
+  getSemanticEvictionFloorTokens,
+  getSemanticRearmBudgetTokens,
   maybePruneContext,
+  recordPassAnnounced,
+  recordPassSettled,
+  shouldRunSemanticPass,
 } from './util/context-pruning'
+import {
+  deriveProtectedEvictionPaths,
+  evictStaleToolResults,
+  EVICTION_KEEP_RECENT_STEPS,
+} from './util/tool-result-eviction'
+import { archivePreCompaction } from './util/context-archive'
+import { maybeRunBackgroundConsolidation } from './util/context-consolidation-runner'
+import { verifyExtractionCoverage } from './util/compaction-verification'
 import {
   annotateLedgerAfterCompaction,
   applyMeasure,
@@ -90,6 +106,10 @@ import {
   flushBufferedToolEvidenceIntoTaskMemory,
   mergeTaskMemoryDraft,
 } from './util/task-memory'
+import {
+  compileMemoryV2Context,
+  countConceptAdvisoryEntries,
+} from './util/memory-v2-context'
 
 import type { AgentTemplate } from '@codebuff/common/types/agent-template'
 import type { TrackEventFn } from '@codebuff/common/types/contracts/analytics'
@@ -126,6 +146,126 @@ import type {
 } from '@codebuff/common/util/file'
 
 /**
+ * M1-T5: redact secrets from a message before it reaches a log sink. Handles
+ * BOTH string-shaped content and array-shaped content: text parts carry
+ * tool/file output read during the run (exactly the "secret file contents"
+ * the M1-T5 audit targets), so every text part's text is redacted too. Other
+ * part types carry no raw prompt text and pass through untouched.
+ */
+function redactMessageForLog(message: Message): Message {
+  const { content } = message
+  if (typeof content === 'string') {
+    // Shape-preserving copy: only the string content is rewritten. The union
+    // spread needs the two-step cast TS requires for mixed-content unions.
+    return { ...message, content: redactSecretValues(content) } as unknown as Message
+  }
+  if (!Array.isArray(content)) {
+    return message
+  }
+  const redactedParts = content.map((part) =>
+    part.type === 'text'
+      ? { ...part, text: redactSecretValues(part.text) }
+      : part,
+  )
+  // Shape-preserving copy: only text-part `text` fields are rewritten, so the
+  // runtime message union is unchanged.
+  return { ...message, content: redactedParts } as Message
+}
+
+/**
+ * Validates and normalizes one candidate mutation path into `paths`
+ * (contained-rel-path-only: empty, absolute, drive-rooted, and '..'-escaping
+ * values are rejected — audit shard-runtime-loop: a tool-result payload
+ * echoing such a string must not pollute the mutation ledger).
+ */
+function addSelfMutatedPath(paths: Set<string>, value: unknown): void {
+  if (typeof value !== 'string') return
+  const trimmed = value.trim().replace(/\\/g, '/')
+  if (trimmed.length === 0) return
+  if (trimmed.startsWith('/') || /^[A-Za-z]:/.test(trimmed)) return
+  const isInsideProject = trimmed
+    .split('/')
+    .reduce<number>((depth, segment) => {
+      if (segment === '' || segment === '.') return depth
+      if (segment === '..') return depth - 1
+      return depth + 1
+    }, 0)
+  if (isInsideProject <= 0) return
+  paths.add(trimmed)
+}
+
+/**
+ * Crediting layer for one traversed node: confirmed file-mutation actions,
+ * touchedPaths, changedFiles, and schemaVersion=1 agent receipts feed
+ * addSelfMutatedPath. Shared with the CASE 5 before mirror in
+ * scripts/measure-perf-guards-baseline.ts so before/after rows run identical
+ * crediting work (RF-8 / case5-asymmetric-speedup-ratio) and only the
+ * traversal guard differs.
+ */
+export function creditSelfMutatedPathValue(
+  paths: Set<string>,
+  value: unknown,
+): void {
+  // Keep a non-narrowed plain object view. Type-guard file mutations on
+  // `value` (unknown) so TS does not collapse `plain` to FileMutationResultV1
+  // and drop agent-receipt property access below.
+  const plain: Record<string, unknown> = value as Record<string, unknown>
+
+  if (isFileMutationResultV1(value)) {
+    for (const action of getConfirmedAppliedActionsV1(value)) {
+      addSelfMutatedPath(paths, action.path)
+      if (action.action === 'move') {
+        addSelfMutatedPath(paths, action.destinationPath)
+      }
+    }
+  }
+
+  const collectChangedFiles = (changedFiles: unknown) => {
+    if (!Array.isArray(changedFiles)) return
+    for (const item of changedFiles) {
+      if (typeof item === 'string') {
+        addSelfMutatedPath(paths, item)
+      } else if (item && typeof item === 'object') {
+        addSelfMutatedPath(paths, (item as { path?: unknown }).path)
+      }
+    }
+  }
+
+  // Optional touchedPaths → selfMutatedPaths: SYNC terminal/basher dirty
+  // delta and first-settled check_job BACKGROUND settlement dirty delta.
+  if (Array.isArray(plain.touchedPaths)) {
+    for (const p of plain.touchedPaths) addSelfMutatedPath(paths, p)
+  }
+  // Credit top-level changedFiles when already present on tool results.
+  if (Array.isArray(plain.changedFiles)) {
+    collectChangedFiles(plain.changedFiles)
+  }
+
+  // agent-receipt checks use plain.* only (never narrowed FileMutationResultV1)
+  const isAgentReceipt =
+    plain.schemaVersion === 1 &&
+    typeof plain.receiptId === 'string' &&
+    Array.isArray(plain.changedFiles)
+  if (isAgentReceipt) {
+    collectChangedFiles(plain.changedFiles)
+  }
+  if (
+    plain.agentReceipt &&
+    typeof plain.agentReceipt === 'object' &&
+    !Array.isArray(plain.agentReceipt)
+  ) {
+    const receipt = plain.agentReceipt as Record<string, unknown>
+    if (
+      receipt.schemaVersion === 1 &&
+      typeof receipt.receiptId === 'string' &&
+      Array.isArray(receipt.changedFiles)
+    ) {
+      collectChangedFiles(receipt.changedFiles)
+    }
+  }
+}
+
+/**
  * Publish process-owned mutation paths onto agentState so concurrent gate
  * isolation (base2 mid-turn git-status absorption) can credit broker/owned
  * writes without absorbing foreign dirty files.
@@ -148,82 +288,70 @@ export function publishSelfMutatedPaths(params: {
   const existing = agentState.selfMutatedPaths
   const paths = new Set<string>()
 
-  const addPath = (value: unknown) => {
-    if (typeof value !== 'string') return
-    const trimmed = value.trim().replace(/\\/g, '/')
-    if (trimmed.length > 0) paths.add(trimmed)
+  if (Array.isArray(existing)) {
+    for (const path of existing) addSelfMutatedPath(paths, path)
   }
 
-  if (Array.isArray(existing)) {
-    for (const path of existing) addPath(path)
+  // Traversal guard (performance-specialist finding
+  // single-visited-set-shared-across-results): depth > 8 alone cannot bound a
+  // CYCLIC tool-result graph at O(cycle_length × branches) — a self-referencing
+  // object loops forever hit-or-miss with the depth threshold. A plain visited
+  // set bounds the walk but is NOT semantics-preserving: when a shared object
+  // is first reached at a deep depth its subtree is pruned by the depth cap,
+  // and the later shallower reach — which still has budget for that subtree —
+  // is silently skipped, under-collecting paths the unguarded walk finds (the
+  // benchmark shared-graph parity case collected 9 of 19 paths that way).
+  //
+  // A depth-aware memo keeps the bound AND the semantics: each object records
+  // the shallowest depth it has been walked at and is re-walked only when
+  // reached with strictly more remaining budget (a smaller depth). Collection
+  // at a shallower depth is a superset of collection at any deeper one (same
+  // edges, more budget), so the shallowest walk yields exactly the union the
+  // unguarded walk collects, while cyclic re-entry always arrives at a LARGER
+  // depth and is refused. Bounded: at most one walk per object per depth level
+  // instead of one per path.
+  //
+  // The memo is PER-PAYLOAD (cleared between each tool result / tool message):
+  // gate results and messages are conceptually independent subgraphs today, but
+  // if two payloads ever shared object identity (e.g. a receipt object embedded
+  // in two tool results), a step-global memo would silently skip the second
+  // appearance and could change what gets measured. Cycle detection is scoped
+  // to the object graph WITHIN one payload; sharing across payloads is
+  // intentionally re-visited so each payload's mutation evidence is collected
+  // on its own terms.
+  const walkedAtDepth = new Map<unknown, number>()
+
+  const visitPayload = (payload: unknown): void => {
+    walkedAtDepth.clear()
+    visitValue(payload)
   }
 
   const visitValue = (value: unknown, depth = 0): void => {
     if (value == null || depth > 8) return
+    if (typeof value !== 'object') return
+    // Re-walk only on a strictly shallower reach. An equal-depth repeat is a
+    // diamond, not a larger budget: both reaches traverse the identical
+    // subtree at the identical budget, so skipping keeps the union unchanged.
+    // Arrays are memoized here too (they are objects): exempting them left a
+    // shared/self-referential array chain re-walking once per path (depth-capped
+    // but breadth-unbounded, k refs ^ remaining budget) — the residual half of
+    // the single-visited-set-shared-across-results breadth clause.
+    const priorWalkDepth = walkedAtDepth.get(value)
+    if (priorWalkDepth !== undefined && priorWalkDepth <= depth) return
+    walkedAtDepth.set(value, depth)
     if (Array.isArray(value)) {
       for (const item of value) visitValue(item, depth + 1)
       return
     }
-    if (typeof value !== 'object') return
 
-    // Keep a non-narrowed plain object view. Type-guard file mutations on
-    // `value` (unknown) so TS does not collapse `plain` to FileMutationResultV1
-    // and drop agent-receipt property access below.
+    // Non-narrowed plain-object view for traversal (the file-mutation type
+    // guards live in creditSelfMutatedPathValue below).
     const plain: Record<string, unknown> = value as Record<string, unknown>
     if (plain.type === 'json' && 'value' in plain) {
       visitValue(plain.value, depth + 1)
     }
 
-    if (isFileMutationResultV1(value)) {
-      for (const action of getConfirmedAppliedActionsV1(value)) {
-        addPath(action.path)
-        if (action.action === 'move') addPath(action.destinationPath)
-      }
-    }
-
-    const collectChangedFiles = (changedFiles: unknown) => {
-      if (!Array.isArray(changedFiles)) return
-      for (const item of changedFiles) {
-        if (typeof item === 'string') {
-          addPath(item)
-        } else if (item && typeof item === 'object') {
-          addPath((item as { path?: unknown }).path)
-        }
-      }
-    }
-
-    // Optional touchedPaths → selfMutatedPaths: SYNC terminal/basher dirty
-    // delta and first-settled check_job BACKGROUND settlement dirty delta.
-    if (Array.isArray(plain.touchedPaths)) {
-      for (const p of plain.touchedPaths) addPath(p)
-    }
-    // Credit top-level changedFiles when already present on tool results.
-    if (Array.isArray(plain.changedFiles)) {
-      collectChangedFiles(plain.changedFiles)
-    }
-
-    // agent-receipt checks use plain.* only (never narrowed FileMutationResultV1)
-    const isAgentReceipt =
-      plain.schemaVersion === 1 &&
-      typeof plain.receiptId === 'string' &&
-      Array.isArray(plain.changedFiles)
-    if (isAgentReceipt) {
-      collectChangedFiles(plain.changedFiles)
-    }
-    if (
-      plain.agentReceipt &&
-      typeof plain.agentReceipt === 'object' &&
-      !Array.isArray(plain.agentReceipt)
-    ) {
-      const receipt = plain.agentReceipt as Record<string, unknown>
-      if (
-        receipt.schemaVersion === 1 &&
-        typeof receipt.receiptId === 'string' &&
-        Array.isArray(receipt.changedFiles)
-      ) {
-        collectChangedFiles(receipt.changedFiles)
-      }
-    }
+    creditSelfMutatedPathValue(paths, value)
 
     // Shallow nested walk for tool-result envelopes without deep graph cycles.
     for (const nested of Object.values(plain)) {
@@ -234,11 +362,11 @@ export function publishSelfMutatedPaths(params: {
   }
 
   for (const result of toolResults) {
-    visitValue(result.content)
+    visitPayload(result.content)
   }
   for (const message of messages) {
     if (message.role !== 'tool') continue
-    visitValue(message.content)
+    visitPayload(message.content)
   }
 
   const published = [...paths].sort()
@@ -319,6 +447,8 @@ export const runAgentStep = async (
     agentTemplate: AgentTemplate
     fileContext: ProjectFileContext
     agentState: AgentState
+    /** Ephemeral compiled memory messages rebuilt by loopAgentSteps for this request. */
+    memoryContextMessages?: Message[]
     localAgentTemplates: Record<string, AgentTemplate>
 
     prompt: string | undefined
@@ -525,6 +655,7 @@ export const runAgentStep = async (
 
   const agentMessagesUntruncated = buildArray<Message>(
     ...expireMessages(agentState.messageHistory, 'agentStep'),
+    ...(params.memoryContextMessages ?? []),
 
     stepPrompt &&
     userMessage({
@@ -667,10 +798,17 @@ export const runAgentStep = async (
       contextTokenCount: agentState.contextTokenCount,
       // Limit debug-log message history to the most recent 50 messages to
       // avoid MB-sized log lines on long sessions. Reverse so the most recent
-      // message appears first.
-      agentMessages: agentState.messageHistory.slice(-50).reverse(),
-      system,
-      prompt,
+      // message appears first. M1-T5: secrets are redacted from logged prompt
+      // bytes (system prompt embeds shell config contents; transcripts can
+      // carry secret file contents read during the run).
+      agentMessages: agentState.messageHistory
+        .slice(-50)
+        .reverse()
+        .map(redactMessageForLog),
+      system: redactSecretValues(system),
+      // M1-T5: prompt is a string or undefined here (the params type pins it);
+      // array-shaped message content above is redacted per text part.
+      prompt: typeof prompt === 'string' ? redactSecretValues(prompt) : undefined,
       params: spawnParams,
       agentContext,
       systemTokens,
@@ -726,9 +864,15 @@ export const runAgentStep = async (
     let nResponses: string[]
     try {
       nResponses = JSON.parse(responsesString) as string[]
-      if (!Array.isArray(nResponses)) {
-        // Parsed but not an array: degrade to a single response rather than
-        // throwing, so one malformed best-of-N completion can't kill the run.
+      // Audit shard-runtime-loop: Array.isArray alone typed objects/numbers/nulls
+      // as string[] and flowed them into GENERATE_N consumers. Every element
+      // must be a string, else degrade to the single-response fallback.
+      if (
+        !Array.isArray(nResponses) ||
+        !nResponses.every((candidate) => typeof candidate === 'string')
+      ) {
+        // Parsed but not a string array: degrade to a single response rather
+        // than throwing, so one malformed best-of-N completion can't kill the run.
         logger.warn(
           { n: params.n, response: responsesString.slice(0, 50) },
           'Expected JSON array response from LLM for n; got non-array, falling back to single response',
@@ -986,55 +1130,13 @@ export const runAgentStep = async (
     shouldEndTurn = hasTaskCompleted || (hasNoToolResults && !isThinkOnly)
   }
 
-  const isThinkOnlyWithoutCompletion =
-    requiresExplicitCompletion &&
-    !hasTaskCompleted &&
-    hasNoToolResults &&
-    isThinkOnly
-  if (isThinkOnlyWithoutCompletion) {
-    agentState.consecutiveTextOnlyWithoutCompletion = 0
-  }
-
-  // Bounded fallback for explicit-completion agents that produce a text-only
-  // answer without calling task_completed (general-agent, last_message). Keep
-  // task_completed semantics strict, but don't loop forever: first text-only
-  // gets a nudge, second consecutive text-only ends the turn. Think-only
-  // turns never count (the model was just reasoning).
-  const isExplicitTextOnlyWithoutCompletion =
-    requiresExplicitCompletion &&
-    !hasTaskCompleted &&
-    hasNoToolResults &&
-    !isThinkOnly &&
-    responseWithoutThinkTags.length > 0
-  let injectedCompletionNudge = false
-  if (isExplicitTextOnlyWithoutCompletion) {
-    const consecutive =
-      (agentState.consecutiveTextOnlyWithoutCompletion ?? 0) + 1
-    agentState.consecutiveTextOnlyWithoutCompletion = consecutive
-    if (consecutive === 1) {
-      const nudge = withSystemTags(
-        'You produced an answer without calling task_completed. If work is done, call task_completed now; otherwise continue with tool calls.',
-      )
-      agentState.messageHistory = [
-        ...agentState.messageHistory,
-        userMessage({ content: nudge, keepDuringTruncation: true }),
-      ]
-      onResponseChunk(`${nudge}\n\n`)
-      injectedCompletionNudge = true
-    } else {
-      shouldEndTurn = true
-      if (
-        agentTemplate.outputMode === 'last_message' &&
-        agentState.output === undefined
-      ) {
-        agentState.output = { harvestedFromFallback: true }
-      }
-    }
-  } else if (!isThinkOnlyWithoutCompletion) {
-    if (!hasNoToolResults || hasTaskCompleted) {
-      agentState.consecutiveTextOnlyWithoutCompletion = 0
-    }
-  }
+  // Explicit-completion agents (task_completed in the tool list) are never
+  // killed for running a long time without completing: a text-only response
+  // without task_completed does not count toward anything, gets no nudge, and
+  // does NOT end the turn — the turn continues until task_completed, the step
+  // cap, a budget, or cancellation ends it. Think-only intent in such a run is
+  // likewise just a continue. Only task_completed/end_turn ends the turn for
+  // explicit-completion templates.
 
   // For structured-output agents, once set_output successfully sets the
   // agent's output, the turn should end regardless of other heuristics.
@@ -1051,28 +1153,11 @@ export const runAgentStep = async (
     shouldEndTurn = true
   }
 
-  if (injectedCompletionNudge) {
-    shouldEndTurn = false
-  }
-
-  const repeatedStepLoop = evaluateRepeatedStepLoop({
-    previousSignature: agentState.lastStepProgressSignature,
-    previousRepeatCount: agentState.repeatedStepProgressCount,
-    toolCalls,
-    toolResults,
-    isThinkOnly,
-    responseText: responseWithoutThinkTags,
-    shouldEndTurn,
-  })
-
-  agentState = {
-    ...agentState,
+agentState = {    ...agentState,
     stepsRemaining:
       agentState.stepsRemaining > 0
         ? agentState.stepsRemaining - 1
         : agentState.stepsRemaining,
-    lastStepProgressSignature: repeatedStepLoop.signature,
-    repeatedStepProgressCount: repeatedStepLoop.repeatCount,
     agentContext,
     // Apply the step's accumulated cost once, here, on the post-spread object.
     // This avoids the stale-closure mutation bug where late async cost callbacks
@@ -1085,33 +1170,6 @@ export const runAgentStep = async (
     cacheInputTokens: agentState.cacheInputTokens + stepCacheInputTokens,
     cacheTotalInputTokens:
       agentState.cacheTotalInputTokens + stepCacheTotalInputTokens,
-  }
-
-  if (repeatedStepLoop.shouldStop) {
-    const message = [
-      `No-progress watchdog stopped the turn after ${REPEATED_STEP_LOOP_LIMIT} repeated step patterns.`,
-      'Current work and run state were preserved.',
-      'Resume after changing the approach or inputs; productive runs are not limited by a fixed step count.',
-    ].join(' ')
-    agentState = {
-      ...agentState,
-      messageHistory: [
-        ...agentState.messageHistory,
-        assistantMessage({
-          content: message,
-          tags: ['NO_PROGRESS_LOOP_GUARD'],
-          keepDuringTruncation: true,
-        }),
-      ],
-    }
-    onResponseChunk(`${message}\n\n`)
-    return {
-      agentState,
-      fullResponse: message,
-      shouldEndTurn: true,
-      messageId: null,
-      nResponses: undefined,
-    }
   }
 
   // P1-5: Enforce per-run budgets after accumulation. If either cap is
@@ -1271,6 +1329,7 @@ export async function loopAgentSteps(
       | 'additionalToolDefinitions'
       | 'agentState'
       | 'agentTemplate'
+      | 'memoryContextMessages'
       | 'prompt'
       | 'runId'
       | 'spawnParams'
@@ -1742,10 +1801,6 @@ export async function loopAgentSteps(
     }
     initialAgentState.toolDefinitions = toolDefinitions
     let currentAgentState: AgentState = initialAgentState
-    if (prompt?.trim()) {
-      currentAgentState.lastStepProgressSignature = undefined
-      currentAgentState.repeatedStepProgressCount = 0
-    }
 
     let shouldEndTurn = false
     let outputSchemaRetryCount = 0
@@ -1798,8 +1853,9 @@ export async function loopAgentSteps(
     //     COMPACTION_NO_PROGRESS_FRACTION of its OWN pre-compaction history
     //     size, which also covers an announced pass that returned the
     //     transcript unchanged. Once it reaches
-    //     COMPACTION_NO_PROGRESS_STREAK_THRESHOLD the loop stops spawning the
-    //     semantic pruner for the rest of this turn.
+    //     COMPACTION_NO_PROGRESS_STREAK_THRESHOLD the loop logs a warning;
+    //     the governor (not the streak) caps further paid passes for the rest
+    //     of this turn via `recordPassSettled`.
     //
     // Budgets are still never silently lowered and pinned state is never
     // dropped as a reaction: the only remediation is to stop paying for a
@@ -1810,23 +1866,42 @@ export async function loopAgentSteps(
     let warnedCompactionNoProgress = false
     let consecutiveUnproductiveSemanticPasses = 0
     let warnedSemanticCompactionSuppressed = false
+    // Loop-local streak state backing the persisted advisory. The advisory
+    // field itself is recomputed once per iteration (see the mirror below), so
+    // the streak must live here: a field write inside
+    // registerUnproductiveSemanticPass alone would be overwritten by the next
+    // iteration's recomputation.
+    let streakSuppressionActive = false
     // `suppressSemanticCompaction` is a transient, loop-owned advisory. Reset
     // once here, before the loop, so a persisted or inherited `true` from an
     // earlier turn can never leak in and deadlock a recoverable run.
     initialAgentState.suppressSemanticCompaction = undefined
+    // Token-state governor replacing the old announce-every-over-trigger-iteration
+    // + permanent-suppression design. Loop-local for the same reason the other
+    // telemetry locals are: each turn starts clean, and the rearm margin is
+    // observable in the token counts themselves, so nothing needs to persist.
+    const compactionGovernor = createSemanticCompactionGovernor()
     const registerUnproductiveSemanticPass = () => {
       consecutiveUnproductiveSemanticPasses += 1
+      // The governor owns loop pacing: an unproductive pass extends its
+      // cooldown, and a SECOND consecutive unproductive pass spends the
+      // turn's remaining pass budget (bounded denial). The persisted
+      // `suppressSemanticCompaction` advisory keeps its documented
+      // streak-based contract, so crossing the streak threshold also sets
+      // it, making the inline pruner spawn path decline for the rest of the
+      // turn. Eviction and the mechanical trim still respond to pressure,
+      // and next turn starts with a fresh governor and a loop-entry reset.
+      recordPassSettled(compactionGovernor, { productive: false })
       if (
         consecutiveUnproductiveSemanticPasses <
         COMPACTION_NO_PROGRESS_STREAK_THRESHOLD
       ) {
         return
       }
-      // Advisory only: both pruner paths (an orchestrator's inline spawn and
-      // the runtime-driven pass) honor it for the rest of this loop, and a
-      // suppressed iteration announces no pass at all. No budget is lowered and
-      // no pinned state is dropped, and every announced pass still settles.
-      currentAgentState.suppressSemanticCompaction = true
+      // Streak state, not a direct field write: the per-iteration advisory
+      // mirror below is the single writer of the persisted field, so the
+      // streak is folded into that recomputation instead of racing it.
+      streakSuppressionActive = true
       if (warnedSemanticCompactionSuppressed) return
       warnedSemanticCompactionSuppressed = true
       logger.warn(
@@ -1835,7 +1910,7 @@ export async function loopAgentSteps(
           runId,
           consecutiveUnproductiveSemanticPasses,
         },
-        'Suppressing further semantic compaction for this turn after consecutive unproductive passes',
+        'Semantic compaction passes are not reclaiming space; further passes this turn are capped',
       )
     }
     const registerCompaction = (compaction: {
@@ -1878,7 +1953,12 @@ export async function loopAgentSteps(
           registerUnproductiveSemanticPass()
         } else {
           consecutiveUnproductiveSemanticPasses = 0
-          currentAgentState.suppressSemanticCompaction = undefined
+          // Clearing the streak flag (not the field directly) is what makes
+          // the documented "cleared by a productive pass" path reachable: the
+          // next iteration's advisory mirror recomputes the field from this
+          // flag plus the current governor decision.
+          streakSuppressionActive = false
+          recordPassSettled(compactionGovernor, { productive: true })
         }
       }
 
@@ -1907,6 +1987,22 @@ export async function loopAgentSteps(
       }
     }
 
+    // M3-T2: per-turn incremental token accounting (audit shard-runtime-loop
+    // run-agent-step.ts:1947). Each message's serialized token count is
+    // memoized by object reference, so repeated estimateContextTokensLocally
+    // calls (post-programmatic, post-eviction, post-prune) price only NEW or
+    // rewritten messages instead of re-encoding the whole transcript every
+    // time. Memoization keys are weak, so evicted/trimmed references do not
+    // pin anything. One full recount (reset + fresh sum) runs only after a
+    // history-rewriting compaction/trim, whose sites below call
+    // invalidateHistoryAggregate.
+    const incrementalTokenCounter = new IncrementalTokenCounter()
+    const invalidateHistoryAggregate = () => {
+      // History was rewritten (compaction/trim): the next estimate must
+      // recount fully rather than trusting stale per-message memoized counts.
+      incrementalTokenCounter.reset()
+    }
+
     try {
       while (true) {
         totalSteps++
@@ -1926,28 +2022,55 @@ export async function loopAgentSteps(
           logger,
           additionalToolDefinitions: additionalToolDefinitionsWithCache,
         })
+        const getCorrelatedAuthoritativeV2 = (state: AgentState) => {
+          if (
+            state.memoryAuthority?.active !== 'sqlite-v2-opt-in' ||
+            state.memoryAuthority.userInputId !== userInputId
+          ) {
+            return undefined
+          }
+          const parsed = MemoryTurnContextV2Schema.safeParse(state.memoryV2Context)
+          return parsed.success && parsed.data.userInputId === userInputId
+            ? parsed.data
+            : undefined
+        }
         const buildCompiledTaskMemoryMessage = (state: AgentState) =>
-          state.taskMemory
+          state.taskMemory && !getCorrelatedAuthoritativeV2(state)
             ? userMessage({
-              content: withSystemTags(
-                compileTaskMemoryContext({
-                  memory: state.taskMemory,
-                  agentType: state.agentType,
-                  contextWindowTokens: state.contextWindowTokens,
-                  rootAgent: !state.parentId,
-                  // Rank evidence toward the files this run has just read or
-                  // edited, so relevance rather than raw recency decides what
-                  // survives the compiled budget.
-                  focusPaths: deriveTaskMemoryFocusPaths(state.taskMemory),
-                }),
-              ),
-              tags: ['TASK_MEMORY_CONTEXT'],
-              keepDuringTruncation: true,
-            })
+                content: withSystemTags(
+                  compileTaskMemoryContext({
+                    memory: state.taskMemory,
+                    agentType: state.agentType,
+                    contextWindowTokens: state.contextWindowTokens,
+                    rootAgent: !state.parentId,
+                    // Rank evidence toward the files this run has just read or
+                    // edited and the bounded terms in this loop's trusted
+                    // request, so relevance rather than raw recency decides what
+                    // survives the compiled budget.
+                    focusPaths: deriveTaskMemoryFocusPaths(state.taskMemory),
+                    currentRequest: prompt,
+                  }),
+                ),
+                tags: ['TASK_MEMORY_CONTEXT'],
+                timeToLive: 'agentStep' as const,
+                keepDuringTruncation: true,
+              })
             : false
+        const buildCompiledMemoryV2Message = (state: AgentState) => {
+          const context = getCorrelatedAuthoritativeV2(state)
+          return context
+            ? userMessage({
+                content: withSystemTags(compileMemoryV2Context(context)),
+                tags: ['MEMORY_V2_CONTEXT'],
+                timeToLive: 'agentStep' as const,
+                keepDuringTruncation: true,
+              })
+            : false
+        }
         let messagesWithStepPrompt = buildArray(
           ...currentAgentState.messageHistory,
           buildCompiledTaskMemoryMessage(currentAgentState),
+          buildCompiledMemoryV2Message(currentAgentState),
           stepPrompt &&
           userMessage({
             content: stepPrompt,
@@ -1959,11 +2082,20 @@ export async function loopAgentSteps(
         // Under progressive tool disclosure, a mid-turn tier unlock rebuilds
         // `tools` below and recomputes this total and the serialized
         // toolDefinitions, so pruning estimates track the live tool surface.
+        //
+        // M3-T2: history tokens are counted incrementally (per-message memo);
+        // only system/tools, which are cache-stable strings/objects, are
+        // recounted here. Behavior and every consumed number are unchanged.
         let systemAndToolsTokens =
           countTokensJson(system) + countTokensJson(toolsForTokenCount)
+        incrementalTokenCounter.setSystemAndToolsTokens(
+          systemAndToolsTokens,
+        )
 
         const estimateContextTokensLocally = () =>
-          countTokensJson(messagesWithStepPrompt) + systemAndToolsTokens
+          incrementalTokenCounter.messagesTokens(
+            messagesWithStepPrompt,
+          ) + systemAndToolsTokens
 
         currentAgentState.contextTokenCount = estimateContextTokensLocally()
         const contextTokensBeforeProgrammatic =
@@ -1983,47 +2115,188 @@ export async function loopAgentSteps(
         const semanticBudget = getSemanticCompactionBudget(
           currentAgentState.contextWindowTokens,
         )
+
+        // Continuous light consolidation, FIRST: deterministic, zero-cost
+        // eviction of stale tool-result bodies above the eviction floor. This
+        // frequently pulls context below the semantic trigger on its own, so
+        // the expensive LLM pruner pass below becomes a last resort rather
+        // than the first response to context pressure. Skipped when the model
+        // window is unknown (floor 0): eviction is only valuable while it is
+        // strictly cheaper than the alternatives.
+        const evictionFloorTokens = getSemanticEvictionFloorTokens(
+          currentAgentState.contextWindowTokens,
+        )
+        let evictedTokensThisIteration = 0
+        let evictedCountThisIteration = 0
+        if (
+          evictionFloorTokens > 0 &&
+          contextTokensBeforeProgrammatic > evictionFloorTokens
+        ) {
+          const evictionResult = evictStaleToolResults(
+            currentAgentState.messageHistory,
+            {
+              // Importance-aware protection: tool results whose content
+              // references a path recorded in task memory (evidence, inspected
+              // files, edits) stay full regardless of age, so the
+              // deterministic evictor cannot strip the context behind a pinned
+              // decision or an unverified edit anchor.
+              protectedPaths: deriveProtectedEvictionPaths(
+                currentAgentState.taskMemory,
+              ),
+            },
+          )
+          if (evictionResult.messages !== currentAgentState.messageHistory) {
+            // Eviction rewrites read-file bodies out of model-visible
+            // history, so it owes the same post-compaction
+            // read-authorization contract as the semantic and
+            // mechanical-trim branches: previously read paths require a
+            // fresh read before the next edit.
+            revokeImplicitReadAuthorizationsAfterCompaction(currentAgentState)
+            currentAgentState.messageHistory = evictionResult.messages
+            evictedTokensThisIteration = evictionResult.tokensSaved
+            evictedCountThisIteration = evictionResult.evictedCount
+            // Same rebuild the post-prune branch performs below: the request
+            // must reflect the evicted history, and the token estimate must be
+            // recomputed before the trigger decision reads it.
+            messagesWithStepPrompt = buildArray(
+              ...currentAgentState.messageHistory,
+              buildCompiledTaskMemoryMessage(currentAgentState),
+              buildCompiledMemoryV2Message(currentAgentState),
+              stepPrompt &&
+                userMessage({
+                  content: stepPrompt,
+                }),
+            )
+            currentAgentState.contextTokenCount = estimateContextTokensLocally()
+            logger.debug(
+              {
+                runId,
+                tokensSaved: evictionResult.tokensSaved,
+                evictedCount: evictionResult.evictedCount,
+              },
+              'Deterministic tool-result eviction reclaimed context without an LLM pass',
+            )
+          }
+        }
+
+        // Effective per-model limits for THIS iteration. Hoisted ABOVE the
+        // governor decision so the emergency override reads the effective
+        // provider-safe limit — `getEffectiveContextLimits` clamps an explicit
+        // `maxContextLength` override — instead of a value declared further
+        // down the same block scope (a use-before-declaration TDZ error).
+        // `contextWindowTokens` and `maxContextLength` only ever change
+        // BETWEEN iterations (the streaming callback runs inside the LLM step
+        // at the end of the loop body), so this single per-iteration value is
+        // the one authoritative limit shared by the governor's emergency
+        // check, the mechanical trim, and the status emission below.
+        const activeContextLimits = getEffectiveContextLimits(
+          currentAgentState.contextWindowTokens,
+          maxContextLength,
+        )
+        const activeMaxContextLength =
+          activeContextLimits.providerSafeMessageLimit
+        const activeContextWindowForStatus =
+          activeContextLimits.statusWindowTokens
+        const hasExplicitMaxContextLength = maxContextLength !== undefined
+
+        const contextTokensForTrigger = currentAgentState.contextTokenCount
         const exceededSemanticTrigger =
-          contextTokensBeforeProgrammatic + 1_000 >
+          contextTokensForTrigger + 1_000 >
           semanticBudget.triggerBudgetTokens
-        // Transient, loop-owned anti-thrash advisory. Read once per iteration so
-        // the announcement, the pass itself, and the unproductive-pass
-        // bookkeeping below can never disagree about whether this iteration is
-        // allowed to compact.
-        const semanticCompactionSuppressed =
-          currentAgentState.suppressSemanticCompaction === true
-        // Announced for BOTH pruner paths: an orchestrator's generator spawns
-        // the pruner itself, while a prompt-only template gets the
-        // runtime-driven pass below. A suppressed iteration runs no pass, so it
-        // must not announce one either.
+        // Governed trigger: the loop-local governor decides whether THIS
+        // iteration may announce (and pay for) a semantic pass, replacing the
+        // old announce-every-over-trigger-iteration behavior. The `+1_000`
+        // hysteresis is preserved from the previous design.
+        const governorDecision = shouldRunSemanticPass(compactionGovernor, {
+          contextTokens: contextTokensForTrigger,
+          triggerBudgetTokens: semanticBudget.triggerBudgetTokens,
+          rearmBudgetTokens: getSemanticRearmBudgetTokens(
+            currentAgentState.contextWindowTokens,
+          ),
+          emergencyLimitTokens:
+            activeMaxContextLength ?? DEFAULT_MAX_CONTEXT_TOKENS,
+        })
+        // The announcement gate is the semantic trigger plus the governor's
+        // per-iteration decision. The persisted `suppressSemanticCompaction`
+        // advisory keeps its documented streak-based contract (owned by the
+        // pass-outcome accounting above), and an OVER-TRIGGER iteration the
+        // governor denies is additionally mirrored into it: the generator-
+        // driven inline spawn path has no other pacing lever, so without the
+        // mirror a handleSteps template could keep spawning pruner children
+        // every iteration while only the announcement was paced.
+        //
+        // The mirror is deliberately NON-STICKY: it recomputes the field every
+        // iteration from the CURRENT governor decision plus the loop-local
+        // streak flag. A sticky version (OR-ing the previous field value)
+        // would let the cooldown denials right after an announced pass pin the
+        // advisory for the whole turn, making the documented clearing paths
+        // unreachable — a productive pass could never clear it, and the second
+        // pass the governor re-arms for (context below the rearm budget
+        // regrowing past the trigger) could never spawn. Below the trigger a
+        // quiet iteration clears the field unless the streak holds it. A
+        // denied iteration runs no pass and announces neither half of the
+        // status pair, exactly as before.
+        const governorWithheldOverTriggerPass =
+          exceededSemanticTrigger && !governorDecision.shouldRunSemanticPass
+        currentAgentState.suppressSemanticCompaction =
+          governorWithheldOverTriggerPass || streakSuppressionActive
+            ? true
+            : undefined
         const announceSemanticPass =
-          exceededSemanticTrigger && !semanticCompactionSuppressed
+          exceededSemanticTrigger && governorDecision.shouldRunSemanticPass
         if (announceSemanticPass) {
+          recordPassAnnounced(compactionGovernor)
+          if (governorDecision.emergencyOverride) {
+            logger.warn(
+              { runId, contextTokens: contextTokensForTrigger },
+              'Semantic compaction allowed by emergency override: context reached the provider-safe limit while the governor was disarmed',
+            )
+          }
           unsettledCompactionStart = true
           onResponseChunk({
             type: 'context_compaction_status',
             state: 'started',
             ...compactionCorrelation,
-            contextTokens: contextTokensBeforeProgrammatic,
+            contextTokens: contextTokensForTrigger,
             resolvedContextWindowTokens:
               semanticBudget.resolvedContextWindowTokens,
             triggerBudgetTokens: semanticBudget.triggerBudgetTokens,
             targetBudgetTokens: semanticBudget.targetBudgetTokens,
+            ...(evictedTokensThisIteration > 0 && {
+              evictedTokens: evictedTokensThisIteration,
+            }),
           })
           // First milestone of the announced pass, so the UI shows real movement
           // instead of an idle bar while the inline pruner starts up.
           emitCompactionProgress('analyzing', 20, {
-            contextTokens: contextTokensBeforeProgrammatic,
+            contextTokens: contextTokensForTrigger,
             targetBudgetTokens: semanticBudget.targetBudgetTokens,
           })
         }
+        // Advance the cooldown counter once per iteration, AFTER the decision
+        // consumed it and AFTER any announced pass reset it to 0.
+        advanceGovernorIteration(compactionGovernor)
 
         // 1. Run programmatic step first if it exists
         let n: number | undefined = undefined
         const historyBeforeProgrammatic = currentAgentState.messageHistory
-        const historyTokensBeforeProgrammatic = countTokensJson(
-          historyBeforeProgrammatic,
-        )
+        // Archive the pre-compaction transcript when this iteration will run
+        // a semantic pass: the pruner's rewrite below is the one history
+        // change with no deterministic recovery path, so the recall leg
+        // (`recall_context`) needs this snapshot. Identity-keyed inside
+        // archivePreCompaction, so an unchanged re-settle archives once.
+        if (announceSemanticPass) {
+          archivePreCompaction(
+            currentAgentState,
+            historyBeforeProgrammatic,
+            'semantic_compaction',
+            EVICTION_KEEP_RECENT_STEPS,
+          )
+        }
+        // M3-T2: incremental accounting — heap allocation for every message in
+        // the transcript was priced fully; only its delta differs now.
+        const historyTokensBeforeProgrammatic =
+          incrementalTokenCounter.messagesTokens(historyBeforeProgrammatic)
         const categoriesBeforeProgrammatic = getContextCategoryTelemetry(
           historyBeforeProgrammatic,
         )
@@ -2151,49 +2424,42 @@ export async function loopAgentSteps(
         // emitter makes it a no-op.
         emitCompactionProgress('applying', 90)
 
-        // Capture the request goal once per step for the root agent. The
-        // compaction branch below scrapes <knowledge_memory> only when a
-        // session actually compacts, so a session that never compacts used to
-        // persist a record with an empty goal. Derivation matches that branch's
-        // boundedGoal exactly so both paths record the same text.
+        // Background consolidation (PROTOTYPE, canary-gated OFF by default via
+        // `programmaticConfig.backgroundSnapshotConsolidation`): unconsolidated
+        // archive snapshots are summarized by a fire-and-forget prompt-only LLM
+        // child. Never awaited and never load-bearing — the call self-no-ops
+        // when the canary is off or every snapshot is already covered, so
+        // running it unconditionally per iteration is one cheap set lookup.
+        // Mechanical-trim snapshots archived later in this iteration consolidate
+        // on the next iteration's trigger (same turn, still background).
+        maybeRunBackgroundConsolidation({
+          ...params,
+
+          agentState: currentAgentState,
+          agentTemplate,
+          userInputId,
+        })
+
+        // Capture the current root request directly from loopAgentSteps' trusted
+        // prompt. Never infer it from messageHistory: that transcript also holds
+        // tool output, system wrappers, and compiled task-memory messages that
+        // must not become the active goal. A fresh substantive request replaces
+        // an unrelated hydrated goal once; repeat iterations return by identity.
         //
         // Deliberately after the programmatic step: a `set_messages`-yielding
         // generator (the context pruner) guards its transcript replacement with
         // `expectedTaskMemoryRevision`, and its view of the persisted revision
-        // is injected by template id. Creating a revision-0 record before that
-        // step makes the guard fail, so semantic compaction would be rejected
-        // and the run would fall back to the mechanical emergency brake. The
-        // compiled memory message is rebuilt below, so the goal still reaches
-        // this step's request.
+        // is injected by template id. Creating a revision before that step makes
+        // the guard fail, so semantic compaction would be rejected. The compiled
+        // memory message is rebuilt below, so the goal still reaches this step.
         if (!currentAgentState.parentId) {
           try {
-            let derivedGoal = ''
-            for (
-              let index = currentAgentState.messageHistory.length - 1;
-              index >= 0;
-              index--
-            ) {
-              const message = currentAgentState.messageHistory[index]
-              if (message.role !== 'user') continue
-              const plainText = message.content
-                .filter((part) => part.type === 'text')
-                .map((part) => part.text)
-                .join('\n')
-                .replace(/<[^>]+>/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim()
-              if (!plainText || /^(?:\/compact|compact)$/i.test(plainText)) {
-                continue
-              }
-              derivedGoal = plainText
-              break
-            }
             const nextTaskMemory = ensureTaskMemoryGoal({
               current: currentAgentState.taskMemory,
-              goal: derivedGoal,
+              goal: prompt ?? '',
               workspaceState: currentAgentState.workspaceState,
             })
-            // Identity result means the goal was already captured: assigning
+            // Identity result means this request was already captured: assigning
             // would be a no-op write, so only a genuinely new value is stored.
             if (
               nextTaskMemory &&
@@ -2214,6 +2480,7 @@ export async function loopAgentSteps(
         messagesWithStepPrompt = buildArray(
           ...currentAgentState.messageHistory,
           buildCompiledTaskMemoryMessage(currentAgentState),
+          buildCompiledMemoryV2Message(currentAgentState),
           stepPrompt &&
           userMessage({
             content: stepPrompt,
@@ -2221,9 +2488,13 @@ export async function loopAgentSteps(
         )
         currentAgentState.contextTokenCount = estimateContextTokensLocally()
 
-        const historyTokensAfterProgrammatic = countTokensJson(
-          currentAgentState.messageHistory,
-        )
+        // M3-T2: incremental accounting prices any NEW or rewritten
+        // (eviction) messages once and reuses memoized counts for the rest;
+        // semantic/lifecycle telemetry below still keys off the same number.
+        const historyTokensAfterProgrammatic =
+          incrementalTokenCounter.messagesTokens(
+            currentAgentState.messageHistory,
+          )
         let compactedThisIteration = false
         const retainedSemanticMemory = currentAgentState.messageHistory.some(
           (message) =>
@@ -2236,15 +2507,6 @@ export async function loopAgentSteps(
                 ),
             ),
         )
-        const activeContextLimits = getEffectiveContextLimits(
-          currentAgentState.contextWindowTokens,
-          maxContextLength,
-        )
-        const activeMaxContextLength =
-          activeContextLimits.providerSafeMessageLimit
-        const activeContextWindowForStatus =
-          activeContextLimits.statusWindowTokens
-        const hasExplicitMaxContextLength = maxContextLength !== undefined
         if (
           retainedSemanticMemory &&
           historyTokensAfterProgrammatic < historyTokensBeforeProgrammatic &&
@@ -2270,6 +2532,16 @@ export async function loopAgentSteps(
             preCompactionHistoryTokens: historyTokensBeforeProgrammatic,
             postCompactionHistoryTokens: historyTokensAfterProgrammatic,
           })
+          // Post-compaction extraction verification: derive the expected-fact
+          // set (paths read/written, commands run) from the PRE-compaction
+          // transcript and check each survived into the post-compaction
+          // history or task memory. Gaps surface in the recovery guidance
+          // below; the archive holds the verbatim source (recall_context).
+          const extractionVerification = verifyExtractionCoverage({
+            preMessages: historyBeforeProgrammatic,
+            postMessages: currentAgentState.messageHistory,
+            taskMemory: currentAgentState.taskMemory,
+          })
           const semanticReason = exceededSemanticTrigger
             ? 'Total context exceeded the model-aware semantic trigger budget.'
             : 'An explicit maxContextLength override allowed semantic compaction before the model-aware trigger budget.'
@@ -2281,6 +2553,10 @@ export async function loopAgentSteps(
               semanticBudget.resolvedContextWindowTokens,
             triggerBudgetTokens: semanticBudget.triggerBudgetTokens,
             targetBudgetTokens: semanticBudget.targetBudgetTokens,
+            ...(evictedTokensThisIteration > 0 && {
+              evictedTokens: evictedTokensThisIteration,
+              evictedCount: evictedCountThisIteration,
+            }),
             compactionCount: compactionTelemetry.compactionCount,
             consecutiveNoProgressCompactions:
               compactionTelemetry.consecutiveNoProgressCompactions,
@@ -2302,7 +2578,9 @@ export async function loopAgentSteps(
             removedCategories,
             retainedKnowledgeMemory: true,
             recovery:
-              'Resume from the retained <knowledge_memory> and verify exact live files before editing.',
+              extractionVerification.missing.length > 0
+                ? `Resume from the retained <knowledge_memory> and verify exact live files before editing. Pre-compaction detail was not retained (recover verbatim via recall_context): ${extractionVerification.missing.join(', ')}`
+                : 'Resume from the retained <knowledge_memory> and verify exact live files before editing.',
           })
           compactedThisIteration = true
         } else if (
@@ -2328,11 +2606,24 @@ export async function loopAgentSteps(
           logger,
         })
         if (pruningResult.pruned) {
+          // The mechanical trim drops whole messages with no recovery path,
+          // so the recall leg archives the pre-trim transcript first.
+          archivePreCompaction(
+            currentAgentState,
+            currentAgentState.messageHistory,
+            'mechanical_trim',
+            EVICTION_KEEP_RECENT_STEPS,
+          )
           revokeImplicitReadAuthorizationsAfterCompaction(currentAgentState)
           currentAgentState.messageHistory = pruningResult.messages
+          // History was rewritten by the mechanical trim: the full recount
+          // below starts from a fresh per-message memo (M3-T2 full-recall
+          // point).
+          invalidateHistoryAggregate()
           messagesWithStepPrompt = buildArray(
             ...pruningResult.messages,
             buildCompiledTaskMemoryMessage(currentAgentState),
+            buildCompiledMemoryV2Message(currentAgentState),
             stepPrompt &&
             userMessage({
               content: stepPrompt,
@@ -2420,6 +2711,9 @@ export async function loopAgentSteps(
           // so neither value is reconciled against the other before emission.
           compactionTriggerTokens: semanticBudget.triggerBudgetTokens,
           compactionTargetTokens: semanticBudget.targetBudgetTokens,
+          ...(evictedTokensThisIteration > 0 && {
+            evictedTokens: evictedTokensThisIteration,
+          }),
         })
 
         // Check if output is required but missing
@@ -2489,6 +2783,10 @@ export async function loopAgentSteps(
           ...params,
 
           agentState: currentAgentState,
+          memoryContextMessages: buildArray(
+            buildCompiledTaskMemoryMessage(currentAgentState),
+            buildCompiledMemoryV2Message(currentAgentState),
+          ),
           // Projected progressive surface so executeToolCall (which gates via
           // getEffectiveAgentToolNames without agentState) accepts unlocked
           // model tools and rejects still-locked ones for this step.
@@ -2533,6 +2831,39 @@ export async function loopAgentSteps(
         currentParams = undefined
       }
 
+      // Emit exactly one deterministic per-turn memory reuse receipt for the
+      // ROOT run only (subagents/inline agents have a parentId). Carried on the
+      // live turn stream, never persisted to the memory-v2 event store. Fires
+      // once here on the completed finish path after the loop exits. Mirrors
+      // the existing `context_window` chunk emission.
+      if (!currentAgentState.parentId && currentAgentState.memoryReuse) {
+        const receipt = currentAgentState.memoryReuse
+        // conceptExpanded producer (P8): count the advisory concept-expansion
+        // entries this turn's retrieval served, derived from the turn's
+        // validated retrieval context and freshness-guarded on userInputId so
+        // a stale context from a prior turn never leaks into this receipt.
+        // Best-effort: an absent/invalid context counts 0 (semantics off).
+        const parsedMemoryContext = MemoryTurnContextV2Schema.safeParse(
+          currentAgentState.memoryV2Context,
+        )
+        receipt.conceptExpanded =
+          parsedMemoryContext.success &&
+          parsedMemoryContext.data.userInputId === String(userInputId)
+            ? countConceptAdvisoryEntries(parsedMemoryContext.data)
+            : 0
+        receipt.turnId = String(userInputId).slice(0, 128)
+        if (receipt.byTool) {
+          receipt.byTool.sort((a, b) =>
+            a.tool < b.tool ? -1 : a.tool > b.tool ? 1 : 0,
+          )
+        }
+        onResponseChunk({ type: 'memory_reuse', receipt })
+        // Hand the stamped receipt to the SDK coordinator (finishTurn reads it
+        // for usage correlation) instead of dropping it.
+        currentAgentState.memoryUsageTurn = receipt
+        currentAgentState.memoryReuse = undefined
+      }
+
       if (clearUserPromptMessagesAfterResponse) {
         currentAgentState.messageHistory = expireMessages(
           currentAgentState.messageHistory,
@@ -2540,14 +2871,22 @@ export async function loopAgentSteps(
         )
       }
 
-      await finishAgentRun({
-        ...params,
-        runId,
-        status: 'completed',
-        totalSteps,
-        directCredits: currentAgentState.directCreditsUsed,
-        totalCredits: currentAgentState.creditsUsed,
-      })
+      try {
+        await finishAgentRun({
+          ...params,
+          runId,
+          status: 'completed',
+          totalSteps,
+          directCredits: currentAgentState.directCreditsUsed,
+          totalCredits: currentAgentState.creditsUsed,
+        })
+      } catch (finishError) {
+        // Finalization must not replace the successful run result.
+        logger.warn(
+          { error: finishError, runId },
+          'Failed to finalize agent run after completion (non-fatal)',
+        )
+      }
 
       return {
         agentState: currentAgentState,
@@ -2578,19 +2917,31 @@ export async function loopAgentSteps(
             agentId: currentAgentState.agentId,
             runId,
             totalSteps,
-            messageHistory: currentAgentState.messageHistory,
+            // M1-T5: redact secrets — the history can carry secret file reads
+            // and shell-config contents, same as the failure path below.
+            messageHistory:
+              currentAgentState.messageHistory.map(redactMessageForLog),
           },
           'Agent run cancelled by user (abort error)',
         )
 
-        await finishAgentRun({
-          ...params,
-          runId,
-          status: 'cancelled',
-          totalSteps,
-          directCredits: currentAgentState.directCreditsUsed,
-          totalCredits: currentAgentState.creditsUsed,
-        })
+        try {
+          await finishAgentRun({
+            ...params,
+            runId,
+            status: 'cancelled',
+            totalSteps,
+            directCredits: currentAgentState.directCreditsUsed,
+            totalCredits: currentAgentState.creditsUsed,
+          })
+        } catch (finishError) {
+          // Preserve the abort flow; a finalization failure at this point must
+          // not replace the original cancellation with a different error.
+          logger.warn(
+            { error: finishError, runId },
+            'Failed to finalize agent run after cancellation (non-fatal)',
+          )
+        }
 
         return {
           agentState: currentAgentState,
@@ -2610,8 +2961,11 @@ export async function loopAgentSteps(
           totalSteps,
           directCreditsUsed: currentAgentState.directCreditsUsed,
           creditsUsed: currentAgentState.creditsUsed,
-          messageHistory: currentAgentState.messageHistory,
-          systemPrompt: system,
+          // M1-T5: redact secrets from the failure-path log (the system prompt
+          // embeds shell config contents; history can carry secret file reads).
+          messageHistory:
+            currentAgentState.messageHistory.map(redactMessageForLog),
+          systemPrompt: redactSecretValues(system),
         },
         'Agent execution failed',
       )
@@ -2654,15 +3008,24 @@ export async function loopAgentSteps(
       )
 
       const status = signal.aborted ? 'cancelled' : 'failed'
-      await finishAgentRun({
-        ...params,
-        runId,
-        status,
-        totalSteps,
-        directCredits: currentAgentState.directCreditsUsed,
-        totalCredits: currentAgentState.creditsUsed,
-        errorMessage,
-      })
+      try {
+        await finishAgentRun({
+          ...params,
+          runId,
+          status,
+          totalSteps,
+          directCredits: currentAgentState.directCreditsUsed,
+          totalCredits: currentAgentState.creditsUsed,
+          errorMessage,
+        })
+      } catch (finishError) {
+        // Propagate the ORIGINAL error, not a finalization failure that would
+        // mask it.
+        logger.warn(
+          { error: finishError, runId, status },
+          'Failed to finalize agent run after error (non-fatal)',
+        )
+      }
 
       // Payment required errors (402) should propagate
       if (statusCode === 402) {

@@ -18,6 +18,23 @@ openbuff          # primary binary
 
 Openbuff is always local/BYOK — there is no cloud-mode toggle.
 
+## Quickstart
+
+1. Install and launch the CLI:
+
+   ```bash
+   npm install -g @openbuff/cli
+   cd your-project
+   openbuff
+   ```
+
+2. Configure a provider inside the TUI with `/setup <preset>` (e.g.
+   `/setup openai`), or `/provider add` for the interactive wizard.
+3. Verify with `/provider status` (loaded config, provider URLs, missing env
+   vars) and `/models`.
+
+See [Getting Started](./getting-started.md) for the full walkthrough.
+
 ## Configure providers
 
 Openbuff looks for provider config in this order (see
@@ -194,18 +211,36 @@ Provider `models` can be either a list:
       "baseURL": "https://opencode.ai/zen/go/v1",
       "apiKeyEnv": "OPENCODE_GO_API_KEY",
       "models": [
+        "glm-5.3-flash",
+        "glm-5.3",
+        "glm-5.2",
         "glm-5.1",
-        "glm-5",
+        "kimi-k3",
+        "kimi-k2.7-code",
         "kimi-k2.6",
-        "kimi-k2.5",
+        "longcat-2.0",
         "mimo-v2.5-pro",
         "mimo-v2.5",
-        "qwen3.6-plus",
-        "qwen3.5-plus",
+        "deepseek-v4.1-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "hy4-preview",
+        "hy3"
+      ]
+    },
+    "opencode-go-anthropic": {
+      "type": "anthropic-compatible",
+      "baseURL": "https://opencode.ai/zen/go/v1",
+      "apiKeyEnv": "OPENCODE_GO_API_KEY",
+      "models": [
+        "minimax-m3",
         "minimax-m2.7",
         "minimax-m2.5",
-        "deepseek-v4-pro",
-        "deepseek-v4-flash"
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus"
       ]
     }
   },

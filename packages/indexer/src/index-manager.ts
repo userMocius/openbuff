@@ -1,7 +1,6 @@
-import { createHash } from 'node:crypto'
-
 import { buildMetadataIndex, updateMetadataIndex } from './metadata-indexer'
 import {
+  computeIndexSnapshotId,
   isIndexReady,
   isIndexStale,
   getIndexDir,
@@ -13,11 +12,17 @@ import {
 import { queryIndex, type QueryOptions } from './query'
 import {
   buildFileVectors,
+  fileEmbeddingHash,
   getSemanticConfigFingerprint,
   semanticSearch,
   blendSemanticScores,
 } from './semantic'
-import type { EmbedFn, FileVector, SemanticHit } from './semantic'
+import type {
+  BuildFileVectorsDiagnostics,
+  EmbedFn,
+  FileVector,
+  SemanticHit,
+} from './semantic'
 import type {
   IndexingConfig,
   IndexBuildError,
@@ -29,6 +34,7 @@ import type {
   QueryIndexMode,
   QueryIndexResult,
 } from './types'
+import { compareRevisions } from './metadata-indexer'
 
 export class IndexManager {
   // Bounded LRU-ish (FIFO) cache of per-project-root singletons. Prevents
@@ -45,18 +51,32 @@ export class IndexManager {
   private staleRefreshPending = false
   private embed?: EmbedFn
   private fileVectors: FileVector[] = []
+  /** Files dropped from the vector set by the last successful semantic build. */
+  private semanticSkippedCount = 0
+  /** Set when the most recent waitUntilReady timed out before the build finished. */
+  private waitTimedOut = false
   private lastBuildError: IndexBuildError | undefined
   private pendingMutationDelta: IndexMutationDelta | undefined
   private mutationEpoch = 0
+  /**
+   * P8.1: bound on parserDegraded delta re-queueing — the currently pending
+   * mutation signal may be re-queued at most once; the guard resets only
+   * when a new signal arrives or a non-degraded refresh persists.
+   */
+  private degradedDeltaRequeued = false
   private snapshotCache:
     | { index: MetadataIndex; identity: IndexSnapshotIdentity }
     | undefined
   private readonly MIN_RETRY_INTERVAL_MS = 30_000
+  /** Registry key this instance was created under (see {@link getInstanceKey}). */
+  private readonly instanceKey: string
 
   private constructor(
     private readonly projectRoot: string,
     private readonly config: IndexingConfig,
-  ) {}
+  ) {
+    this.instanceKey = IndexManager.getInstanceKey(projectRoot, config)
+  }
 
   static getInstance(
     projectRoot: string,
@@ -88,6 +108,22 @@ export class IndexManager {
         instance.forceRefresh = true
         instance.ensureBuilt()
       }
+    } else if (
+      embed &&
+      instance.embed &&
+      embed.cacheKey !== instance.embed.cacheKey
+    ) {
+      // Rewire on a changed embedder identity (reliability finding
+      // second-embedder-silently-ignored): the persisted vector cache is
+      // fingerprinted by the embedder's cacheKey, so silently keeping the
+      // stale embedder would keep serving vectors from the old provider.
+      // Wipe the in-memory semantic tier (its vectors belong to the old
+      // fingerprint) and rebuild against the new one.
+      instance.embed = embed
+      instance.fileVectors = []
+      instance.semanticSkippedCount = 0
+      instance.forceRefresh = true
+      instance.ensureBuilt()
     }
     return instance
   }
@@ -115,6 +151,23 @@ export class IndexManager {
    * Returns immediately without blocking.
    */
   ensureBuilt(): void {
+    // Detached-instance gate (reliability finding
+    // detached-index-manager-still-runs-own-build-loop): a holder evicted
+    // from the registry must not run a second _build loop against the same
+    // cache directory — forward to the registered singleton instead.
+    const registered = IndexManager.instances.get(this.instanceKey)
+    if (registered && registered !== this) {
+      // Preserve this holder's accumulated state before delegating (a delta
+      // queued while the holder was detached must reach the singleton that
+      // answers queries, and a path-less stale signal must not be silently
+      // dropped) and mirror the singleton's post-forward epoch onto this
+      // holder so per-instance epochs stay equal (reliability findings
+      // detached-indexmanager-pending-delta-dropped-on-forward /
+      // ensurebuilt-forward-no-epoch-mirror).
+      this.forwardPendingMutationsTo(registered)
+      registered.ensureBuilt()
+      return
+    }
     if (this.config.enabled === false) return
     if (this.config.semantic?.enabled && !this.embed) {
       console.debug(
@@ -150,12 +203,85 @@ export class IndexManager {
   }
 
   /**
+   * Advance this holder's epoch after forwarding a mutation signal to the
+   * registered singleton (see {@link markStale}). The pre-forward epoch is
+   * read exactly once and the write is derived from that single captured
+   * value, so the read-modify-write on the shared field is one atomic step:
+   * two concurrent forwarded signals (or a forwarded signal racing a local
+   * mutation) can never both read the same pre-forward epoch and collapse
+   * two distinct mutation signals into a single advance of the documented
+   * strictly-monotonic per-instance epoch (reliability finding
+   * detached-epoch-forward-not-atomic).
+   */
+  private advanceEpochAfterForward(singletonEpoch: number): void {
+    const epochBeforeForward = this.mutationEpoch
+    this.mutationEpoch = Math.max(epochBeforeForward + 1, singletonEpoch)
+  }
+
+  /**
+   * Forward a detached holder's accumulated mutation state to the registered
+   * singleton and mirror its post-signal epoch. Shared by every detached
+   * forward path (ensureBuilt, waitUntilReady, query, queryBlended) so a
+   * delta queued while the holder was detached reaches the singleton even
+   * when callers only use the query/readiness paths — only ensureBuilt
+   * drained this state before, so a holder whose callers never call
+   * ensureBuilt left the singleton answering from a snapshot that never saw
+   * the queued delta (reliability finding
+   * detached-query-forward-skips-pending-drain). The forwarded signal
+   * advances the singleton's epoch, so the holder mirrors the singleton's
+   * post-forward epoch via {@link advanceEpochAfterForward} exactly like the
+   * markStale/markPathsChanged forward paths (reliability finding
+   * ensurebuilt-forward-no-epoch-mirror).
+   */
+  private forwardPendingMutationsTo(registered: IndexManager): void {
+    const pendingDelta = this.pendingMutationDelta
+    const holdersForceRefresh = this.forceRefresh
+    this.pendingMutationDelta = undefined
+    this.forceRefresh = false
+    if (pendingDelta) {
+      registered.markPathsChanged(pendingDelta)
+    } else if (holdersForceRefresh) {
+      registered.markStale()
+    } else {
+      // Nothing to forward: no signal advanced the singleton, so the epoch
+      // mirror must not pretend one did.
+      return
+    }
+    this.advanceEpochAfterForward(registered.indexMutationEpoch)
+  }
+
+  /**
    * Signal that on-disk files changed (e.g. the agent just edited code), so the
    * next {@link waitUntilReady}/{@link query} performs an incremental refresh
    * even if the index is not yet time-stale. Cheap and path-less: the
    * incremental update detects exactly which files changed by mtime/hash.
    */
   markStale(): void {
+    // Race fix: a detached instance (evicted from the registry but still held
+    // by a caller) must not run its own build loop against the same cache
+    // directory — two _build loops would race and the detached instance's
+    // freshness signals would never reach the instance answering queries.
+    // Forward the mutation signal to the registered singleton instead.
+    const registered = IndexManager.instances.get(this.instanceKey)
+    if (registered && registered !== this) {
+      // The epoch contract is per-instance: a caller holding a detached
+      // instance observes the mutation via the epoch on the instance it
+      // holds. Forward first, then MIRROR the singleton's post-signal epoch:
+      // a blind +1 on a counter that never agreed with the singleton's
+      // before the call diverges monotonically with every forwarded signal,
+      // so consumers comparing epochs across instances see a permanent,
+      // growing offset (reliability findings
+      // instance-registry-unbounded-detached-fanout /
+      // detached-instance-epoch-divergence).
+      registered.markStale()
+      // Adopt the singleton's post-signal epoch only when it is ahead of
+      // this holder's next epoch: a restarted singleton (fresh instance
+      // after registry eviction) starts at 0, and mirroring it verbatim
+      // would move this holder's monotonic epoch backwards on the first
+      // forward (reliability finding detached-epoch-mirror-can-regress).
+      this.advanceEpochAfterForward(registered.indexMutationEpoch)
+      return
+    }
     this.mutationEpoch += 1
     this.pendingMutationDelta = undefined
     this.forceRefresh = true
@@ -163,7 +289,30 @@ export class IndexManager {
 
   /** Queue a precise filesystem mutation delta for the next refresh. */
   markPathsChanged(delta: IndexMutationDelta): void {
+    // Forward from a detached instance to the registered singleton, mirroring
+    // markStale above.
+    const registered = IndexManager.instances.get(this.instanceKey)
+    if (registered && registered !== this) {
+      // Merge any delta accumulated on this holder before the forward so
+      // mutation signals queued while the holder was detached still reach
+      // the singleton that answers queries (reliability finding
+      // detached-indexmanager-pending-delta-dropped-on-forward). Mirror
+      // markStale above: forward first, then mirror the singleton's
+      // post-signal epoch so per-instance epochs stay equal instead of
+      // diverging monotonically (reliability finding
+      // detached-instance-epoch-divergence).
+      const forwarded = mergeMutationDeltas(this.pendingMutationDelta, delta)
+      this.pendingMutationDelta = undefined
+      registered.markPathsChanged(forwarded)
+      // Mirror markStale above, with the same no-regress guard: adopt the
+      // singleton's post-signal epoch only when it is ahead of this holder's
+      // next epoch (reliability finding detached-epoch-mirror-can-regress).
+      this.advanceEpochAfterForward(registered.indexMutationEpoch)
+      return
+    }
     this.mutationEpoch += 1
+    // A fresh mutation signal re-arms the P8.1 parserDegraded re-queue bound.
+    this.degradedDeltaRequeued = false
     this.pendingMutationDelta = mergeMutationDeltas(
       this.pendingMutationDelta,
       delta,
@@ -173,9 +322,23 @@ export class IndexManager {
 
   /**
    * Wait for the index to be ready (up to timeoutMs).
-   * Starts a build if needed.
+   * Starts a build if needed. Returns false when the wait timed out before
+   * the build finished (also surfaced via {@link getStatus}).
    */
-  async waitUntilReady(timeoutMs = 30_000): Promise<void> {
+  async waitUntilReady(timeoutMs = 30_000): Promise<boolean> {
+    // Detached-instance gate (reliability finding
+    // detached-index-manager-still-runs-own-build-loop): forward readiness to
+    // the registered singleton so the holder never builds (or serves) its own
+    // index.
+    const registered = IndexManager.instances.get(this.instanceKey)
+    if (registered && registered !== this) {
+      // Drain the holder's queued mutation state before delegating so a
+      // delta queued while the holder was detached reaches the singleton now
+      // instead of being deferred until something else calls ensureBuilt
+      // (reliability finding detached-query-forward-skips-pending-drain).
+      this.forwardPendingMutationsTo(registered)
+      return registered.waitUntilReady(timeoutMs)
+    }
     this.scheduleRefreshIfNeeded()
     if (
       isIndexReady(this.index) &&
@@ -183,14 +346,36 @@ export class IndexManager {
       !this.staleRefreshPending &&
       (!this.config.semantic?.enabled || !this.embed || this.isSemanticReady())
     ) {
-      return
+      this.waitTimedOut = false
+      return true
     }
     this.ensureBuilt()
-    if (!this.buildPromise) return
-    await Promise.race([
-      this.buildPromise,
-      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
-    ])
+    if (!this.buildPromise) {
+      this.waitTimedOut = false
+      return true
+    }
+    // Clear the losing timeout in a finally and surface the timeout through
+    // the return value and getStatus() so callers can distinguish a hung
+    // build from readiness (reliability finding
+    // waituntilready-silent-timeout-leaks-timer). The unref'd timer never
+    // pins the event loop past timeoutMs.
+    this.waitTimedOut = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        this.buildPromise,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            this.waitTimedOut = true
+            resolve()
+          }, timeoutMs)
+          timer.unref?.()
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+    }
+    return !this.waitTimedOut
   }
 
   /**
@@ -218,6 +403,17 @@ export class IndexManager {
     status: IndexStatus
     snapshot?: IndexSnapshotIdentity
   } {
+    // Detached-instance gate (reliability finding
+    // detached-index-manager-still-runs-own-build-loop): serve the registered
+    // singleton's index — the holder must never answer from its own stale
+    // snapshot.
+    const registered = IndexManager.instances.get(this.instanceKey)
+    if (registered && registered !== this) {
+      // Drain the holder's queued mutation state before delegating (reliability
+      // finding detached-query-forward-skips-pending-drain).
+      this.forwardPendingMutationsTo(registered)
+      return registered.query(query, options)
+    }
     if (this.config.enabled === false) {
       return {
         results: [],
@@ -290,6 +486,17 @@ export class IndexManager {
     status: IndexStatus
     snapshot?: IndexSnapshotIdentity
   }> {
+    // Detached-instance gate (reliability finding
+    // detached-index-manager-still-runs-own-build-loop): delegate the blended
+    // query to the registered singleton so lexical results and semantic
+    // vectors come from one index generation.
+    const registered = IndexManager.instances.get(this.instanceKey)
+    if (registered && registered !== this) {
+      // Drain the holder's queued mutation state before delegating (reliability
+      // finding detached-query-forward-skips-pending-drain).
+      this.forwardPendingMutationsTo(registered)
+      return registered.queryBlended(query, options)
+    }
     const lexical = this.query(query, options)
     if (!lexical.ready || !this.index || !this.isSemanticReady()) {
       return lexical
@@ -303,12 +510,28 @@ export class IndexManager {
       return lexical
     }
 
+    // Pin the snapshot for the whole blend: searchSemantic awaits the query
+    // embedding, and a concurrent refresh (_build) can replace this.index
+    // during that await. Working against the captured snapshot keeps file
+    // metadata for semantic-only hits and the returned totalIndexed/indexAge/
+    // snapshot identity consistent with the lexical results (reliability
+    // finding queryblended-mixed-snapshot-metadata).
+    const snapshot = this.index
+    // Pin the vector set together with the snapshot: _buildVectors
+    // repopulates this.fileVectors inside the same _build that swaps
+    // this.index, so the semantic search must run against the vectors that
+    // belong to THIS snapshot — a hit computed against newer vectors can
+    // reference a path the pinned snapshot never had (reliability finding
+    // queryblended-pins-index-not-vectors).
+    const pinnedVectors = this.fileVectors
+
     const limit = options.limit ?? 20
     const semantic = await this.searchSemantic(
       query,
       limit,
       options.fileTypes,
       options.pathPrefixes,
+      { snapshot, vectors: pinnedVectors },
     )
     if (semantic.length === 0) return lexical
 
@@ -322,8 +545,9 @@ export class IndexManager {
     const results: QueryIndexResult[] = blended.map(({ path, score }) => {
       const existing = lexByPath.get(path)
       if (existing) return { ...existing, score }
-      // Semantic-only hit: surface it with file metadata from the index.
-      const file = this.index!.files[path]
+      // Semantic-only hit: surface it with file metadata from the pinned
+      // snapshot — never from a concurrently refreshed index.
+      const file = snapshot.files[path]
       return {
         path,
         score,
@@ -357,7 +581,19 @@ export class IndexManager {
       } else {
         index = await buildMetadataIndex(this.projectRoot, this.config)
       }
-      if (mutationDelta?.revision !== undefined) {
+      // P8.1: a degraded refresh did not incorporate the delta, so its
+      // revision must not be stamped onto the preserved prior snapshot.
+      // Never regress either: updateMetadataIndex early-returns stale
+      // complete deltas without applying them (and otherwise preserves the
+      // already-incorporated revision), so only stamp the delta revision
+      // when it does not move the persisted workspaceRevision backwards.
+      if (
+        mutationDelta?.revision !== undefined &&
+        !index.parserDegraded &&
+        (index.workspaceRevision === undefined ||
+          compareRevisions(mutationDelta.revision, index.workspaceRevision) >=
+            0)
+      ) {
         index.workspaceRevision = mutationDelta.revision
       }
       stage = 'persist'
@@ -373,7 +609,60 @@ export class IndexManager {
           )
         }
       }
-      this.index = (await loadIndex(this.projectRoot, cacheDir)) ?? index
+      if (
+        index.parserDegraded &&
+        mutationDelta &&
+        !this.degradedDeltaRequeued
+      ) {
+        // P8.1: the tree-sitter parse degraded and the delta was dropped.
+        // Re-queue it once so the next refresh re-applies it; the raw flag
+        // bound prevents infinite retries when parsing stays degraded.
+        this.degradedDeltaRequeued = true
+        this.forceRefresh = true
+        this.pendingMutationDelta = mergeMutationDeltas(
+          this.pendingMutationDelta,
+          mutationDelta,
+        )
+        console.debug(
+          '[indexer] parser degraded; mutation delta re-queued for the next refresh.',
+        )
+      } else if (persisted && !index.parserDegraded) {
+        this.degradedDeltaRequeued = false
+      }
+      if (persisted) {
+        // Fail-closed verification: only trust disk when it still holds the
+        // snapshot we just built. Verified by comparing snapshot content
+        // directly rather than by re-deriving a content digest, so the check
+        // cannot be silently disabled if this module's identity hash and
+        // index-store's ever drift apart. A mismatch falls back to the
+        // in-memory index so a concurrent writer can't swap content under us.
+        let verified: MetadataIndex | null = null
+        try {
+          verified = await loadIndex(this.projectRoot, cacheDir)
+        } catch {
+          verified = null
+        }
+        if (verified && !isSameIndexSnapshot(verified, index)) {
+          verified = null
+        }
+        if (!verified) {
+          console.warn(
+            '[indexer] persisted index failed snapshot verification; serving the in-memory index.',
+          )
+        }
+        this.index = verified ?? index
+      } else {
+        // Our save lost the CAS race: preserve concurrent-newest-wins by
+        // serving the newest on-disk index (unverified). The read is guarded
+        // so a failed read can't discard the index we just built.
+        let onDisk: MetadataIndex | null = null
+        try {
+          onDisk = await loadIndex(this.projectRoot, cacheDir)
+        } catch {
+          onDisk = null
+        }
+        this.index = onDisk ?? index
+      }
       this.snapshotCache = undefined
       this.lastBuildError = undefined
       await this._buildVectors(this.index, cacheDir)
@@ -396,15 +685,14 @@ export class IndexManager {
 
   private getSnapshotIdentity(index: MetadataIndex): IndexSnapshotIdentity {
     if (this.snapshotCache?.index === index) return this.snapshotCache.identity
-    const hash = createHash('sha256').update(
-      `${index.version}\0${index.projectRoot}\0${index.builtAt}\0${index.workspaceRevision ?? 'unknown'}\0`,
-    )
-    for (const filePath of Object.keys(index.files).sort()) {
-      hash.update(filePath).update('\0').update(index.files[filePath]!.hash)
-    }
+    // Content-addressed: builtAt is metadata only (kept on the identity
+    // object) and excluded from the snapshotId hash input so identical
+    // content yields identical snapshotIds across rebuilds. Delegates to the
+    // single canonical implementation in index-store so the published
+    // identity can never drift from the verification digest.
     const identity: IndexSnapshotIdentity = {
       schemaVersion: 1,
-      snapshotId: hash.digest('hex'),
+      snapshotId: computeIndexSnapshotId(index),
       indexVersion: index.version,
       builtAt: index.builtAt,
       ...(index.workspaceRevision !== undefined
@@ -424,6 +712,10 @@ export class IndexManager {
     cacheDir: string,
   ): Promise<void> {
     if (!this.config.semantic?.enabled || !this.embed) return
+    const diagnostics: BuildFileVectorsDiagnostics = {
+      skippedPaths: [],
+      skippedCount: 0,
+    }
     try {
       const fingerprint = getSemanticConfigFingerprint(
         this.config.semantic,
@@ -439,7 +731,9 @@ export class IndexManager {
         this.embed,
         64,
         [...this.fileVectors, ...persisted],
+        diagnostics,
       )
+      this.semanticSkippedCount = diagnostics.skippedCount
       await saveSemanticVectors(
         this.projectRoot,
         fingerprint,
@@ -448,7 +742,34 @@ export class IndexManager {
       )
     } catch (err) {
       console.debug('[indexer] semantic vector build failed:', err)
-      this.fileVectors = []
+      // One transient embedder failure must not wipe the whole semantic tier
+      // (reliability finding semantic-tier-wiped-by-transient-embedder-failure):
+      // keep the vectors this instance already holds, or recover the persisted
+      // cache for the current fingerprint when we hold none. The tier is
+      // cleared only by the fingerprint-change rewire in getInstance.
+      if (this.fileVectors.length === 0) {
+        try {
+          const persisted = await loadSemanticVectors(
+            this.projectRoot,
+            getSemanticConfigFingerprint(this.config.semantic, this.embed),
+            cacheDir,
+          )
+          const vectorByHash = new Map(
+            persisted.map((entry) => [entry.embeddingHash, entry.vector]),
+          )
+          const recovered: FileVector[] = []
+          for (const file of Object.values(index.files)) {
+            const embeddingHash = fileEmbeddingHash(file)
+            const vector = vectorByHash.get(embeddingHash)
+            if (vector) {
+              recovered.push({ path: file.path, embeddingHash, vector })
+            }
+          }
+          if (recovered.length > 0) this.fileVectors = recovered
+        } catch {
+          // Persisted cache unavailable too: stay lexical-only this round.
+        }
+      }
       this.lastBuildError = createBuildError(
         'semantic',
         err,
@@ -510,6 +831,12 @@ export class IndexManager {
     const errorNotice = this.lastBuildError
       ? ` Last ${this.lastBuildError.stage} error: ${this.lastBuildError.message}`
       : ''
+    const semanticSkippedNotice = this.semanticSkippedCount
+      ? ` Semantic recall is partial: ${this.semanticSkippedCount} file(s) have no embedding vector.`
+      : ''
+    const waitTimeoutNotice = this.waitTimedOut
+      ? ' Timed out waiting for index build.'
+      : ''
     return {
       state,
       ready: Boolean(this.index),
@@ -521,7 +848,10 @@ export class IndexManager {
       diagnostics,
       coverage,
       lastBuildError: this.lastBuildError,
-      message: `${state === 'ready' ? 'Index ready.' : state === 'stale' ? 'Serving a stale snapshot while refreshing.' : state === 'degraded' ? 'Index ready with partial coverage or diagnostics.' : state === 'failed' ? 'Index build failed.' : state === 'building' ? 'Index is building.' : state === 'disabled' ? 'Indexing is disabled.' : 'Index is empty or unavailable.'}${coverageNotice}${errorNotice}`,
+      ...(this.semanticSkippedCount > 0
+        ? { semanticSkippedFiles: this.semanticSkippedCount }
+        : {}),
+      message: `${state === 'ready' ? 'Index ready.' : state === 'stale' ? 'Serving a stale snapshot while refreshing.' : state === 'degraded' ? 'Index ready with partial coverage or diagnostics.' : state === 'failed' ? 'Index build failed.' : state === 'building' ? 'Index is building.' : state === 'disabled' ? 'Indexing is disabled.' : 'Index is empty or unavailable.'}${coverageNotice}${errorNotice}${semanticSkippedNotice}${waitTimeoutNotice}`,
     }
   }
 
@@ -534,13 +864,21 @@ export class IndexManager {
     limit = 20,
     fileTypes?: string[],
     pathPrefixes?: string[],
+    pinned?: { snapshot: MetadataIndex; vectors: FileVector[] },
   ): Promise<SemanticHit[]> {
     if (!this.isSemanticReady() || !this.embed) return []
+    // A pinned {snapshot, vectors} pair captured together keeps the
+    // fileTypes filter and the vector set in the same index generation —
+    // filtering live this.index against live this.fileVectors lets a
+    // concurrent refresh mix generations (reliability finding
+    // query-vs-build-vectors-filetype-inconsistency).
+    const vectors = pinned ? pinned.vectors : this.fileVectors
+    const metadataIndex = pinned ? pinned.snapshot : this.index
     try {
-      const allowedVectors = this.fileVectors.filter((entry) => {
+      const allowedVectors = vectors.filter((entry) => {
         if (
           fileTypes?.length &&
-          !matchesFileTypes(this.index?.files[entry.path]?.ext, fileTypes)
+          !matchesFileTypes(metadataIndex?.files[entry.path]?.ext, fileTypes)
         ) {
           return false
         }
@@ -593,10 +931,40 @@ function withConfigLexicalWeights(
   return { ...options, lexicalWeights: configLexical }
 }
 
+/**
+ * Compares two index snapshots by the content that defines a snapshot: schema
+ * version, project root, workspace revision (matching the store's
+ * `undefined -> 'unknown'` normalization), and every file's content hash.
+ * Backs the fail-closed verification in `_build` without depending on two
+ * independently implemented content-addressed digests agreeing.
+ */
+function isSameIndexSnapshot(a: MetadataIndex, b: MetadataIndex): boolean {
+  if (
+    a.version !== b.version ||
+    a.projectRoot !== b.projectRoot ||
+    (a.workspaceRevision ?? 'unknown') !== (b.workspaceRevision ?? 'unknown')
+  ) {
+    return false
+  }
+  const aPaths = Object.keys(a.files)
+  if (aPaths.length !== Object.keys(b.files).length) return false
+  return aPaths.every(
+    (filePath) => a.files[filePath]?.hash === b.files[filePath]?.hash,
+  )
+}
+
 function mergeMutationDeltas(
   current: IndexMutationDelta | undefined,
   next: IndexMutationDelta,
 ): IndexMutationDelta {
+  // P8.3: select the max revision with numeric-aware comparison; plain string
+  // territory ("10" < "9") would let an older-dated delta win the merge.
+  const revision =
+    current?.revision !== undefined &&
+    next.revision !== undefined &&
+    compareRevisions(current.revision, next.revision) > 0
+      ? current.revision
+      : (next.revision ?? current?.revision)
   const changedPaths = new Set([
     ...(current?.changedPaths ?? []),
     ...(next.changedPaths ?? []),
@@ -612,7 +980,7 @@ function mergeMutationDeltas(
     complete: current
       ? current.complete === true && next.complete === true
       : next.complete,
-    revision: next.revision ?? current?.revision,
+    revision,
   }
 }
 

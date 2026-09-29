@@ -1,3 +1,14 @@
+export interface CodeChunkSummary {
+  chunkId: string
+  qualifiedName: string
+  kind: string
+  startLine: number
+  endLine: number
+  hash: string
+  stableChunkId?: string
+  signature?: string
+}
+
 export interface IndexedFile {
   path: string // relative to project root
   mtime: number // ms epoch, for cache invalidation
@@ -8,6 +19,7 @@ export interface IndexedFile {
   imports: string[] // import paths (regex extracted)
   headings: string[] // for .md/.mdx only
   concepts: string[] // normalized doc concepts/headings for graph search
+  chunks?: CodeChunkSummary[]
   /** Bounded implementation text used only when semantic indexing is enabled. */
   contentSample?: string
   /** Asset references extracted from game-engine text files (Unity .meta/.prefab/.unity, Godot .tscn/.tres, Unreal .uproject, Bevy). Undefined for files with no asset refs. */
@@ -82,6 +94,13 @@ export interface MetadataIndex {
   /** Durable per-file tree-sitter summaries used by incremental rebuilds. */
   parseData?: Record<string, import('@codebuff/code-map').ParsedFileTokens>
   parseDiagnostics?: ParseDiagnostic[]
+  /**
+   * P8.1: set by updateMetadataIndex when the tree-sitter parse degraded for
+   * this refresh. The returned snapshot is the prior one (builtAt and
+   * workspaceRevision untouched) and IndexManager re-queues the dropped
+   * mutation delta once so the next refresh reapplies it.
+   */
+  parserDegraded?: boolean
   coverage?: IndexCoverage
   /** Workspace journal revision incorporated by the latest precise refresh. */
   workspaceRevision?: string | number
@@ -132,6 +151,12 @@ export interface IndexStatus {
   diagnostics: ParseDiagnostic[]
   coverage?: IndexCoverage
   lastBuildError?: IndexBuildError
+  /**
+   * Files whose embedding came back empty/invalid in the last successful
+   * semantic build and were dropped from the vector set (0/absent = full
+   * semantic recall for the indexed set).
+   */
+  semanticSkippedFiles?: number
   message: string
 }
 
@@ -176,8 +201,9 @@ export interface LexicalWeights {
   concept?: number
   /** Match against import specifiers. Historical default: 1. */
   import?: number
+  /** Match against code chunk qualifiedName/kind. Default: 1 (tunable via openbuff.json; measured to hold corpus MRR >= 0.9). */
+  chunk?: number
 }
-
 /**
  * Graph edge weights applied when `buildGraph` materialises edges into the
  * index. Defaults match the historical hardcoded constants; customising lets a
@@ -227,6 +253,45 @@ export interface RelatedFile {
   via?: string
 }
 
+/** Stable chunk identity entry stored in the derived chunks.json sidecar. */
+export interface ChunkSidecarEntry {
+  file: string
+  startLine: number
+  endLine: number
+  qualifiedName: string
+  kind: string
+  contentHash: string
+}
+
+/**
+ * Derived, deterministic chunk sidecar persisted as chunks.json alongside
+ * metadata.json. Rebuildable from MetadataIndex.files; older caches may omit
+ * it and callers must fall back to chunkId/inline chunks. Header carries the
+ * canonical snapshotId plus revision so SNAPSHOT-OLD can be detected without
+ * parsing the full metadata.json.
+ */
+export interface ChunkSidecar {
+  version: 1
+  snapshotId: string
+  workspaceRevision?: string | number
+  builtAt: number
+  projectRoot: string
+  chunks: Record<string, ChunkSidecarEntry>
+}
+
+/** Per-file top chunk hits (capped 5/file in query.ts). No separate chunkHash map is exposed — file-level indexedHash stays the file hash; chunk hashes ride along on each hit. */
+export interface QueryChunkHit {
+  chunkId: string
+  /** Stable identity surviving re-chunks/reorders; optional so old caches without it still rank (fallback to chunkId). */
+  stableChunkId?: string
+  qualifiedName: string
+  kind: string
+  startLine: number
+  endLine: number
+  hash: string
+  score: number
+}
+
 export interface QueryIndexResult {
   path: string
   /** Content hash captured by this immutable index snapshot. */
@@ -241,10 +306,12 @@ export interface QueryIndexResult {
     | 'concept'
     | 'semantic'
     | 'command'
+    | 'chunk'
   >
   symbols?: string[]
   headings?: string[]
   matchedSnippets?: string[]
+  chunks?: QueryChunkHit[]
   relatedFiles?: RelatedFile[]
   explanation?: string
 }

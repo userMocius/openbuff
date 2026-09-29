@@ -47,6 +47,8 @@ import {
 import { WorkspaceJournalService } from './services/workspace-journal'
 import { WorkspaceMutationBroker } from './services/workspace-mutation-broker'
 import { LocalHarnessStore } from './services/local-harness-store'
+import { MemoryV2Coordinator } from './services/memory-v2/coordinator'
+import type { MemoryV2ClientConfig } from './services/memory-v2/types'
 import {
   HarnessApprovalService,
   evaluateHarnessActionPolicy,
@@ -132,6 +134,39 @@ import { listJobs } from './tools/list-jobs'
 import type { ListJobsViewRow } from '@codebuff/common/util/list-jobs-view'
 import { fingerprintListJobsRows } from '@codebuff/common/util/list-jobs-view'
 import { getSystemProcessEnv } from './env'
+import { spawn as nodeSpawn } from 'node:child_process'
+
+/**
+ * Stable trusted background-job ownership seed for THIS client session.
+ *
+ * The seed is created lazily ONCE per process (never per run), so consecutive
+ * `run()` calls from the same CLI session resolve the same
+ * `trustedJobOwner.clientSessionId`. That keeps a background process spawned in
+ * turn N owned (and manageable via check_job/kill_job/read_logs/list_jobs /
+ * end_turn) in turn N+1, instead of every new run stamping a fresh random id
+ * that makes all earlier jobs look 'foreign'.
+ *
+ * Trust invariants (unchanged):
+ * - The seed is runtime-owned process state; it is NEVER derived from model,
+ *   tool input, or anything the model can influence.
+ * - It is scoped to one client session/process, so separate sessions stay
+ *   distinct owners.
+ * - `sessionState` itself carries no stable session-level identifier today
+ *   (`AgentState` has only per-run `runId` / deprecated `agentId`, and turn
+ *   ids like `promptId` are per-run by design), which is exactly why a
+ *   process-owned seed is used. No per-run fallback is needed: every
+ *   background job this session spawns is stamped with this same seed.
+ */
+let trustedSessionClientId: string | undefined
+
+/**
+ * Exported for tests: the same accessor `runOnce` uses, so ownership tests
+ * can pin consecutive-run stability against the production symbol.
+ */
+export function getTrustedSessionClientId(): string {
+  trustedSessionClientId ??= crypto.randomUUID()
+  return trustedSessionClientId
+}
 
 /**
  * Wraps content for user messages, ensuring text is wrapped in <user_message> tags.
@@ -253,6 +288,9 @@ export type OpenbuffClientOptions = {
   fsSource?: Source<CodebuffFileSystem>
   spawnSource?: Source<CodebuffSpawn>
   logger?: Logger
+
+  /** Runtime-neutral Memory V2 configuration. Authority defaults from legacy mode (shadow when omitted). */
+  memoryV2?: MemoryV2ClientConfig
 
   /** Overall wall-clock timeout for a single run, in milliseconds. When set,
    *  the returned promise settles with an error RunState if the run has not
@@ -575,6 +613,7 @@ async function runOnce({
   fsSource,
   spawnSource,
   logger,
+  memoryV2,
 
   agent,
   prompt,
@@ -718,7 +757,7 @@ async function runOnce({
     const spawnSourceValue = await spawnSource
     spawn = spawnSourceValue as CodebuffSpawn
   } else {
-    spawn = require('child_process').spawn as CodebuffSpawn
+    spawn = nodeSpawn as CodebuffSpawn
   }
   const preparedContent = wrapContentForUserMessage(content)
 
@@ -779,12 +818,17 @@ async function runOnce({
   // final memory into it. The runtime replaces this property rather than
   // mutating it in place, so holding the reference is sufficient.
   const hydratedTaskMemory = sessionState.mainAgentState.taskMemory
+  const memoryV2Coordinator = memoryV2
+    ? new MemoryV2Coordinator(memoryV2, logger)
+    : undefined
   // Trusted ownership identity for every process-job operation. Derived
-  // ONLY from run/session state (the per-run promptId + the runtime's own
-  // run/agent ids) — NEVER from model or tool input — and injected into
-  // check_job/kill_job/read_logs/list_jobs/run_terminal_command below.
+  // ONLY from trusted runtime state — NEVER from model or tool input — and
+  // injected into check_job/kill_job/read_logs/list_jobs/run_terminal_command
+  // below. `clientSessionId` comes from the stable per-process session seed
+  // (see getTrustedSessionClientId), NOT from the per-turn promptId, so
+  // ownership survives across consecutive turns of the same client session.
   const trustedJobOwner: JobOwner = {
-    clientSessionId: promptId,
+    clientSessionId: getTrustedSessionClientId(),
     rootRunId:
       sessionState.mainAgentState.runId ?? sessionState.mainAgentState.agentId,
     parentRunId:
@@ -826,6 +870,10 @@ async function runOnce({
     }
   }
 
+  // The combined run signal and the run timeout arm HERE, before memory
+  // preparation, so a slow or hung Memory V2 repository is bounded by the run
+  // timeout instead of extending it
+  // (reliability:memory-preparation-is-outside-timeout).
   const timeoutAbortController = new AbortController()
   const timeoutEnabled = typeof runTimeoutMs === 'number' && runTimeoutMs > 0
   const runSignal = timeoutEnabled
@@ -912,6 +960,50 @@ async function runOnce({
     }
   }
 
+  if (timeoutEnabled) {
+    timeoutHandle = setTimeout(() => {
+      const message = `Run timed out after ${runTimeoutMs}ms`
+      abortRun(new Error(message))
+      resolveTerminal(getCancelledRunState(message))
+    }, runTimeoutMs)
+    timeoutHandle.unref?.()
+  }
+
+  // Race memory preparation against the run signal: an abort (user cancel or
+  // run timeout) rejects here and the run proceeds through its normal
+  // degraded/cancelled paths instead of hanging or crashing. prepareTurn
+  // itself never rejects — its own failures degrade the turn internally — so
+  // the caught rejection below can only come from the abort race.
+  if (memoryV2Coordinator) {
+    try {
+      await raceAgainstAbort(
+        memoryV2Coordinator.prepareTurn({
+          agentState: sessionState.mainAgentState,
+          trustedUserInputId: promptId,
+          query: prompt,
+          workspaceState: sessionState.mainAgentState.workspaceState,
+          resumeInterruptedTurn,
+          signal: runSignal,
+        }),
+        runSignal,
+      )
+    } catch (error) {
+      logger?.warn(
+        { error },
+        'Memory V2 turn preparation was aborted or failed; continuing without injected memory',
+      )
+    }
+  }
+
+  if (runSignal.aborted) {
+    resolveTerminal(getCancelledRunState(createAbortError(runSignal).message))
+    const terminalState = await terminalPromise
+    callbacksEnabled = false
+    unsubscribeJobEvents()
+    if (timeoutHandle) clearTimeout(timeoutHandle)
+    return terminalState
+  }
+
   const onResponseChunk = async (
     action: ServerAction<'response-chunk'>,
   ): Promise<void> => {
@@ -995,10 +1087,11 @@ async function runOnce({
           if (cloneMatch?.[1]) ownedLibrarianCloneDirs.add(cloneMatch[1])
         }
       }
+      const trustedCallId = callId ?? crypto.randomUUID()
       const handled = await handleToolCall({
         action: {
           type: 'tool-call-request',
-          requestId: callId ?? crypto.randomUUID(),
+          requestId: trustedCallId,
           userInputId,
           toolName,
           input,
@@ -1073,6 +1166,27 @@ async function runOnce({
               })()
           : undefined,
         signal: toolSignal ?? runSignal,
+      })
+      const directOverride =
+        toolName === 'read_files'
+          ? overrideTools?.read_files
+          : overrideTools?.[toolName as Exclude<PublishedToolName, 'read_files'>]
+      const fallbackWriteOverride =
+        (toolName === 'str_replace' || toolName === 'create_plan') &&
+        overrideTools?.write_file
+      await memoryV2Coordinator?.recordToolObservation({
+        toolName,
+        callId: trustedCallId,
+        userInputId,
+        input,
+        output: handled.output,
+        workspaceState: sessionState.mainAgentState.workspaceState,
+        native:
+          toolNames.includes(toolName as ToolName) &&
+          !customToolDefinitions?.some((definition) => definition.toolName === toolName) &&
+          !directOverride &&
+          !fallbackWriteOverride,
+        mcp: Boolean(mcpConfig),
       })
       // Intercept the single dispatch path (model- and agent-initiated calls
       // alike) so an unchanged list_jobs digest doesn't re-inject the full
@@ -1237,15 +1351,6 @@ async function runOnce({
     },
   })
 
-  if (timeoutEnabled) {
-    timeoutHandle = setTimeout(() => {
-      const message = `Run timed out after ${runTimeoutMs}ms`
-      abortRun(new Error(message))
-      resolveTerminal(getCancelledRunState(message))
-    }, runTimeoutMs)
-    timeoutHandle.unref?.()
-  }
-
   // Send input
   const userInfo = await agentRuntimeImpl.getUserInfoFromApiKey({
     ...agentRuntimeImpl,
@@ -1254,7 +1359,18 @@ async function runOnce({
   })
   if (!userInfo) {
     if (timeoutHandle) clearTimeout(timeoutHandle)
-    return getCancelledRunState('Invalid API key or user not found')
+    const terminalState = getCancelledRunState('Invalid API key or user not found')
+    if (memoryV2Coordinator) {
+      await raceAgainstAbort(
+        memoryV2Coordinator.finishTurn({
+          agentState: terminalState.sessionState!.mainAgentState,
+          output: terminalState.output,
+          signal: runSignal,
+        }),
+        runSignal,
+      ).catch(() => {})
+    }
+    return terminalState
   }
 
   const userId = userInfo.id
@@ -1266,6 +1382,16 @@ async function runOnce({
     callbacksEnabled = false
     unsubscribeJobEvents()
     if (timeoutHandle) clearTimeout(timeoutHandle)
+    if (terminalState.sessionState && memoryV2Coordinator) {
+      await raceAgainstAbort(
+        memoryV2Coordinator.finishTurn({
+          agentState: terminalState.sessionState.mainAgentState,
+          output: terminalState.output,
+          signal: runSignal,
+        }),
+        runSignal,
+      ).catch(() => {})
+    }
     return terminalState
   }
 
@@ -1336,7 +1462,12 @@ async function runOnce({
   callbacksEnabled = false
   unsubscribeJobEvents()
   if (timeoutHandle) clearTimeout(timeoutHandle)
-  await stopBrowserSessionsByOwner({ clientSessionId: promptId })
+  await stopBrowserSessionsByOwner({
+    // Same resolved owner identity the job tools scope by: browser sessions
+    // follow the stable session seed (not the per-turn promptId), so
+    // browses opened this run are still owned next turn until stopped here.
+    clientSessionId: trustedJobOwner.clientSessionId,
+  })
   const cleanupLibrarianClone = (cloneDir: string) => {
     try {
       rmSync(cloneDir, { recursive: true, force: true })
@@ -1362,6 +1493,16 @@ async function runOnce({
       { error: callbackFailure },
       'Run completed after one or more client callbacks failed',
     )
+  }
+  if (terminalState.sessionState && memoryV2Coordinator) {
+    await raceAgainstAbort(
+      memoryV2Coordinator.finishTurn({
+        agentState: terminalState.sessionState.mainAgentState,
+        output: terminalState.output,
+        signal: runSignal,
+      }),
+      runSignal,
+    ).catch(() => {})
   }
   // Persist task memory whenever a cwd is set. The gate lives in
   // persistRunTaskMemory and deliberately ignores output.type, so cancelled,
@@ -1751,9 +1892,9 @@ export async function handleToolCall({
         `Tool not implemented in SDK. Please provide an override or modify your agent to not use this tool: ${toolName}`,
       )
     }
-    if (isClientTool) {
-      clientToolCallSchema.parse(normalizedAction)
-    }
+    const parsed = isClientTool
+      ? clientToolCallSchema.parse(normalizedAction)
+      : undefined
 
     if (override) {
       const overrideSignal = signal ?? new AbortController().signal
@@ -1824,8 +1965,15 @@ export async function handleToolCall({
         )
       }
     } else if (toolName === 'end_turn') {
+      // Mirror the runtime end_turn handler's fail-closed scoping: list ONLY
+      // jobs owned by THIS run's trusted owner (the registry pairs owner
+      // equality on clientSessionId + rootRunId). An unscoped
+      // `listRunning()` here would surface other client sessions' jobs.
       const runningJobs = jobRegistry
-        .listRunning()
+        .listRunning({
+          clientSessionId: trustedJobOwner.clientSessionId,
+          rootRunId: trustedJobOwner.rootRunId,
+        })
         .filter((job) => job.kind === 'process')
       result = [
         {
@@ -1904,13 +2052,24 @@ export async function handleToolCall({
       })
     } else if (toolName === 'run_terminal_command') {
       const projectRoot = requireCwd(cwd, 'run_terminal_command')
-      const terminalInput = input as Parameters<
-        typeof runTerminalCommand
-      >[0] & {
-        approval_receipt_id?: string
+      if (parsed?.toolName !== 'run_terminal_command') {
+        throw new Error(
+          'Expected a parsed run_terminal_command client tool call',
+        )
       }
+      const terminalInput = parsed.input
+      // `permission_profile` passes through verbatim from the client tool call
+      // input, but that input is constructed by the agent runtime handler
+      // (handleRunTerminalCommand), which always sets it from the agent
+      // template's declared `terminalPermissionProfile` (defaulting to
+      // 'full-access') and never from model/tool input — see the parity test
+      // in packages/agent-runtime/src/tools/handlers/tool/__tests__/
+      // run-terminal-command.test.ts. The per-profile policy engine is
+      // therefore clamped to the template declaration, never widened by the
+      // model. The schema on the SDK side still validates the value.
       result = await runTerminalCommand({
         ...terminalInput,
+        timeout_seconds: terminalInput.timeout_seconds ?? -1,
         // Ownership identity is runtime-injected from trusted run state; any
         // model-supplied `owner` in terminalInput is overridden here.
         owner: trustedJobOwner,
@@ -2108,18 +2267,19 @@ export async function handleToolCall({
         fileFilter,
       })
     } else if (toolName === 'browser_logs') {
+      // M1-T7: any model-supplied `_browserOwner` in the tool input is
+      // IGNORED — owner identity is stamped from trusted runtime state
+      // (trustedJobOwner) exactly like the check_job/kill_job/read_logs
+      // branches, so a prompt-injected tool call can never claim another
+      // session's browser sessions.
       const browserInput = input as Parameters<typeof browserLogs>[0] & {
         _browserOwner?: BrowserSessionOwner
       }
       const { _browserOwner, ...browserAction } = browserInput
-      if (!_browserOwner) {
-        throw new Error(
-          'browser_logs requires runtime-owned client/run/agent session identity.',
-        )
-      }
+      void _browserOwner
       result = await browserLogs(
         browserAction as Parameters<typeof browserLogs>[0],
-        { ..._browserOwner, projectRoot: cwd },
+        { ...trustedJobOwner, projectRoot: cwd },
       )
     } else if (toolName === 'code_search') {
       if (fs.hostProcessView === false) {
@@ -2183,8 +2343,12 @@ export async function handleToolCall({
       })
     } else if (toolName === 'check_job') {
       // The trusted owner overrides any model-supplied owner in the input.
+      // M2-T4 (Fix 4): the runtime abort signal is likewise pinned OVER any
+      // model-supplied input value, so a spoofed `signal` in tool input cannot
+      // substitute its own for cancellation.
       result = await checkJob({
         ...(input as Omit<Parameters<typeof checkJob>[0], 'owner'>),
+        signal,
         owner: trustedJobOwner,
       })
     } else if (toolName === 'kill_job') {

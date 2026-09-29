@@ -17,13 +17,42 @@ initializeThemeStore()
  */
 const renderTest = process.env.NODE_ENV === 'production' ? test.skip : test
 
+/**
+ * Dev/prod act mismatch: `bun test` resolves the dev React build (which warns
+ * on any update "not wrapped in act(...)") while `@opentui/react/test-utils`
+ * resolves production React, whose `act` is a throwing stub — so testRender's
+ * internal act-wrapping silently no-ops and reconciler updates escape capture
+ * under load. Only an explicit outer act can be trusted; this shim is safe
+ * under both builds, using React's real act when available (dev) and a
+ * microtask-flushing passthrough otherwise (production or a missing export).
+ */
+const actPassthrough = async (callback: () => Promise<void>): Promise<void> => {
+  await callback()
+  await Promise.resolve()
+}
+
+const act: (callback: () => Promise<void>) => Promise<void> =
+  process.env.NODE_ENV === 'production'
+    ? actPassthrough
+    : ((React as any).act ?? actPassthrough)
+
+// React's dev build only honors act() when this flag is set before the first
+// render, so set it once at module scope.
+;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
+
 const renderFrame = async (node: React.ReactNode): Promise<string> => {
   const { testRender } = await import('@opentui/react/test-utils')
-  const setup = await testRender(
-    <box style={{ flexDirection: 'column', width: 100 }}>{node}</box>,
-    { width: 100, height: 40 },
-  )
-  await setup.renderOnce()
+  let setup!: Awaited<ReturnType<typeof testRender>>
+  await act(async () => {
+    setup = await testRender(
+      <box style={{ flexDirection: 'column', width: 152 }}>{node}</box>,
+      { width: 152, height: 40 },
+    )
+  })
+  await act(async () => {
+    await setup.renderOnce()
+    await Promise.resolve()
+  })
   const frame: string = setup.captureCharFrame()
   setup.renderer.destroy()
   return frame
@@ -69,9 +98,17 @@ const baseProps = {
   scrollToLatest: () => {},
   statusIndicatorState: STREAMING,
   contextWindowUsage: { used: 48_000, max: 100_000 },
+  sessionCostCents: 25,
   modelName: 'anthropic/claude-sonnet',
   diffStats: { modified: 2, added: 1, deleted: 0 },
 }
+
+/**
+ * sessionCostCents large enough that formatCostLabel renders '$0.25' (not
+ * '<$0.0001'), pinning the low-priority cost chip the selector now renders
+ * beside the context chip in this scenario.
+ */
+const COST_LABEL = '$0.25'
 
 describe('StatusBar through the real OpenTUI reconciler', () => {
   renderTest(
@@ -81,7 +118,12 @@ describe('StatusBar through the real OpenTUI reconciler', () => {
         <StatusBar {...baseProps} isAtBottom={false} />,
       )
 
-      expectRendered(frame, ['working...', CONTEXT_PERCENT, SCROLL_GLYPH])
+      expectRendered(frame, [
+        'working...',
+        CONTEXT_PERCENT,
+        COST_LABEL,
+        SCROLL_GLYPH,
+      ])
     },
   )
 
@@ -109,7 +151,7 @@ describe('StatusBar through the real OpenTUI reconciler', () => {
     async () => {
       const frame = await renderFrame(<StatusBar {...baseProps} isAtBottom />)
 
-      expectRendered(frame, ['working...', CONTEXT_PERCENT])
+      expectRendered(frame, ['working...', CONTEXT_PERCENT, COST_LABEL])
       expect(frame).not.toContain(SCROLL_GLYPH)
     },
   )

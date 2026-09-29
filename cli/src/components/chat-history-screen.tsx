@@ -14,6 +14,7 @@ import {
 } from '../utils/chat-history'
 import { createTextPasteHandler } from '../utils/strings'
 import { isPlainEnterKey } from '../utils/terminal-enter-detection'
+import { BORDER_CHARS } from '../utils/ui-constants'
 
 import type { SelectableListItem } from './selectable-list'
 
@@ -280,6 +281,14 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
           </box>
         )}
 
+        {/* P6.3: make the render cap explicit instead of silently hiding
+            the rest of the list. */}
+        {!isCompactMode && filteredItems.length > LAYOUT.MAX_RENDERED_CHATS && (
+          <text style={{ fg: theme.muted, flexShrink: 0 }}>
+            {`Showing the ${LAYOUT.MAX_RENDERED_CHATS} most recent of ${filteredItems.length} chats — refine your search to see more`}
+          </text>
+        )}
+
         {/* Search input */}
         <box
           style={{
@@ -319,6 +328,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
             width: contentWidth,
             borderStyle: 'single',
             borderColor: theme.muted,
+            customBorderChars: BORDER_CHARS,
             flexGrow: 1,
             flexShrink: 1,
             overflow: 'hidden',
@@ -392,6 +402,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
                   paddingBottom: 0,
                   borderStyle: 'single',
                   borderColor: theme.primary,
+                  customBorderChars: BORDER_CHARS,
                 }}
                 border={['top', 'bottom', 'left', 'right']}
               >
@@ -406,6 +417,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = ({
                   paddingBottom: 0,
                   borderStyle: 'single',
                   borderColor: theme.muted,
+                  customBorderChars: BORDER_CHARS,
                 }}
                 border={['top', 'bottom', 'left', 'right']}
               >

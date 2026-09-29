@@ -96,17 +96,47 @@ export const checkBackgroundAgentParams = {
               sequence: z.number().int().positive(),
               jobId: z.string(),
               timestamp: z.number(),
-              payload: z.object({
-                type: z.literal('agent_chunk'),
-                chunkType: z.string(),
-                // Opaque structured chunk payload
-                // (text/tool_call/tool_result/subagent_*); any JSON shape.
-                data: z.any(),
-              }),
+              // Full registry JobEventPayload union: the buffered event stream
+              // includes agent_chunk, shell output, lifecycle transitions, and
+              // status events (M1-T7 — the agent_chunk-only narrowing rejected
+              // real events and made schema-faithful consumers drop them).
+              payload: z.union([
+                z.object({
+                  type: z.literal('agent_chunk'),
+                  chunkType: z.string(),
+                  // Opaque structured chunk payload
+                  // (text/tool_call/tool_result/subagent_*); any JSON shape.
+                  data: z.any(),
+                }),
+                z.object({
+                  type: z.literal('output'),
+                  data: z.string(),
+                }),
+                z.object({
+                  type: z.literal('lifecycle'),
+                  state: z.enum([
+                    'queued',
+                    'running',
+                    'stopping',
+                    'completed',
+                    'error',
+                    'stopped',
+                    'lost',
+                    'cancelled',
+                  ]),
+                  exitCode: z.number().nullable().optional(),
+                  error: z.string().optional(),
+                  result: z.any().optional(),
+                }),
+                z.object({
+                  type: z.literal('status'),
+                  message: z.string().optional(),
+                }),
+              ]),
             }),
           )
           .describe(
-            "Sequenced agent_chunk events since the consumer's cursor. Each payload is {type:'agent_chunk',chunkType,data}.",
+            "Sequenced job events since the consumer's cursor: {type:'agent_chunk',chunkType,data} for agent turns plus output/lifecycle/status events.",
           ),
         nextCursor: z.number().int().nonnegative(),
         truncated: z.boolean(),
@@ -120,6 +150,22 @@ export const checkBackgroundAgentParams = {
         matched: z.boolean().optional(),
         timedOut: z.boolean().optional(),
         cancelled: z.boolean().optional(),
+        hint: z
+          .string()
+          .optional()
+          .describe(
+            'Server-side loop-breaker hint (e.g. idle running with no new events).',
+          ),
+        stop_polling: z
+          .boolean()
+          .optional()
+          .describe(
+            'When true, do other work instead of re-polling immediately.',
+          ),
+        do_not_repoll: z
+          .boolean()
+          .optional()
+          .describe('When true, the job is terminal: do not poll again.'),
       }),
       z.object({
         jobId: z.string(),

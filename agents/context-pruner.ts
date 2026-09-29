@@ -144,8 +144,8 @@ const definition: AgentDefinition = {
     // canonical module, so these literals are generated, not hand-copied.
     const DEFAULT_MAX_CONTEXT_LENGTH = 140_000 // DEFAULT_SEMANTIC_COMPACTION_TRIGGER_TOKENS
     const DEFAULT_TARGET_CONTEXT_LENGTH = 100_000 // DEFAULT_SEMANTIC_COMPACTION_TARGET_TOKENS
-    const SEMANTIC_TRIGGER_FRACTION = 0.7 // SEMANTIC_COMPACTION_TRIGGER_FRACTION
-    const SEMANTIC_TARGET_FRACTION = 0.35 // SEMANTIC_COMPACTION_TARGET_FRACTION
+    const SEMANTIC_TRIGGER_FRACTION = 0.78 // SEMANTIC_COMPACTION_TRIGGER_FRACTION
+    const SEMANTIC_TARGET_FRACTION = 0.4 // SEMANTIC_COMPACTION_TARGET_FRACTION
     const SEMANTIC_HEADROOM_FRACTION = 0.15 // SEMANTIC_COMPACTION_HEADROOM_FRACTION
     const SEMANTIC_MIN_HEADROOM_TOKENS = 32_000 // SEMANTIC_COMPACTION_MIN_HEADROOM_TOKENS
     const SEMANTIC_MAX_HEADROOM_TOKENS = 160_000 // SEMANTIC_COMPACTION_MAX_HEADROOM_TOKENS
@@ -1954,9 +1954,16 @@ const definition: AgentDefinition = {
       const verdict = isStaleSnapshotReviewerOutput(value)
         ? 'STALE_SNAPSHOT'
         : String(record.verdict).trim().toUpperCase()
+      const rawFingerprint = record.snapshotFingerprint
       const fingerprint =
-        typeof record.snapshotFingerprint === 'string'
-          ? record.snapshotFingerprint
+        typeof rawFingerprint === 'string'
+          ? rawFingerprint.trim().length === 0
+            ? // Manual spawns echo the documented omit-for-manual contract as an
+              // empty string; that echo carries no attestation, so label it
+              // instead of rendering a bare `snapshot=` a reader could mistake
+              // for a gate-attested fingerprint.
+              '(manual/unattested)'
+            : rawFingerprint
           : '(legacy/unattested)'
       const coverage =
         typeof record.coverage === 'string' ? record.coverage : 'n/a'

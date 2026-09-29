@@ -27,6 +27,7 @@ import { createOpenAI } from '@ai-sdk/openai'
 import { getValidChatGptOAuthCredentials } from '../credentials'
 import {
   DEFAULT_PROVIDER_COMPATIBILITY,
+  OPENCODE_GO_RESPONSES_MODELS,
   loadProviderConfigSync,
   resolveConfiguredAgentModelConfig,
   resolveConfiguredProviderModel,
@@ -37,6 +38,8 @@ import {
   createChatGptBackendFetch,
   extractChatGptAccountId,
 } from './chatgpt-backend-fetch'
+import { createOpenCodeGoResponsesFetch } from './opencode-go-responses-fetch'
+import { getSystemProcessEnv } from '../env'
 import { resolveModelsToTry } from './failover'
 
 import type {
@@ -113,6 +116,24 @@ export function resetChatGptOAuthRateLimit(): void {
   chatGptOAuthRateLimit.reset()
 }
 
+export const OPENCODE_GO_SESSION_HEADER = 'x-opencode-session'
+export const OPENBUFF_USER_AGENT = 'openbuff'
+
+export function isOpenCodeGoProvider(params: {
+  providerId: string
+  baseURL?: string
+}): boolean {
+  if (params.providerId === 'opencode-go') return true
+  if (params.providerId.startsWith('opencode-go-')) return true
+  return (params.baseURL ?? '').includes('opencode.ai/zen/go')
+}
+
+export function isOpenCodeGoResponsesModel(providerModel: string): boolean {
+  return (OPENCODE_GO_RESPONSES_MODELS as readonly string[]).includes(
+    providerModel,
+  )
+}
+
 /**
  * Parameters for requesting a model.
  */
@@ -130,6 +151,10 @@ export interface ModelRequestParams {
   costMode?: string
   /** True when the prompt/message history contains image input parts. */
   requiresVision?: boolean
+  /** Stable per-conversation session id forwarded as x-opencode-session to
+   * OpenCode Go for routing and prompt caching. Callers pass fingerprintId
+   * (stable per client) falling back to clientSessionId. */
+  sessionId?: string
   /** When true, an explicit `model` wins over mode/agent/defaultModel routing
    *  in openbuff.json. Used by the provider-failover loop so each configured
    *  failover model is actually attempted instead of being re-resolved to the
@@ -157,6 +182,11 @@ export interface ModelResult {
    *  openbuff.json `modelCapabilities.pricing`. Used by the cost-accounting
    *  fallback when the provider does not return OpenRouter-style cost metadata. */
   pricing?: ModelPricing
+  /** Configured per-response output token ceiling for the resolved model, from
+   *  provider config `defaultCapabilities`/`modelCapabilities`
+   *  `context.outputTokens`. Forwarded to the provider as `maxOutputTokens`
+   *  when the agent template does not declare its own. */
+  maxOutputTokens?: number
 }
 
 export function selectAdaptiveReasoningEffort(params: {
@@ -203,6 +233,7 @@ export async function getModelForRequest(
   params: ModelRequestParams,
 ): Promise<ModelResult> {
   const { model, agentId, skipChatGptOAuth, preferModelParam } = params
+  const sessionId = params.sessionId
   const loadedProviderConfig = loadProviderConfigSync()
   const effectiveAgentModelConfig = resolveConfiguredAgentModelConfig({
     agentId,
@@ -247,8 +278,28 @@ export async function getModelForRequest(
   }
   const contextWindowTokens = resolvedCapabilities?.context?.windowTokens
   const pricing = resolvedCapabilities?.pricing
+  const maxOutputTokens = resolvedCapabilities?.context?.outputTokens
 
   if (configuredProviderModel) {
+    if (
+      isOpenCodeGoResponsesModel(configuredProviderModel.providerModel) ||
+      isOpenCodeGoResponsesModel(effectiveModel) ||
+      isOpenCodeGoResponsesModel(configuredProviderModel.requestedModel)
+    ) {
+      return {
+        model: createConfiguredOpenCodeGoResponsesModel(
+          configuredProviderModel,
+          sessionId,
+        ),
+        isChatGptOAuth: false,
+        compatibility: configuredProviderModel.compatibility,
+        reasoningEffort,
+        effectiveModel,
+        contextWindowTokens,
+        pricing,
+        maxOutputTokens,
+      }
+    }
     if (configuredProviderModel.provider.type === 'chatgpt-oauth') {
       const chatGptOAuthCredentials = await getValidChatGptOAuthCredentials()
       if (!chatGptOAuthCredentials) {
@@ -268,18 +319,23 @@ export async function getModelForRequest(
         effectiveModel,
         contextWindowTokens,
         pricing,
+        maxOutputTokens,
       }
     }
 
     if (configuredProviderModel.provider.type === 'anthropic-compatible') {
       return {
-        model: createConfiguredAnthropicModel(configuredProviderModel),
+        model: createConfiguredAnthropicModel(
+          configuredProviderModel,
+          sessionId,
+        ),
         isChatGptOAuth: false,
         compatibility: configuredProviderModel.compatibility,
         reasoningEffort,
         effectiveModel,
         contextWindowTokens,
         pricing,
+        maxOutputTokens,
       }
     }
 
@@ -288,13 +344,44 @@ export async function getModelForRequest(
         configuredProviderModel.provider.type === 'openai-compatible' &&
           configuredProviderModel.provider.api === 'responses'
           ? createConfiguredOpenAIResponsesModel(configuredProviderModel)
-          : createConfiguredOpenAICompatibleModel(configuredProviderModel),
+          : isOpenCodeGoResponsesModel(configuredProviderModel.providerModel) ||
+              isOpenCodeGoResponsesModel(effectiveModel) ||
+              isOpenCodeGoResponsesModel(configuredProviderModel.requestedModel)
+            ? createConfiguredOpenCodeGoResponsesModel(
+                configuredProviderModel,
+                sessionId,
+              )
+            : createConfiguredOpenAICompatibleModel(
+                configuredProviderModel,
+                sessionId,
+              ),
       isChatGptOAuth: false,
       compatibility: configuredProviderModel.compatibility,
       reasoningEffort,
       effectiveModel,
       contextWindowTokens,
       pricing,
+      maxOutputTokens,
+    }
+  }
+
+  const responsesFallback = resolveOpenCodeGoResponsesFallback({
+    effectiveModel,
+    loadedConfig: loadedProviderConfig,
+  })
+  if (responsesFallback) {
+    return {
+      model: createConfiguredOpenCodeGoResponsesModel(
+        responsesFallback,
+        sessionId,
+      ),
+      isChatGptOAuth: false,
+      compatibility: responsesFallback.compatibility,
+      reasoningEffort,
+      effectiveModel,
+      contextWindowTokens,
+      pricing,
+      maxOutputTokens,
     }
   }
 
@@ -328,6 +415,7 @@ export async function getModelForRequest(
           reasoningEffort,
           effectiveModel,
           contextWindowTokens,
+          maxOutputTokens,
         }
       }
 
@@ -595,6 +683,7 @@ function resolveVisionModelIfNeeded(params: {
 
 function createConfiguredOpenAICompatibleModel(
   resolvedModel: ResolvedProviderModel,
+  sessionId?: string,
 ): LanguageModel {
   const { providerId, provider, providerModel, apiKey } = resolvedModel
   if (provider.type !== 'openai-compatible') {
@@ -607,12 +696,88 @@ function createConfiguredOpenAICompatibleModel(
   return new OpenAICompatibleChatLanguageModel(providerModel, {
     provider: providerId,
     url: ({ path: endpoint }: { path: string }) => `${baseURL}${endpoint}`,
-    headers: () => createOpenAICompatibleHeaders(apiKey),
+    headers: () =>
+      createOpenAICompatibleHeaders(apiKey, {
+        providerId,
+        baseURL: provider.baseURL,
+        sessionId,
+      }),
     fetch: createConfiguredProviderFetch(resolvedModel),
     includeUsage: undefined,
     supportsStructuredOutputs: provider.supportsStructuredOutputs,
     stringifyTextContent: resolvedModel.compatibility.stringifyTextContent,
   })
+}
+
+function createConfiguredOpenCodeGoResponsesModel(
+  resolvedModel: ResolvedProviderModel,
+  sessionId?: string,
+): LanguageModel {
+  const { providerId, provider, providerModel, apiKey } = resolvedModel
+  if (provider.type !== 'openai-compatible') {
+    throw new Error(
+      `Provider '${providerId}' is not an OpenAI-compatible provider.`,
+    )
+  }
+  const baseURL = provider.baseURL.replace(/\/$/, '')
+
+  return new OpenAICompatibleChatLanguageModel(providerModel, {
+    provider: providerId,
+    url: () => `${baseURL}/responses`,
+    headers: () =>
+      createOpenAICompatibleHeaders(apiKey, {
+        providerId,
+        baseURL: provider.baseURL,
+        sessionId,
+      }),
+    fetch: createOpenCodeGoResponsesFetch(),
+    includeUsage: undefined,
+    supportsStructuredOutputs: provider.supportsStructuredOutputs,
+    stringifyTextContent: resolvedModel.compatibility.stringifyTextContent,
+  })
+}
+
+function resolveOpenCodeGoResponsesFallback(params: {
+  effectiveModel: string
+  loadedConfig: LoadedProviderConfig
+}): ResolvedProviderModel | undefined {
+  const { effectiveModel, loadedConfig } = params
+  const providerModel = effectiveModel.includes('/')
+    ? effectiveModel.slice(effectiveModel.indexOf('/') + 1)
+    : effectiveModel
+  if (!isOpenCodeGoResponsesModel(providerModel)) {
+    return undefined
+  }
+  const entries = Object.entries(loadedConfig.config.providers)
+  const match =
+    entries.find(
+      ([providerId, provider]) =>
+        providerId === 'opencode-go' && provider.type === 'openai-compatible',
+    ) ??
+    entries.find(
+      ([, provider]) =>
+        provider.type === 'openai-compatible' &&
+        provider.baseURL.includes('opencode.ai/zen/go'),
+    )
+  if (!match) {
+    return undefined
+  }
+  const [providerId, provider] = match
+  if (provider.type !== 'openai-compatible') {
+    return undefined
+  }
+  const env = getSystemProcessEnv()
+  return {
+    providerId,
+    provider,
+    requestedModel: effectiveModel,
+    providerModel,
+    apiKey: provider.apiKeyEnv ? env[provider.apiKeyEnv] : undefined,
+    compatibility: {
+      ...DEFAULT_PROVIDER_COMPATIBILITY,
+      ...(provider.compatibility ?? {}),
+    },
+  }
 }
 
 function createConfiguredOpenAIResponsesModel(
@@ -645,10 +810,22 @@ function createConfiguredOpenAIResponsesModel(
  */
 export function createOpenAICompatibleHeaders(
   apiKey?: string,
+  opts?: { providerId?: string; baseURL?: string; sessionId?: string },
 ): Record<string, string> {
+  const isGo = opts?.providerId
+    ? isOpenCodeGoProvider({
+        providerId: opts.providerId,
+        baseURL: opts.baseURL,
+      })
+    : false
   return {
     ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-    'user-agent': `ai-sdk/openai-compatible/${VERSION}/openbuff-custom-provider`,
+    'user-agent': isGo
+      ? OPENBUFF_USER_AGENT
+      : `ai-sdk/openai-compatible/${VERSION}/openbuff-custom-provider`,
+    ...(isGo && opts?.sessionId
+      ? { [OPENCODE_GO_SESSION_HEADER]: opts.sessionId }
+      : {}),
   }
 }
 
@@ -670,6 +847,7 @@ export function normalizeAnthropicBaseURL(baseURL: string): string {
 
 function createConfiguredAnthropicModel(
   resolvedModel: ResolvedProviderModel,
+  sessionId?: string,
 ): LanguageModel {
   const { providerId, provider, providerModel, apiKey } = resolvedModel
   if (provider.type !== 'anthropic-compatible') {
@@ -678,6 +856,10 @@ function createConfiguredAnthropicModel(
     )
   }
 
+  const isGo = isOpenCodeGoProvider({
+    providerId,
+    baseURL: provider.baseURL,
+  })
   const anthropic = createAnthropic({
     baseURL: normalizeAnthropicBaseURL(provider.baseURL),
     // Sent as the `x-api-key` header. Pass an empty string rather than letting
@@ -685,7 +867,10 @@ function createConfiguredAnthropicModel(
     // local gateway.
     apiKey: apiKey ?? '',
     headers: {
-      'user-agent': `ai-sdk/anthropic/${VERSION}/openbuff-custom-provider`,
+      'user-agent': isGo
+        ? OPENBUFF_USER_AGENT
+        : `ai-sdk/anthropic/${VERSION}/openbuff-custom-provider`,
+      ...(isGo && sessionId ? { [OPENCODE_GO_SESSION_HEADER]: sessionId } : {}),
     },
     name: providerId,
   })

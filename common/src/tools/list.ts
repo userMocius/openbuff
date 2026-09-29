@@ -22,6 +22,8 @@ import { globParams } from './params/tool/glob'
 import { listDirectoryParams } from './params/tool/list-directory'
 import { lookupAgentInfoParams } from './params/tool/lookup-agent-info'
 import { queryIndexParams } from './params/tool/query-index'
+import { recallContextParams } from './params/tool/recall-context'
+import { recordDecisionParams } from './params/tool/record-decision'
 import { readDocsParams } from './params/tool/read-docs'
 import { readFilesParams } from './params/tool/read-files'
 import { readImageParams } from './params/tool/read-image'
@@ -103,6 +105,8 @@ const canonicalToolParams = {
   list_directory: listDirectoryParams,
   lookup_agent_info: lookupAgentInfoParams,
   query_index: queryIndexParams,
+  recall_context: recallContextParams,
+  record_decision: recordDecisionParams,
   read_docs: readDocsParams,
   read_files: readFilesParams,
   read_image: readImageParams,
@@ -289,6 +293,7 @@ export const clientToolCallSchema = z.discriminatedUnion('toolName', [
           'full-access',
         ]),
         allowed_paths: z.array(z.string()).optional(),
+        approval_receipt_id: z.string().optional(),
       }),
     ),
   }),

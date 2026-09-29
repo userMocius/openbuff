@@ -217,23 +217,32 @@ export async function statProjectFiles(
       isMandatorySensitiveReadPath(relativePath) ||
       isGeneratedOperationalArtifact(relativePath) ||
       isExtraExcludedPath(relativePath, extraExcludeSet) ||
-      isIgnoredLikeWalk(
+      (await isIgnoredLikeWalk(
         projectRoot,
         relativePath,
         normalizedExtraExclude,
         extraExcludeSet,
         directoryMatcherCache,
-      )
+      ))
     ) {
       continue
     }
     const absolutePath = path.join(projectRoot, relativePath)
+    // P8.6: lstat (not stat) so symlink entries are skipped instead of
+    // followed, matching the recursive walk's no-follow semantics — an
+    // out-of-project symlink must not be stat'd/hashed as an in-project file.
     let stat: fs.Stats
     try {
-      stat = await fs.promises.stat(absolutePath)
+      stat = await fs.promises.lstat(absolutePath)
     } catch {
       continue
     }
+    // stat-only checks like isFile() are skipped for symlinks entirely: a
+    // symlink to a regular file inside the project would still be indexed
+    // through its target's content, which the walk's readdir no-follow
+    // contract does not do (readdir classifies symlinks as neither
+    // isFile() nor isDirectory()).
+    if (stat.isSymbolicLink()) continue
     if (!stat.isFile()) continue
     const ext = path.extname(relativePath).toLowerCase()
     const is3dAsset = THREE_D_ASSET_EXTENSIONS.has(ext)
@@ -281,52 +290,52 @@ function isIgnoredLikeWalk(
   extraExclude: string[],
   extraExcludeSet: Set<string>,
   directoryMatcherCache: Map<string, ScopedMatcher>,
-): boolean {
-  const segments = relativePath.split('/').filter(Boolean)
-  if (segments.length === 0) return true
+): Promise<boolean> {
+  return (async () => {
+    const segments = relativePath.split('/').filter(Boolean)
+    if (segments.length === 0) return true
 
-  let currentAbs = projectRoot
-  const parents: ScopedMatcher[] = []
+    let currentAbs = projectRoot
+    const parents: ScopedMatcher[] = []
 
-  for (let i = 0; i < segments.length; i++) {
-    const name = segments[i]!
-    const isLast = i === segments.length - 1
+    for (let i = 0; i < segments.length; i++) {
+      const name = segments[i]!
+      const isLast = i === segments.length - 1
 
-    if (!isLast) {
-      if (DEFAULT_EXCLUDE_DIRS.has(name) || extraExcludeSet.has(name)) {
-        return true
+      if (!isLast) {
+        if (DEFAULT_EXCLUDE_DIRS.has(name) || extraExcludeSet.has(name)) {
+          return true
+        }
+      }
+
+      let directoryMatcher = directoryMatcherCache.get(currentAbs)
+      if (!directoryMatcher) {
+        directoryMatcher = {
+          base: currentAbs,
+          matcher: ignore().add([
+            ...(await loadDirectoryIgnorePatterns(currentAbs)),
+            ...(currentAbs === projectRoot ? extraExclude : []),
+          ]),
+        }
+        directoryMatcherCache.set(currentAbs, directoryMatcher)
+      }
+
+      const matchers = [...parents, directoryMatcher]
+      const abs = path.join(currentAbs, name)
+      const ignored = matchers.some(({ base, matcher }) => {
+        const scoped = normalizeRelativePath(path.relative(base, abs))
+        return scoped && matcher.ignores(isLast ? scoped : `${scoped}/`)
+      })
+      if (ignored) return true
+
+      if (!isLast) {
+        parents.push(directoryMatcher)
+        currentAbs = abs
       }
     }
 
-    let directoryMatcher = directoryMatcherCache.get(currentAbs)
-    if (!directoryMatcher) {
-      directoryMatcher = {
-        base: currentAbs,
-        matcher: ignore().add([
-          ...loadIgnorePatterns(path.join(currentAbs, '.gitignore')),
-          ...loadIgnorePatterns(path.join(currentAbs, '.openbuffignore')),
-          ...loadIgnorePatterns(path.join(currentAbs, '.codebuffignore')),
-          ...(currentAbs === projectRoot ? extraExclude : []),
-        ]),
-      }
-      directoryMatcherCache.set(currentAbs, directoryMatcher)
-    }
-
-    const matchers = [...parents, directoryMatcher]
-    const abs = path.join(currentAbs, name)
-    const ignored = matchers.some(({ base, matcher }) => {
-      const scoped = normalizeRelativePath(path.relative(base, abs))
-      return scoped && matcher.ignores(isLast ? scoped : `${scoped}/`)
-    })
-    if (ignored) return true
-
-    if (!isLast) {
-      parents.push(directoryMatcher)
-      currentAbs = abs
-    }
-  }
-
-  return false
+    return false
+  })()
 }
 
 export async function walkProjectDetailed(
@@ -338,9 +347,39 @@ export async function walkProjectDetailed(
   const candidatesByPrefix = new Map<string, WalkedFile[]>()
   const eligibleCountsByPrefix = new Map<string, number>()
 
+  // Per-prefix candidate cap (reliability finding
+  // per-prefix-cap-equals-max-files): each top-level prefix bucket is capped
+  // at a fair share of maxFiles instead of maxFiles itself, so a wide
+  // monorepo cannot accumulate O(prefixes x maxFiles) candidate entries per
+  // refresh. Discovering a new prefix tightens the shared cap and trims
+  // existing buckets from the tail; bucket heads are always retained so the
+  // round-robin trim below keeps its truncation-fairness semantics.
+  const sharedPrefixCap = (): number =>
+    Math.max(1, Math.ceil(maxFiles / Math.max(1, candidatesByPrefix.size)))
+  const trimPrefixBuckets = (cap: number): void => {
+    for (const [prefix, bucket] of candidatesByPrefix) {
+      if (bucket.length > cap) {
+        candidatesByPrefix.set(prefix, bucket.slice(0, cap))
+      }
+    }
+  }
+
   type ScopedMatcher = { base: string; matcher: ReturnType<typeof ignore> }
 
   async function walk(dir: string, parents: ScopedMatcher[]): Promise<void> {
+    // No-follow guard at the recursion point (reliability finding
+    // walk-dir-swap-after-lstat-window): the caller's lstat re-verify and
+    // this readdir are separate path-based operations, so a directory
+    // swapped to an out-of-project symlink between them must be refused
+    // HERE — this is the last check before any traversal into its bytes.
+    // Cheap (one lstat per directory visited), ENOENT tolerated (vanished
+    // mid-walk is skipped like any other disappearance).
+    try {
+      const dirStat = await fs.promises.lstat(dir)
+      if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) return
+    } catch {
+      return
+    }
     let entries: fs.Dirent[]
     try {
       entries = await fs.promises.readdir(dir, { withFileTypes: true })
@@ -350,9 +389,7 @@ export async function walkProjectDetailed(
 
     entries.sort((a, b) => a.name.localeCompare(b.name))
     const directoryMatcher = ignore().add([
-      ...loadIgnorePatterns(path.join(dir, '.gitignore')),
-      ...loadIgnorePatterns(path.join(dir, '.openbuffignore')),
-      ...loadIgnorePatterns(path.join(dir, '.codebuffignore')),
+      ...(await loadDirectoryIgnorePatterns(dir)),
       ...(dir === projectRoot ? extraExclude : []),
     ])
     const matchers = [...parents, { base: dir, matcher: directoryMatcher }]
@@ -375,6 +412,18 @@ export async function walkProjectDetailed(
           continue
         }
         if (ignored) continue
+        // P8.6 follow-up (reliability finding walk-dir-symlink-toctou):
+        // re-verify the directory entry with lstat before recursing — a path
+        // swapped from directory to out-of-project symlink between readdir
+        // and the recursive readdir must not be followed (the walk's
+        // documented no-follow contract). A vanished entry is skipped like
+        // any other mid-walk disappearance.
+        try {
+          const dirStat = await fs.promises.lstat(abs)
+          if (dirStat.isSymbolicLink() || !dirStat.isDirectory()) continue
+        } catch {
+          continue
+        }
         await walk(abs, matchers)
       } else if (entry.isFile()) {
         if (
@@ -385,10 +434,16 @@ export async function walkProjectDetailed(
           continue
         let stat: fs.Stats
         try {
-          stat = await fs.promises.stat(abs)
+          // P8.6: lstat (not stat) so a symlink swapped in between readdir
+          // and stat is skipped instead of followed, matching the
+          // statProjectFiles no-follow contract. An entry that vanished
+          // mid-walk lands in the catch below and is skipped.
+          stat = await fs.promises.lstat(abs)
         } catch {
           continue
         }
+        if (stat.isSymbolicLink()) continue
+        if (!stat.isFile()) continue
         const ext = path.extname(entry.name).toLowerCase()
         const is3dAsset = THREE_D_ASSET_EXTENSIONS.has(ext)
         if (stat.size > MAX_FILE_SIZE && !is3dAsset) continue
@@ -398,8 +453,15 @@ export async function walkProjectDetailed(
           prefix,
           (eligibleCountsByPrefix.get(prefix) ?? 0) + 1,
         )
-        const prefixCandidates = candidatesByPrefix.get(prefix) ?? []
-        if (prefixCandidates.length >= maxFiles) continue
+        let prefixCandidates = candidatesByPrefix.get(prefix)
+        if (!prefixCandidates) {
+          // A newly discovered prefix tightens everyone's fair share.
+          trimPrefixBuckets(
+            Math.max(1, Math.ceil(maxFiles / (candidatesByPrefix.size + 1))),
+          )
+          prefixCandidates = []
+        }
+        if (prefixCandidates.length >= sharedPrefixCap()) continue
         prefixCandidates.push({
           absolutePath: abs,
           relativePath: normalizeRelativePath(rel),
@@ -450,9 +512,9 @@ export async function walkProjectDetailed(
   }
 }
 
-function loadIgnorePatterns(filePath: string): string[] {
+async function loadIgnorePatterns(filePath: string): Promise<string[]> {
   try {
-    const content = fs.readFileSync(filePath, 'utf8')
+    const content = await fs.promises.readFile(filePath, 'utf8')
     return content
       .split('\n')
       .map((line) => line.trim())
@@ -460,6 +522,21 @@ function loadIgnorePatterns(filePath: string): string[] {
   } catch {
     return []
   }
+}
+
+/**
+ * Load all three per-directory ignore files concurrently (reliability finding
+ * synchronous-readfile-per-directory-in-async-walk): the async walk issues
+ * one awaited batch per directory instead of three blocking readFileSync
+ * syscalls that interleave with awaited stats.
+ */
+async function loadDirectoryIgnorePatterns(dir: string): Promise<string[]> {
+  const [gitignore, openbuffignore, codebuffignore] = await Promise.all([
+    loadIgnorePatterns(path.join(dir, '.gitignore')),
+    loadIgnorePatterns(path.join(dir, '.openbuffignore')),
+    loadIgnorePatterns(path.join(dir, '.codebuffignore')),
+  ])
+  return [...gitignore, ...openbuffignore, ...codebuffignore]
 }
 
 export function normalizeRelativePath(relativePath: string): string {

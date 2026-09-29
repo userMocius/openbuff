@@ -88,7 +88,7 @@ function convertUserContentParts(content: unknown): unknown {
   })
 }
 
-function convertMessages(messages: ChatCompletionsMessage[]): unknown[] {
+export function convertMessages(messages: ChatCompletionsMessage[]): unknown[] {
   const input: unknown[] = []
 
   for (const msg of messages) {
@@ -152,7 +152,7 @@ function convertMessages(messages: ChatCompletionsMessage[]): unknown[] {
   return input
 }
 
-function convertTools(tools: ChatCompletionsTool[]): unknown[] {
+export function convertTools(tools: ChatCompletionsTool[]): unknown[] {
   return tools.map((tool) => {
     if (tool.type === 'function' && tool.function) {
       return {
@@ -218,7 +218,10 @@ export function transformChatGptBackendRequestBody(
 // Response Transform: Responses API SSE → Chat Completions SSE
 // ============================================================================
 
-function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
+function createSseTransformStream(): {
+  transform: TransformStream<Uint8Array, Uint8Array>
+  error: (err: unknown) => void
+} {
   const encoder = new TextEncoder()
   const decoder = new TextDecoder()
 
@@ -235,6 +238,63 @@ function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
     chunk: Record<string, unknown>,
   ) {
     controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+  }
+
+  /**
+   * Emit the authoritative done-time arguments for a tool call. The
+   * chat-completions delta channel is append-only (the AI SDK's tool-call
+   * chunk accumulation appends `argumentsDelta`, so a returned delta can
+   * never REPLACE accumulated tool input). The only honest emissions are:
+   * - a repeated done event (identical args): emit nothing;
+   * - a pure extension (done args prefix-match the streamed accumulation):
+   *   emit only the not-yet-streamed tail;
+   * - divergence (the provider rewrote the arguments out from under the
+   *   already-streamed deltas): emit nothing and log a bounded
+   *   provider-protocol observation. Appending the full authoritative value
+   *   here used to reassemble `previousArguments + doneArguments` — malformed
+   *   tool input — so keeping the streamed accumulation (and per-tool
+   *   validation erroring downstream) is the safe behavior (M2-T5).
+   */
+  function emitDoneArgumentsCorrection(
+    controller: TransformStreamDefaultController<Uint8Array>,
+    outputIdx: number,
+    previousArguments: string,
+    doneArguments: string,
+  ): void {
+    if (!doneArguments || doneArguments === previousArguments) return
+
+    const tcIdx = outputIndexToToolIndex.get(outputIdx) ?? 0
+
+    if (!doneArguments.startsWith(previousArguments)) {
+      outputIndexToArguments.set(outputIdx, doneArguments)
+      console.debug(
+        `ChatGPT backend tool-call arguments diverged from the streamed deltas ` +
+          `(output index ${outputIdx}, tool call index ${tcIdx}); keeping the ` +
+          `already-streamed accumulation to avoid appending corrupted tool input`,
+      )
+      return
+    }
+
+    const tail = doneArguments.slice(previousArguments.length)
+    if (!tail) return
+    outputIndexToArguments.set(outputIdx, doneArguments)
+    emit(controller, {
+      id: responseId,
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: tcIdx,
+                function: { arguments: tail },
+              },
+            ],
+          },
+          finish_reason: null,
+        },
+      ],
+    })
   }
 
   function processEvent(
@@ -301,7 +361,9 @@ function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
                   tool_calls: [
                     {
                       index: tcIndex,
-                      id: (item.call_id as string) ?? (item.id as string),
+                      id:
+                        ((item.call_id ?? item.id) as string | undefined) ??
+                        `${responseId ?? 'resp'}-call-${outputIdx}`,
                       function: {
                         name: item.name as string,
                         arguments: '',
@@ -347,31 +409,15 @@ function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
         const outputIdx = (data.output_index as number) ?? 0
         const doneArguments = (data.arguments as string | undefined) ?? ''
         const previousArguments = outputIndexToArguments.get(outputIdx) ?? ''
-        const missingSuffix = doneArguments.startsWith(previousArguments)
-          ? doneArguments.slice(previousArguments.length)
-          : doneArguments
-
-        if (missingSuffix) {
-          outputIndexToArguments.set(outputIdx, doneArguments)
-          const tcIdx = outputIndexToToolIndex.get(outputIdx) ?? 0
-          emit(controller, {
-            id: responseId,
-            choices: [
-              {
-                index: 0,
-                delta: {
-                  tool_calls: [
-                    {
-                      index: tcIdx,
-                      function: { arguments: missingSuffix },
-                    },
-                  ],
-                },
-                finish_reason: null,
-              },
-            ],
-          })
-        }
+        // On prefix mismatch the authoritative value is kept in the map but
+        // nothing is emitted: emitting the old append-delta corrupted tool
+        // input (M2-T5).
+        emitDoneArgumentsCorrection(
+          controller,
+          outputIdx,
+          previousArguments,
+          doneArguments,
+        )
         break
       }
 
@@ -381,31 +427,13 @@ function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
           const outputIdx = (data.output_index as number) ?? 0
           const doneArguments = (item.arguments as string | undefined) ?? ''
           const previousArguments = outputIndexToArguments.get(outputIdx) ?? ''
-          const missingSuffix = doneArguments.startsWith(previousArguments)
-            ? doneArguments.slice(previousArguments.length)
-            : doneArguments
-
-          if (missingSuffix) {
-            outputIndexToArguments.set(outputIdx, doneArguments)
-            const tcIdx = outputIndexToToolIndex.get(outputIdx) ?? 0
-            emit(controller, {
-              id: responseId,
-              choices: [
-                {
-                  index: 0,
-                  delta: {
-                    tool_calls: [
-                      {
-                        index: tcIdx,
-                        function: { arguments: missingSuffix },
-                      },
-                    ],
-                  },
-                  finish_reason: null,
-                },
-              ],
-            })
-          }
+          // Same correction rules as response.function_call_arguments.done.
+          emitDoneArgumentsCorrection(
+            controller,
+            outputIdx,
+            previousArguments,
+            doneArguments,
+          )
         }
         break
       }
@@ -482,7 +510,11 @@ function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
     }
   }
 
-  return new TransformStream<Uint8Array, Uint8Array>({
+  let streamController: TransformStreamDefaultController<Uint8Array> | undefined
+  const stream: TransformStream<Uint8Array, Uint8Array> = new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      streamController = controller
+    },
     transform(chunk, controller) {
       buffer += decoder.decode(chunk, { stream: true })
 
@@ -520,13 +552,29 @@ function createSseTransformStream(): TransformStream<Uint8Array, Uint8Array> {
       }
     },
   })
+
+  return {
+    transform: stream,
+    error: (err: unknown) => {
+      try {
+        streamController?.error(err)
+      } catch {
+        // TransformStream already errored/closed; the readable still surfaces
+        // the original failure.
+      }
+    },
+  }
 }
 
-function transformResponseStream(
+export function transformResponseStream(
   inputStream: ReadableStream<Uint8Array>,
 ): ReadableStream<Uint8Array> {
-  const transform = createSseTransformStream()
-  inputStream.pipeTo(transform.writable).catch(() => {})
+  const { transform, error } = createSseTransformStream()
+  inputStream.pipeTo(transform.writable).catch((err) => {
+    // Surface the backend stream failure in the readable instead of silently
+    // truncating the response to a clean completion.
+    error(err)
+  })
   return transform.readable
 }
 

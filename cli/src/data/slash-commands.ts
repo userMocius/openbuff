@@ -59,7 +59,8 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
   {
     id: 'memory',
     label: 'memory',
-    description: 'Show or prune persisted cross-session task memory',
+    description:
+      'Inspect, query, audit migrations, export, or maintain project memory',
     aliases: ['mem'],
   },
   {
@@ -206,6 +207,11 @@ const ALL_SLASH_COMMANDS: SlashCommand[] = [
   //   label: 'publish',
   //   description: 'Publish agents to the agent store',
   // },
+  {
+    id: 'update',
+    label: 'update',
+    description: 'Check staged CLI update status (restart to apply)',
+  },
   {
     id: 'theme:toggle',
     label: 'theme:toggle',

@@ -8,6 +8,7 @@ import { createBase2 } from '../base2/base2'
 import { createCodeEditor } from '../editor/editor'
 import {
   buildBroadAuditSection,
+  decisionCapturePolicySection,
   gateAwarenessSection,
   gitDisciplineSection,
   preReviewSelfCheckSection,
@@ -224,15 +225,34 @@ describe('shared craftsmanship prompt sections', () => {
   })
 
   test('specialistRoutingSection names the exact snapshot param contract for reviewer-family specialists', () => {
-    // Reviewer-family specialists require params.snapshot_id as the gate-owned
-    // v3 token (not bare get_change_review_bundle.snapshotId), while
-    // security-reviewer requires changed_files + snapshot_fingerprint.
+    // Reviewer-family spawns treat params.snapshot_id as optional under the
+    // omit-for-manual contract: runtime-owned spawns pass the gate-owned v3
+    // token (never bare get_change_review_bundle.snapshotId) and manual spawns
+    // omit the key entirely, while security-reviewer requires changed_files +
+    // snapshot_fingerprint.
     expect(specialistRoutingSection).toContain('snapshot_id')
     expect(specialistRoutingSection).toContain('gate-assigned opaque')
     expect(specialistRoutingSection).toContain('v3:')
     expect(specialistRoutingSection).toContain('get_change_review_bundle')
     expect(specialistRoutingSection).toContain('changed_files')
     expect(specialistRoutingSection).toContain('snapshot_fingerprint')
+  })
+
+  test('decisionCapturePolicySection is interpolated into both orchestrators', () => {
+    // decisionCapturePolicySection is advisory guidance that may evolve; only
+    // assert topic coverage plus that both orchestrators wire it in. It is
+    // deliberately NOT asserted against the editor prompt: the editor's tool
+    // set does not include record_decision, so the clause would be inert there.
+    expect(decisionCapturePolicySection).toContain('# Decision Capture')
+    expect(decisionCapturePolicySection).toContain('record_decision')
+
+    const base2 = createBase2('default', {
+      progressivePromptDisclosure: false,
+    })
+    const baseDeep = createBaseDeep()
+
+    expect(base2.systemPrompt).toContain(decisionCapturePolicySection)
+    expect(baseDeep.systemPrompt).toContain(decisionCapturePolicySection)
   })
 
   test('all three consumers interpolate shared sections and leave conditional sections gated', () => {

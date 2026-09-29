@@ -59,6 +59,7 @@ import { trackEvent } from './utils/analytics'
 import { showClipboardMessage } from './utils/clipboard'
 import { readClipboardImage } from './utils/clipboard-image'
 import { getSystemMessage } from './utils/message-history'
+import { createErrorMessage } from './utils/send-message-helpers'
 import { getInputModeConfig } from './utils/input-modes'
 import {
   addCustomOpenbuffProvider,
@@ -105,6 +106,11 @@ import type {
   StatusBarContextUsage,
 } from './utils/sdk-event-handlers'
 import type { ScrollBoxRenderable } from '@opentui/core'
+import {
+  setExitStreamSignal,
+  setQueuedPromptDrain,
+} from './hooks/use-exit-handler'
+import { createQueuedPromptDrainer } from './hooks/helpers/exit-queue-drain'
 
 export const Chat = ({
   headerContent,
@@ -388,6 +394,28 @@ export const Chat = ({
     sendMessageRef,
   })
 
+  // Exit-path queue drain (reliability finding exit-handler-drops-queued-prompts):
+  // the Ctrl-C/SIGINT path exits through use-exit-handler, which has no
+  // access to the queue; register the same drain the /exit command runs so
+  // prompts queued during an active stream persist to session history
+  // instead of being dropped on that path too. The drain body lives in
+  // hooks/helpers/exit-queue-drain.ts so its partial-failure semantics stay
+  // unit-testable.
+  useEffect(() => {
+    setExitStreamSignal(() => abortControllerRef.current?.signal)
+    setQueuedPromptDrain(
+      createQueuedPromptDrainer({
+        pushMessageSnapshot: () => useChatStore.getState().pushMessageSnapshot(),
+        clearQueue,
+        saveToHistory,
+      }),
+    )
+    return () => {
+      setExitStreamSignal(undefined)
+      setQueuedPromptDrain(undefined)
+    }
+  }, [clearQueue, saveToHistory, addToQueue, abortControllerRef])
+
   // M4.3: Context-window usage for the status bar (updated via context_window
   // PrintModeEvent from the agent runtime).
   // Canonical shape (StatusBarContextUsage): its optional
@@ -552,6 +580,10 @@ export const Chat = ({
           })()
         : null
 
+      // P6.1: Guard the top-level submit path so an unexpected rejection is
+      // caught, logged, and surfaced as a visible inline error message instead
+      // of becoming an unhandled rejection that can crash the TUI. The final
+      // restore of input/attachments still runs in the finally block below.
       try {
         const result = await routeUserPrompt({
           abortControllerRef,
@@ -574,6 +606,22 @@ export const Chat = ({
         })
 
         return result
+      } catch (error) {
+        logger.error(
+          { error, contentLength: content.length, agentMode: mode },
+          '[submit] Prompt submission failed with an unexpected error',
+        )
+        setMessages((prev) => [
+          ...prev,
+          createErrorMessage(
+            '⚠️ Something went wrong while handling your message. Please try again.',
+          ),
+        ])
+        setTimeout(() => scrollToLatest(), 0)
+        // The caller receives undefined (no command result) and errors attached
+        // to this path are handled above rather than propagating as an
+        // unhandled rejection.
+        return undefined
       } finally {
         if (previousInputValue) {
           setInputValue({

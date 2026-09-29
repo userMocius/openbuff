@@ -8,6 +8,8 @@
  * pure-helper precedent).
  */
 
+import { NoOutputGeneratedError } from 'ai'
+
 import {
   getErrorStatusCode,
   isProviderContentPolicyError,
@@ -69,13 +71,30 @@ export function resolveModelsToTry(
  * Classify whether an error is eligible to trigger failover to the next
  * configured backup provider.
  *
- * Returns true for explicitly classified provider content-policy errors or
- * errors carrying a failover-eligible HTTP status code
- * (401/403/500/502/503/504). Other non-HTTP errors (network blips, aborts,
- * etc.) are handled by the inner retry loop's transient-error path.
+ * Per the documented `failoverModels` contract (provider-config.ts): failover
+ * fires on errors carrying a failover-eligible HTTP status code
+ * (401/403/500/502/503/504). Provider content-policy errors are NOT
+ * failover-eligible (M3-T4): a policy refusal is deterministic, so retrying
+ * the same prompt against the next configured model/provider is a
+ * documented-contract violation and a policy-evasion path — the policy error
+ * fails fast instead. Other non-HTTP errors (network blips, aborts, etc.) are
+ * handled by the inner retry loop's transient-error path.
  */
 export function isFailoverEligibleError(error: unknown): boolean {
-  if (isProviderContentPolicyError(error)) return true
+  // Content-policy refusals are never failover-eligible regardless of any
+  // preserved status code: normalizeProviderContentPolicyError keeps the
+  // original statusCode (e.g. a 503 whose body mentions policy normalizes to
+  // statusCode 503), so the status check alone would fail over a
+  // deterministic refusal — the exact policy-evasion path the M3-T4 contract
+  // closes (reliability finding
+  // content-policy-status-preserved-through-normalization).
+  if (isProviderContentPolicyError(error)) return false
+  // An empty stream (NoOutputGeneratedError from the AI SDK) means the
+  // provider accepted the connection but produced zero chunks before a clean
+  // close, so the primary model failed without emitting anything. A backup
+  // model attempt is worthwhile; the failover loop's `anyContentYielded`
+  // guard already protects against duplicating output.
+  if (NoOutputGeneratedError.isInstance(error)) return true
   const statusCode = getErrorStatusCode(error)
   if (statusCode === undefined) return false
   return FAILOVER_ELIGIBLE_STATUS_CODES.has(statusCode)

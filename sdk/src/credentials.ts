@@ -64,6 +64,74 @@ export const userFromJson = (json: string): User | null => {
 }
 
 /**
+ * Owner-only (0600) atomic write used for every credentials-file update:
+ * serialize to a temp file in the same directory, fsync, then rename over the
+ * target so a crash mid-write can never leave a truncated credentials file
+ * behind (which would otherwise fail subsequent parses silently).
+ */
+const writeCredentialsFileAtomic = (
+  filePath: string,
+  value: unknown,
+): void => {
+  ensureDirectoryExistsSync(path.dirname(filePath))
+  const tempPath = `${filePath}.tmp.${process.pid}.${Date.now()}`
+  const handle = fs.openSync(tempPath, 'wx', 0o600)
+  try {
+    fs.writeFileSync(handle, JSON.stringify(value, null, 2))
+    fs.fsyncSync(handle)
+  } finally {
+    fs.closeSync(handle)
+  }
+  try {
+    fs.renameSync(tempPath, filePath)
+  } catch (error) {
+    if (
+      !['EEXIST', 'EPERM'].includes(
+        (error as NodeJS.ErrnoException).code ?? '',
+      )
+    ) {
+      throw error
+    }
+    // Fallback for filesystems that cannot rename over an existing target
+    // (e.g. Windows EPERM/EEXIST). The target path is NEVER emptied:
+    // the old content is COPIED to a unique backup (a failed copy leaves
+    // the target untouched), the new content is renamed over the target
+    // in one atomic step, and only after that succeeds is the backup
+    // removed. A crash in any window leaves either the old or the new
+    // credentials in place at the target path — the file holds OAuth
+    // tokens and the default API key, so unlink-then-rename here would
+    // mean a crash between the two calls destroys them irreversibly.
+    const backupPath = `${filePath}.bak.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`
+    try {
+      fs.copyFileSync(filePath, backupPath)
+      fs.chmodSync(backupPath, 0o600)
+    } catch {
+      // A failed copy leaves the target (and its permissions) untouched;
+      // fall through to retry the plain rename.
+    }
+    try {
+      fs.renameSync(tempPath, filePath)
+    } catch (renameError) {
+      // The rename failed again. The copy already preserved the old
+      // content at the backup path and the target still holds the old
+      // content, so nothing was lost; leave the backup in place as the
+      // recoverable copy and surface the failure.
+      throw renameError
+    }
+    try {
+      fs.unlinkSync(backupPath)
+    } catch {
+      // Best-effort cleanup; the swap already succeeded.
+    }
+  }
+  try {
+    fs.chmodSync(filePath, 0o600)
+  } catch {
+    // Best-effort enforcement; ignore on filesystems that don't support chmod.
+  }
+}
+
+/**
  * Get the config directory path based on the environment.
  * Uses the clientEnv to determine the environment suffix.
  */
@@ -192,18 +260,11 @@ export const saveChatGptOAuthCredentials = (
     chatgptOAuth: credentials,
   }
 
-  // Write with owner-only permissions (0600). The credentials file contains
-  // OAuth access/refresh tokens and the default API key; it must not be
-  // group/world readable. writeFile mode is masked by umask, so chmodSync
-  // enforces the intended mode regardless of the process umask.
-  fs.writeFileSync(credentialsPath, JSON.stringify(updatedData, null, 2), {
-    mode: 0o600,
-  })
-  try {
-    fs.chmodSync(credentialsPath, 0o600)
-  } catch {
-    // Best-effort enforcement; ignore on filesystems that don't support chmod.
-  }
+  // Write with owner-only permissions (0600) via an atomic temp-file rename so
+  // a crash mid-write never leaves a truncated credentials file behind. The
+  // file contains OAuth access/refresh tokens and the default API key; it must
+  // not be group/world readable.
+  writeCredentialsFileAtomic(credentialsPath, updatedData)
 }
 
 export const clearChatGptOAuthCredentials = (clientEnv?: ClientEnv): void => {
@@ -216,14 +277,7 @@ export const clearChatGptOAuthCredentials = (clientEnv?: ClientEnv): void => {
     const existingData = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))
     delete existingData.chatgptOAuth
     // Preserve the 0600 mode established by saveChatGptOAuthCredentials.
-    fs.writeFileSync(credentialsPath, JSON.stringify(existingData, null, 2), {
-      mode: 0o600,
-    })
-    try {
-      fs.chmodSync(credentialsPath, 0o600)
-    } catch {
-      // Best-effort enforcement; ignore on filesystems that don't support chmod.
-    }
+    writeCredentialsFileAtomic(credentialsPath, existingData)
   } catch {
     // Ignore errors
   }
@@ -238,21 +292,39 @@ export const isChatGptOAuthValid = (clientEnv?: ClientEnv): boolean => {
   return credentials.expiresAt > Date.now() + bufferMs
 }
 
-let chatGptRefreshPromise: Promise<ChatGptOAuthCredentials | null> | null = null
+// Module-level single-flight refresh promises, keyed by the config-dir
+// identity the negative cache and credentials files are keyed by. One global
+// slot would make caller B joining caller A's in-flight refresh receive A's
+// tokens (saved to A's file) even across different credential stores (M2-T5).
+const chatGptRefreshPromises = new Map<
+  string,
+  Promise<ChatGptOAuthCredentials | null>
+>()
 
-export const refreshChatGptOAuthToken = async (
+// Module-level negative cache for failed refresh attempts, keyed by config-Dir
+// identity. Contains the last-failure wall-clock time only — no token material.
+const REFRESH_FAILURE_TTL_MS = 45_000
+const chatGptRefreshFailureAt = new Map<string, number>()
+
+export const refreshChatGptOAuthToken = (
   clientEnv?: ClientEnv,
 ): Promise<ChatGptOAuthCredentials | null> => {
-  if (chatGptRefreshPromise) {
-    return chatGptRefreshPromise
+  // Compute the config-dir key FIRST so every map slot and the negative
+  // cache are keyed consistently, before any credentials read/write (M2-T5).
+  const refreshKey = getConfigDir(clientEnv)
+
+  const inFlight = chatGptRefreshPromises.get(refreshKey)
+  if (inFlight) {
+    return inFlight
   }
 
   const credentials = getChatGptOAuthCredentials(clientEnv)
   if (!credentials?.refreshToken) {
-    return null
+    return Promise.resolve(null)
   }
 
-  chatGptRefreshPromise = (async () => {
+  const refreshPromise = (async () => {
+    let failed = false
     try {
       const response = await fetch(CHATGPT_OAUTH_TOKEN_URL, {
         method: 'POST',
@@ -271,6 +343,7 @@ export const refreshChatGptOAuthToken = async (
         console.debug(
           `ChatGPT OAuth token refresh failed (status ${response.status})`,
         )
+        failed = true
         return null
       }
 
@@ -281,6 +354,7 @@ export const refreshChatGptOAuthToken = async (
         data.access_token.trim().length === 0
       ) {
         console.debug('ChatGPT OAuth token refresh returned empty access token')
+        failed = true
         return null
       }
 
@@ -304,13 +378,24 @@ export const refreshChatGptOAuthToken = async (
         'ChatGPT OAuth token refresh failed:',
         error instanceof Error ? error.message : String(error),
       )
+      failed = true
       return null
     } finally {
-      chatGptRefreshPromise = null
+      // Stamp the negative cache BEFORE the shared promise resolves and the
+      // map slot clears, so a caller that observes a null outcome cannot
+      // start a fresh refresh before the failure is recorded (M2-T5).
+      if (failed) {
+        chatGptRefreshFailureAt.set(refreshKey, Date.now())
+      } else {
+        chatGptRefreshFailureAt.delete(refreshKey)
+      }
+      chatGptRefreshPromises.delete(refreshKey)
     }
   })()
 
-  return chatGptRefreshPromise
+  chatGptRefreshPromises.set(refreshKey, refreshPromise)
+
+  return refreshPromise
 }
 
 export const getValidChatGptOAuthCredentials = async (
@@ -330,6 +415,18 @@ export const getValidChatGptOAuthCredentials = async (
 
   if (credentials.expiresAt > Date.now() + bufferMs) {
     return credentials
+  }
+
+  // Negative cache: a refresh that failed less than REFRESH_FAILURE_TTL_MS ago
+  // means we skip retrying entirely rather than re-hitting the network with
+  // the same (presumably still rejected) refresh token.
+  const failureKey = getConfigDir(clientEnv)
+  const lastFailure = chatGptRefreshFailureAt.get(failureKey)
+  if (
+    lastFailure !== undefined &&
+    Date.now() - lastFailure < REFRESH_FAILURE_TTL_MS
+  ) {
+    return null
   }
 
   return refreshChatGptOAuthToken(clientEnv)

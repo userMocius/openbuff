@@ -8,6 +8,7 @@ import {
   attachBackgroundAgentPromise,
   BACKGROUND_AGENT_CANCEL_REASON,
   backgroundAgentJobWasCancelled,
+  emitBackgroundAgentStatus,
   reconcileInterruptedBackgroundAgentIntents,
 } from '../../../util/background-agent-jobs'
 
@@ -32,9 +33,14 @@ import {
 } from '../../../util/workspace-path-leases'
 import {
   buildDiscoveryQuestion,
-  claimDiscoveryShard,
   completeDiscoveryShard,
+  getVerifiedMemoryExcerpts,
+  getVerifiedMemoryPaths,
+  recordDiscoveryResult,
+  tryClaimDiscoveryShard,
 } from '../../../orchestration/discovery-coordinator'
+
+import type { VerifiedExcerpt } from '../../../orchestration/discovery-coordinator'
 
 import type { BackgroundAgentJob } from '../../../util/background-agent-jobs'
 import type { CodebuffToolHandlerFunction } from '../handler-function-type'
@@ -75,6 +81,56 @@ type ValidatedSpawnAgent = {
   leaseId?: string
   discoveryShardKey?: string
   handoff?: AgentHandoff
+}
+
+/**
+ * Derive a small status milestone enum for a background chunk. String chunks
+ * carry no milestone. `tool_call` maps to `tool:<toolName>`, `tool_result`
+ * to `tool_result`, `subagent_start` to `started:<agentType>`, and
+ * `subagent_finish` to `finished:<agentType>` with an `:error` suffix when
+ * the finish carries an error. Returns undefined when no milestone applies.
+ */
+function backgroundAgentStatusForChunk(
+  chunk: PrintModeEvent,
+): string | undefined {
+  try {
+    switch (chunk.type) {
+      case 'tool_call': {
+        const record = chunk as unknown as Record<string, unknown>
+        const nested =
+          (record['toolCall'] as Record<string, unknown> | undefined)?.[
+            'toolName'
+          ] ?? (record['tool'] as Record<string, unknown> | undefined)?.['name']
+        const raw = record['toolName'] ?? record['tool_name'] ?? record['name'] ?? nested
+        const name =
+          typeof raw === 'string' && raw.length > 0 ? raw : 'unknown'
+        return `tool:${name.slice(0, 100)}`
+      }
+      case 'tool_result':
+        return 'tool_result'
+      case 'subagent_start': {
+        const record = chunk as unknown as Record<string, unknown>
+        const raw =
+          record['agentType'] ?? record['agent_type'] ?? record['agentName']
+        const agentType =
+          typeof raw === 'string' && raw.length > 0 ? raw : 'unknown'
+        return `started:${agentType.slice(0, 100)}`
+      }
+      case 'subagent_finish': {
+        const record = chunk as unknown as Record<string, unknown>
+        const raw =
+          record['agentType'] ?? record['agent_type'] ?? record['agentName']
+        const agentType =
+          typeof raw === 'string' && raw.length > 0 ? raw : 'unknown'
+        const base = `finished:${agentType.slice(0, 100)}`
+        return record['error'] ? `${base}:error` : base
+      }
+      default:
+        return undefined
+    }
+  } catch {
+    return undefined
+  }
 }
 
 export const handleSpawnAgents = (async (
@@ -239,25 +295,95 @@ export const handleSpawnAgents = (async (
   const backgroundAgents = validatedAgents.filter(
     (validated) => validated.input.background,
   )
+  let verifiedExcerptsForSpawn: VerifiedExcerpt[] = []
+  try {
+    verifiedExcerptsForSpawn = getVerifiedMemoryExcerpts(parentAgentState, {
+      limit: 5,
+      maxCharsPerExcerpt: 500,
+    }).slice(0, 5)
+  } catch {
+    verifiedExcerptsForSpawn = []
+  }
+  const forwardVerifiedExcerpts = (
+    subAgentState: AgentState,
+    excerpts: VerifiedExcerpt[],
+  ) => {
+    try {
+      if (!excerpts || excerpts.length === 0) return
+      if (!subAgentState || typeof subAgentState !== 'object') return
+      const bounded = excerpts.slice(0, 5).map((entry) => ({
+        path: entry.path,
+        ...(entry.excerpt ? { excerpt: entry.excerpt.slice(0, 500) } : {}),
+      }))
+      const record = subAgentState as unknown as Record<string, unknown>
+      if (Array.isArray(record['verifiedMemoryExcerpts'])) {
+        record['verifiedMemoryExcerpts'] = [
+          ...((record['verifiedMemoryExcerpts'] as unknown[]) ?? []),
+          ...bounded,
+        ].slice(0, 5)
+        return
+      }
+      if ('verifiedMemoryExcerpts' in record && record['verifiedMemoryExcerpts'] === undefined) {
+        record['verifiedMemoryExcerpts'] = bounded
+        return
+      }
+      // Fallback: bounded prompt-prefix injection via a system-tagged context
+      // message so the child can consume verified memory without schema changes.
+      const lines = bounded.map((entry) =>
+        entry.excerpt ? `- ${entry.path}: ${entry.excerpt}` : `- ${entry.path}`,
+      )
+      const text = `<system>Verified memory excerpts (bounded, ${bounded.length} paths):\n${lines.join('\n').slice(0, 2500)}</system>`
+      const history = (subAgentState as AgentState).messageHistory
+      if (Array.isArray(history)) {
+        history.unshift({
+          role: 'user',
+          content: [{ type: 'text', text }],
+          tags: ['SUBAGENT_CONTEXT'],
+          keepDuringTruncation: true,
+        } as unknown as AgentState['messageHistory'][number])
+      }
+    } catch {
+      // Best-effort forwarding only.
+    }
+  }
+  const isDiscoveryAgentType = (agentType: string): boolean => {
+    // query_index/code_search are TOOLS, not spawnable agent templates.
+    // Only file-picker/file-lister remain discovery agent types for shard claim.
+    return agentType === 'file-picker' || agentType === 'file-lister'
+  }
   let nextDiscoveryCoverage = parentAgentState.discoveryCoverage
   for (const validated of validatedAgents) {
-    if (
-      validated.agentType === 'file-picker' ||
-      validated.agentType === 'file-lister'
-    ) {
-      const claimed = claimDiscoveryShard({
+    if (isDiscoveryAgentType(validated.agentType)) {
+      const question = buildDiscoveryQuestion({
+        agentType: validated.agentType,
+        prompt: validated.input.prompt,
+        objective: validated.handoff?.objective,
+        spawnParams: validated.runtimeSpawnParams,
+      })
+      const taskId =
+        validated.handoff?.taskId ??
+        parentAgentState.runId ??
+        parentAgentState.agentId
+      const claimed = tryClaimDiscoveryShard({
         existing: nextDiscoveryCoverage,
         agentType: validated.agentType,
-        question: buildDiscoveryQuestion({
-          agentType: validated.agentType,
-          prompt: validated.input.prompt,
-          objective: validated.handoff?.objective,
-          spawnParams: validated.runtimeSpawnParams,
-        }),
+        question,
         workspaceRevision: parentAgentState.workspaceState?.revision,
+        taskId,
+        workspaceSnapshotId: parentAgentState.workspaceState?.snapshotId,
       })
       nextDiscoveryCoverage = claimed.state
-      validated.discoveryShardKey = claimed.shardKey
+      // A duplicate claim serves the existing receipt: leave the shard key
+      // unset so later completeDiscoveryShard is a no-op for this spawn.
+      // This preserves file-picker/file-lister dedup without throwing the
+      // whole spawn batch on a duplicate claim.
+      if (!claimed.duplicate) {
+        validated.discoveryShardKey = claimed.shardKey
+      }
+      forwardVerifiedExcerpts(
+        validated.subAgentState,
+        verifiedExcerptsForSpawn,
+      )
     }
   }
   // Commit the whole batch of claims at once. If any claim is rejected, the
@@ -269,12 +395,25 @@ export const handleSpawnAgents = (async (
   // reporting spawns that were never launched as in-flight for the rest of the
   // turn.
   const startedSpawnIds = new Set<string>()
+  // Agent ids whose background coroutine WAS launched (mirrors
+  // `wiredBackgroundJobIds`, which is declared in the launch loop below): a
+  // live coroutine owns its own terminal transitions — the lease release,
+  // shard completion, and ledger closure in its settle handlers — so rollback
+  // must neither free its lease (opening an overlap-conflict window for a
+  // subsequent spawn) nor emit an `interrupted` event that pairs with the
+  // `spawn_finished` it settles with.
+  const wiredBackgroundAgentIds = new Set<string>()
   // Release everything the batch already claimed when a whole-batch step
   // fails, so a rejected batch never leaves an active workspace path lease, an
   // active discovery shard, or an unterminated `spawn_started` behind for an
-  // agent that was never launched.
+  // agent that was never launched. Agents whose coroutines already launched
+  // (see `wiredBackgroundAgentIds`) are skipped: their settle handlers own
+  // every terminal transition.
   const rollbackValidatedClaims = (reason: string) => {
     for (const validated of validatedAgents) {
+      if (wiredBackgroundAgentIds.has(validated.subAgentState.agentId)) {
+        continue
+      }
       releaseWorkspacePathLease(parentAgentState, validated.leaseId)
       parentAgentState.discoveryCoverage = completeDiscoveryShard({
         existing: parentAgentState.discoveryCoverage,
@@ -459,6 +598,14 @@ export const handleSpawnAgents = (async (
             payload: chunk,
             timestamp: Date.now(),
           })
+          try {
+            const milestone = backgroundAgentStatusForChunk(chunk)
+            if (milestone !== undefined) {
+              emitBackgroundAgentStatus(job.jobId, milestone)
+            }
+          } catch {
+            // Best-effort milestone only; chunk buffering above already succeeded.
+          }
         },
       })
 
@@ -466,106 +613,140 @@ export const handleSpawnAgents = (async (
         job,
         detachedPromise
           .then((result) => {
-            // The coroutine settled: detach the combined signal's abort
-            // listeners from the long-lived parent signal (idempotent, and a
-            // no-op when there was no parent signal to combine).
-            combinedSignal?.cleanup?.()
-            const receipt = buildRuntimeAgentReceipt({
-              agentType,
-              agentId: result.agentState.agentId,
-              handoff: validated.handoff,
-              spawnParams: validated.runtimeSpawnParams,
-              output: result.output,
-              agentState: result.agentState,
-            })
-            reconcileAgentReceiptIntoParent({
-              parentAgentState,
-              receipt,
-              agentType,
-              objective: validated.handoff?.objective,
-            })
-            const intent = parentAgentState.backgroundAgentJobs?.find(
-              (entry) => entry.jobId === job.jobId,
-            )
-            if (intent) {
-              intent.status = 'completed'
-              intent.completedAt = Date.now()
-              intent.childRunId = result.agentState.runId
-              intent.receipt = receipt
-            }
-            releaseWorkspacePathLease(parentAgentState, validated.leaseId)
-            parentAgentState.discoveryCoverage = completeDiscoveryShard({
-              existing: parentAgentState.discoveryCoverage,
-              shardKey: validated.discoveryShardKey,
-              status: 'completed',
-            })
-            return {
-              agentId: result.agentState.agentId,
-              agentName: agentTemplate.displayName,
-              agentType,
-              output: receipt.output,
-              agentReceipt: receipt,
-              creditsUsed: result.agentState.creditsUsed || 0,
+            // Exception-safe settle chain: the lease release and shard
+            // completion in the finally below run even when an early settle
+            // step throws, so a fault mid-settle can neither leak the
+            // workspace path lease nor strand the discovery shard.
+            let settleSucceeded = false
+            try {
+              // The coroutine settled: detach the combined signal's abort
+              // listeners from the long-lived parent signal (idempotent, and a
+              // no-op when there was no parent signal to combine).
+              combinedSignal?.cleanup?.()
+              const receipt = buildRuntimeAgentReceipt({
+                agentType,
+                agentId: result.agentState.agentId,
+                handoff: validated.handoff,
+                spawnParams: validated.runtimeSpawnParams,
+                output: result.output,
+                agentState: result.agentState,
+              })
+              reconcileAgentReceiptIntoParent({
+                parentAgentState,
+                receipt,
+                agentType,
+                objective: validated.handoff?.objective,
+              })
+              const intent = parentAgentState.backgroundAgentJobs?.find(
+                (entry) => entry.jobId === job.jobId,
+              )
+              if (intent) {
+                intent.status = 'completed'
+                intent.completedAt = Date.now()
+                intent.childRunId = result.agentState.runId
+                intent.receipt = receipt
+              }
+              parentAgentState.discoveryCoverage = recordDiscoveryResult({
+                existing: parentAgentState.discoveryCoverage,
+                agentType,
+                question: buildDiscoveryQuestion({
+                  agentType,
+                  prompt: validated.input.prompt,
+                  objective: validated.handoff?.objective,
+                  spawnParams: validated.runtimeSpawnParams,
+                }),
+                result: result.output,
+                workspaceRevision: parentAgentState.workspaceState?.revision,
+                workspaceSnapshotId: parentAgentState.workspaceState?.snapshotId,
+                verifiedPaths: getVerifiedMemoryPaths(parentAgentState),
+              })
+              settleSucceeded = true
+              return {
+                agentId: result.agentState.agentId,
+                agentName: agentTemplate.displayName,
+                agentType,
+                output: receipt.output,
+                agentReceipt: receipt,
+                creditsUsed: result.agentState.creditsUsed || 0,
+              }
+            } finally {
+              releaseWorkspacePathLease(parentAgentState, validated.leaseId)
+              parentAgentState.discoveryCoverage = completeDiscoveryShard({
+                existing: parentAgentState.discoveryCoverage,
+                shardKey: validated.discoveryShardKey,
+                status: settleSucceeded ? 'completed' : 'interrupted',
+              })
             }
           })
           .catch((error) => {
-            // Same detach on the failure/cancellation path.
-            combinedSignal?.cleanup?.()
-            // A rejection driven by THIS job's own
-            // check_background_agent({ cancel: true }) abort is a
-            // cancellation, not a failure: the registry already recorded
-            // 'cancelled', so stamping 'error'/'failed' onto the parent's
-            // durable intent and receipt would make one job report two
-            // different terminal outcomes. Ordinary rejections — including
-            // subagent timeouts and a parent-signal abort — keep the
-            // error/failed path unchanged.
-            const cancelled = backgroundAgentJobWasCancelled(job)
-            const receipt = buildRuntimeAgentReceipt({
-              agentType,
-              agentId: subAgentState.agentId,
-              handoff: validated.handoff,
-              spawnParams: validated.runtimeSpawnParams,
-              output: undefined,
-              agentState: subAgentState,
-              status: cancelled ? 'cancelled' : 'failed',
-              // Any `error` is folded into the receipt's `errors`, which forces
-              // status 'failed', so the cancelled case requests 'cancelled'
-              // with no error and carries the reason on the intent instead.
-              error: cancelled ? undefined : error,
-            })
-            reconcileAgentReceiptIntoParent({
-              parentAgentState,
-              receipt,
-              agentType,
-              objective: validated.handoff?.objective,
-            })
-            const intent = parentAgentState.backgroundAgentJobs?.find(
-              (entry) => entry.jobId === job.jobId,
-            )
-            if (intent) {
-              intent.status = cancelled ? 'cancelled' : 'error'
-              intent.completedAt = Date.now()
-              // Keep the cancellation reason check_background_agent already
-              // recorded; fall back to the adapter's canonical reason.
-              intent.error = cancelled
-                ? (intent.error ?? BACKGROUND_AGENT_CANCEL_REASON)
-                : error instanceof Error
-                  ? error.message
-                  : String(error)
-              intent.receipt = receipt
+            // Same exception-safe settle chain on the failure/cancellation
+            // path: the finally below guarantees the lease release and shard
+            // completion even when an early settle step throws, and a
+            // mid-settle throw may replace the original error but is never
+            // swallowed.
+            try {
+              combinedSignal?.cleanup?.()
+              // A rejection driven by THIS job's own
+              // check_background_agent({ cancel: true }) abort is a
+              // cancellation, not a failure: the registry already recorded
+              // 'cancelled', so stamping 'error'/'failed' onto the parent's
+              // durable intent and receipt would make one job report two
+              // different terminal outcomes. Ordinary rejections — including
+              // subagent timeouts and a parent-signal abort — keep the
+              // error/failed path unchanged.
+              const cancelled = backgroundAgentJobWasCancelled(job)
+              const receipt = buildRuntimeAgentReceipt({
+                agentType,
+                agentId: subAgentState.agentId,
+                handoff: validated.handoff,
+                spawnParams: validated.runtimeSpawnParams,
+                output: undefined,
+                agentState: subAgentState,
+                status: cancelled ? 'cancelled' : 'failed',
+                // Any `error` is folded into the receipt's `errors`, which forces
+                // status 'failed', so the cancelled case requests 'cancelled'
+                // with no error and carries the reason on the intent instead.
+                error: cancelled ? undefined : error,
+              })
+              reconcileAgentReceiptIntoParent({
+                parentAgentState,
+                receipt,
+                agentType,
+                objective: validated.handoff?.objective,
+              })
+              const intent = parentAgentState.backgroundAgentJobs?.find(
+                (entry) => entry.jobId === job.jobId,
+              )
+              if (intent) {
+                intent.status = cancelled ? 'cancelled' : 'error'
+                intent.completedAt = Date.now()
+                // Keep the cancellation reason check_background_agent already
+                // recorded; fall back to the adapter's canonical reason.
+                intent.error = cancelled
+                  ? (intent.error ?? BACKGROUND_AGENT_CANCEL_REASON)
+                  : error instanceof Error
+                    ? error.message
+                    : String(error)
+                intent.receipt = receipt
+              }
+            } finally {
+              releaseWorkspacePathLease(parentAgentState, validated.leaseId)
+              parentAgentState.discoveryCoverage = completeDiscoveryShard({
+                existing: parentAgentState.discoveryCoverage,
+                shardKey: validated.discoveryShardKey,
+                status: 'failed',
+              })
             }
-            releaseWorkspacePathLease(parentAgentState, validated.leaseId)
-            parentAgentState.discoveryCoverage = completeDiscoveryShard({
-              existing: parentAgentState.discoveryCoverage,
-              shardKey: validated.discoveryShardKey,
-              status: 'failed',
-            })
             throw error
           }),
       )
       // Wired: this job's coroutine is launched and its settle handlers own
       // the terminal transition from here on, so it must never be abandoned.
       wiredBackgroundJobIds.add(job.jobId)
+      // Mirror by agent id so rollbackValidatedClaims (declared before this
+      // loop) can skip coroutine-owned agents: their settle handlers alone
+      // release the lease, complete the shard, and terminate the ledger pair.
+      wiredBackgroundAgentIds.add(subAgentState.agentId)
 
       reports[spawnIndex] = {
         agentId: subAgentState.agentId,
@@ -709,66 +890,121 @@ export const handleSpawnAgents = (async (
 
   await Promise.all(
     results.map(async (result, index): Promise<void> => {
-      const spawnIndex = foregroundAgents[index].spawnIndex
-      if (result.status === 'fulfilled') {
-        const { output, agentType, agentName, agentState } = result.value
-        const handoff = foregroundAgents[index].handoff
-        const receipt = buildRuntimeAgentReceipt({
-          agentType,
-          agentId: agentState.agentId,
-          handoff,
-          spawnParams: foregroundAgents[index].runtimeSpawnParams,
-          output,
-          agentState,
-        })
-        reconcileAgentReceiptIntoParent({
-          parentAgentState,
-          receipt,
-          agentType,
-          objective: handoff?.objective,
-        })
-        reports[spawnIndex] = {
-          agentId: agentState.agentId,
-          agentName,
-          agentType,
-          value: receipt.output as JSONValue,
-          agentReceipt: receipt as unknown as JSONValue,
+      // Exception-safe foreground settle chain (mirrors the background settle
+      // handlers and the inline handler): every settle step runs inside one
+      // try whose finally guarantees the lease release and the discovery-shard
+      // completion, so a fault in a settle step can neither leak the
+      // workspace path lease (30-min TTL) nor strand the claimed shard. The
+      // catch additionally closes the spawn's `spawn_started` ledger pair
+      // with `interrupted` unless the terminal receipt was already
+      // reconciled, then re-throws so Promise.all still rejects with the
+      // original error.
+      const validated = foregroundAgents[index]
+      const spawnIndex = validated.spawnIndex
+      let receiptReconciled = false
+      let settleSucceeded = false
+      try {
+        if (result.status === 'fulfilled') {
+          const { output, agentType, agentName, agentState } = result.value
+          const handoff = validated.handoff
+          const receipt = buildRuntimeAgentReceipt({
+            agentType,
+            agentId: agentState.agentId,
+            handoff,
+            spawnParams: validated.runtimeSpawnParams,
+            output,
+            agentState,
+          })
+          reconcileAgentReceiptIntoParent({
+            parentAgentState,
+            receipt,
+            agentType,
+            objective: handoff?.objective,
+          })
+          receiptReconciled = true
+          reports[spawnIndex] = {
+            agentId: agentState.agentId,
+            agentName,
+            agentType,
+            value: receipt.output as JSONValue,
+            agentReceipt: receipt as unknown as JSONValue,
+          }
+        } else {
+          const agentTypeStr = validated.input.agent_type
+          const handoff = validated.handoff
+          const receipt = buildRuntimeAgentReceipt({
+            agentType: agentTypeStr,
+            agentId: validated.subAgentState.agentId,
+            handoff,
+            spawnParams: validated.runtimeSpawnParams,
+            output: undefined,
+            agentState: validated.subAgentState,
+            status: 'failed',
+            error: result.reason,
+          })
+          reconcileAgentReceiptIntoParent({
+            parentAgentState,
+            receipt,
+            agentType: agentTypeStr,
+            objective: handoff?.objective,
+          })
+          receiptReconciled = true
+          reports[spawnIndex] = {
+            agentType: agentTypeStr,
+            agentName: agentTypeStr,
+            value: { errorMessage: `Error spawning agent: ${result.reason}` },
+            agentReceipt: receipt as unknown as JSONValue,
+          }
         }
-      } else {
-        const agentTypeStr = foregroundAgents[index].input.agent_type
-        const handoff = foregroundAgents[index].handoff
-        const receipt = buildRuntimeAgentReceipt({
-          agentType: agentTypeStr,
-          agentId: foregroundAgents[index].subAgentState.agentId,
-          handoff,
-          spawnParams: foregroundAgents[index].runtimeSpawnParams,
-          output: undefined,
-          agentState: foregroundAgents[index].subAgentState,
-          status: 'failed',
-          error: result.reason,
-        })
-        reconcileAgentReceiptIntoParent({
-          parentAgentState,
-          receipt,
-          agentType: agentTypeStr,
-          objective: handoff?.objective,
-        })
-        reports[spawnIndex] = {
-          agentType: agentTypeStr,
-          agentName: agentTypeStr,
-          value: { errorMessage: `Error spawning agent: ${result.reason}` },
-          agentReceipt: receipt as unknown as JSONValue,
+        if (result.status === 'fulfilled') {
+          parentAgentState.discoveryCoverage = recordDiscoveryResult({
+            existing: parentAgentState.discoveryCoverage,
+            agentType: validated.agentType,
+            question: buildDiscoveryQuestion({
+              agentType: validated.agentType,
+              prompt: validated.input.prompt,
+              objective: validated.handoff?.objective,
+              spawnParams: validated.runtimeSpawnParams,
+            }),
+            result: result.value.output,
+            workspaceRevision: parentAgentState.workspaceState?.revision,
+            workspaceSnapshotId: parentAgentState.workspaceState?.snapshotId,
+            verifiedPaths: getVerifiedMemoryPaths(parentAgentState),
+          })
         }
+        settleSucceeded = true
+      } catch (error) {
+        if (!receiptReconciled) {
+          appendOrchestrationEvent({
+            state: parentAgentState,
+            event: {
+              type: 'interrupted',
+              runId: parentAgentState.runId ?? parentAgentState.agentId,
+              subjectType: 'spawn',
+              subjectId: validated.subAgentState.agentId,
+              reason:
+                error instanceof Error
+                  ? `Foreground spawn settle failed before reaching its terminal receipt: ${error.message}`
+                  : `Foreground spawn settle failed before reaching its terminal receipt: ${String(error)}`,
+              workspaceRevision: parentAgentState.workspaceState?.revision,
+              workspaceSnapshotId: parentAgentState.workspaceState?.snapshotId,
+            },
+          })
+        }
+        throw error
+      } finally {
+        releaseWorkspacePathLease(parentAgentState, validated.leaseId)
+        parentAgentState.discoveryCoverage = completeDiscoveryShard({
+          existing: parentAgentState.discoveryCoverage,
+          shardKey: validated.discoveryShardKey,
+          status:
+            result.status === 'fulfilled'
+              ? settleSucceeded
+                ? 'completed'
+                : 'interrupted'
+              : 'failed',
+        })
       }
-      releaseWorkspacePathLease(
-        parentAgentState,
-        foregroundAgents[index].leaseId,
-      )
-      parentAgentState.discoveryCoverage = completeDiscoveryShard({
-        existing: parentAgentState.discoveryCoverage,
-        shardKey: foregroundAgents[index].discoveryShardKey,
-        status: result.status === 'fulfilled' ? 'completed' : 'failed',
-      })
     }),
   )
 

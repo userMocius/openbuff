@@ -3,6 +3,8 @@ import { z } from 'zod/v4'
 import { MAX_AGENT_STEPS_DEFAULT } from '../constants/agents'
 
 import type { Message } from './messages/codebuff-message'
+import type { ContextArchiveSnapshot } from './context-archive'
+import type { ContextConsolidation } from './context-consolidation'
 import type { ProjectFileContext } from '../util/file'
 import type { TaskMemoryV1 } from './task-memory'
 import type { OrchestrationLedgerV1 } from './orchestration-ledger'
@@ -10,6 +12,19 @@ import type { DiscoveryCoverageV1 } from './discovery-coverage'
 import type { AgentReceipt } from './agent-handoff'
 import type { WorkspaceStateV1 } from './workspace-state'
 import { createInitialWorkspaceState } from './workspace-state'
+import type {
+  MemoryAuthorityMode,
+  MemoryEventId,
+  MemoryReuseReceiptV1,
+  MemorySessionId,
+  MemoryTurnContextV2,
+  ProjectId,
+  QueryCategoryCounts,
+  QueryDegradationSummary,
+  QueryId,
+  TaskId,
+  TaskStatus,
+} from './memory-v2'
 
 export const toolCallSchema = z.object({
   toolName: z.string(),
@@ -58,6 +73,110 @@ export type ConfirmedPostEditAnchor = {
   projectId?: string
   /** Issuing run identity; optional for legacy session parse. */
   runId?: string
+}
+
+/** Canonical sha256 content-hash shape minted by read_files (M2-T3). */
+const SHA256_CONTENT_HASH_PATTERN = /^sha256:[a-f0-9]{64}$/i
+
+/**
+ * Runtime validation shape for {@link ConfirmedPostEditAnchor} (M2-T3): used
+ * by the restore-boundary sanitizer below so a JSON.parse-and-cast cannot
+ * smuggle a forged anchor into `confirmedPostEditAnchorsByPath`. The hash and
+ * capability patterns mirror what read_files mints (canonical sha256 content
+ * hash, cap.v3-prefixed capability token).
+ */
+export const confirmedPostEditAnchorSchema = z
+  .object({
+    startLine: z.number().int().min(1),
+    endLine: z.number().int().min(1),
+    contentHash: z.string().regex(SHA256_CONTENT_HASH_PATTERN),
+    readCapability: z.string().min(1).max(4096).regex(/^cap\.v3\./),
+    projectId: z.string().optional(),
+    runId: z.string().optional(),
+  })
+  .strict()
+  .refine((anchor) => anchor.endLine >= anchor.startLine, {
+    message: 'endLine must be >= startLine',
+  })
+
+/**
+ * Untrusted field view used only inside the sanitizer: restored sessions
+ * arrive via JSON.parse-and-cast, so the static map types on
+ * {@link AgentState} are unverified claims that must be re-validated.
+ */
+type AgentStateSecurityMapsView = {
+  readAuthorizationsByPath?: unknown
+  readAuthorizationHashesByPath?: unknown
+  confirmedPostEditAnchorsByPath?: unknown
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Keep entries whose key is a non-empty string and whose value passes
+ * `isValidValue`; drop every other entry. Returns undefined when the whole
+ * map is not a plain object (forged/corrupt shape).
+ */
+function sanitizeSecurityMapEntries<V>(
+  map: unknown,
+  isValidValue: (value: unknown) => value is V,
+): Record<string, V> | undefined {
+  if (!isPlainObject(map)) return undefined
+  const sanitized: Record<string, V> = {}
+  for (const [key, value] of Object.entries(map)) {
+    if (key.length === 0 || !isValidValue(value)) continue
+    sanitized[key] = value
+  }
+  return sanitized
+}
+
+/**
+ * Restore-boundary sanitizer for the persisted AgentState security maps
+ * (M2-T3).
+ *
+ * WHY: persisted AgentState is restored via JSON.parse-and-cast (see
+ * `applyOverridesToSessionState` in sdk/src/run-state.ts), so a forged or
+ * corrupt session could plant sticky read-before-edit authority
+ * (`readAuthorizationsByPath`), authoritative whole-file content hashes
+ * (`readAuthorizationHashesByPath`), or remintable cap.v3 anchors
+ * (`confirmedPostEditAnchorsByPath`) for files that were never read in this
+ * run. Shape-validate and strip at the restore boundary; staleness
+ * re-verification and token authentication remain use-time concerns handled
+ * by the existing revocation/auth code.
+ *
+ * Pure: never mutates the input — returns a shallow-cloned state whose three
+ * maps are sanitized independently. A non-object map is dropped (undefined);
+ * entries with empty-string keys or values failing the per-map check are
+ * dropped individually.
+ */
+export function sanitizeAgentStateSecurityMaps<
+  T extends Pick<
+    AgentState,
+    | 'readAuthorizationsByPath'
+    | 'readAuthorizationHashesByPath'
+    | 'confirmedPostEditAnchorsByPath'
+  >,
+>(state: T): T {
+  const maps: AgentStateSecurityMapsView = state
+  return {
+    ...state,
+    readAuthorizationsByPath: sanitizeSecurityMapEntries(
+      maps.readAuthorizationsByPath,
+      (value): value is true => value === true,
+    ),
+    readAuthorizationHashesByPath: sanitizeSecurityMapEntries(
+      maps.readAuthorizationHashesByPath,
+      (value): value is string =>
+        typeof value === 'string' && SHA256_CONTENT_HASH_PATTERN.test(value),
+    ),
+    confirmedPostEditAnchorsByPath: sanitizeSecurityMapEntries(
+      maps.confirmedPostEditAnchorsByPath,
+      (value): value is ConfirmedPostEditAnchor =>
+        confirmedPostEditAnchorSchema.safeParse(value).success,
+    ),
+  }
 }
 
 /**
@@ -118,6 +237,149 @@ export interface ContextBudgetLedger {
   compactedAtTurn?: boolean
 }
 
+export type MemoryAuthorityReasonCode =
+  | 'invalid-authority'
+  | 'json-v1-selected'
+  | 'shadow-v2-selected'
+  | 'migration-checksum-mismatch'
+  | 'migration-rejected'
+  | 'migration-failed'
+  | 'lifecycle-append-rejected'
+  | 'lifecycle-append-failed'
+  | 'query-rejected'
+  | 'query-failed'
+  | 'query-threw'
+  | 'query-invalid-result'
+  /** Shared decision S4: repository/storage could not be reached this turn. */
+  | 'backend-unavailable'
+
+export type MemoryV1ImportWarningCode =
+  | 'goal-excluded'
+  | 'observation-cap-reached'
+  | 'legacy-evidence-unverified'
+  | 'stale-evidence-omitted'
+  | 'unsafe-path-omitted'
+  | 'empty-field-omitted'
+  | 'text-truncated'
+
+export type MemoryV1ImportState =
+  | { status: 'not-required' | 'no-record' }
+  | {
+      status: 'imported' | 'no-op'
+      revision: number
+      checksum: string
+      identity: string
+      importedObservations: number
+      omittedFields: number
+      warningCodes: MemoryV1ImportWarningCode[]
+    }
+  | {
+      status: 'failed'
+      revision?: number
+      checksum?: string
+      reason: Extract<
+        MemoryAuthorityReasonCode,
+        | 'migration-checksum-mismatch'
+        | 'migration-rejected'
+        | 'migration-failed'
+      >
+    }
+
+export interface MemoryParityCountsV2 {
+  v1: {
+    requirements: number
+    decisions: number
+    filesInspected: number
+    editsMade: number
+    validationResults: number
+    reviewReceipts: number
+    blockers: number
+    nextActions: number
+    historicalSummary: number
+    evidenceFresh: number
+    evidenceStale: number
+  }
+  v2: {
+    matched: number
+    verified: number
+    reusable: number
+    reread: number
+    historical: number
+    importedCoverage: number
+  }
+}
+
+export interface MemoryParityStateV2 {
+  revision: number
+  checksum: string
+  classification: 'match' | 'v1-ahead' | 'v2-ahead' | 'diverged' | 'unavailable'
+  reasonCodes: Array<
+    | 'coverage-equivalent'
+    | 'v1-counts-greater'
+    | 'v2-counts-greater'
+    | 'mixed-count-difference'
+    | 'import-unavailable'
+  >
+  counts: MemoryParityCountsV2
+}
+
+/** Plain-JSON authority and parity state for the current trusted turn. */
+export interface MemoryAuthorityStateV2 {
+  schemaVersion: 1
+  userInputId: string
+  requested: MemoryAuthorityMode
+  active: MemoryAuthorityMode
+  fallbackOccurred: boolean
+  reason?: MemoryAuthorityReasonCode
+  v1CompatibilityShadowAvailable: boolean
+  v1Import: MemoryV1ImportState
+  parity?: MemoryParityStateV2
+}
+
+/** Plain-JSON Memory V2 correlation state persisted with checkpoints. */
+export interface MemoryRuntimeStateV2 {
+  schemaVersion: 2
+  projectId: ProjectId
+  sessionId: MemorySessionId
+  sessionStartedAt: string
+  lastEventId?: MemoryEventId
+  activeTask: {
+    taskId: TaskId
+    status: TaskStatus
+  }
+  turn: {
+    userInputId: string
+    queryId: QueryId
+    startedAt: string
+    /** 'finishing' = terminal decision parked; terminal batch not yet committed. */
+    status: 'active' | 'finishing' | 'completed' | 'failed' | 'cancelled'
+  }
+  /**
+   * Terminal decision whose lifecycle batch has not been confirmed appended
+   * yet (reliability:terminal-state-precedes-terminal-append). Set when the
+   * turn enters 'finishing' and cleared once the terminal batch commits (or is
+   * confirmed idempotent on replay), so a later finishTurn can replay the same
+   * deterministic batch after a storage failure. Optional, so existing
+   * serialized states keep parsing unchanged.
+   */
+  pendingTerminal?: {
+    status: 'completed' | 'failed' | 'cancelled'
+    endedAt: string
+    /** Exact bounded query terminal decision used to rebuild the parked batch. */
+    query:
+      | {
+          outcome: 'completed'
+          counts: QueryCategoryCounts
+          degradation: QueryDegradationSummary
+        }
+      | {
+          outcome: 'failed'
+          error: string
+          retryable: boolean
+        }
+  }
+}
+
 export type AgentState = {
   /**
    * @deprecated agentId is replaced by runId
@@ -131,12 +393,6 @@ export type AgentState = {
   childRunIds: string[]
   messageHistory: Message[]
   stepsRemaining: number
-  /** Hash of the previous repeated-step watchdog observation. */
-  lastStepProgressSignature?: string
-  /** Consecutive count for the current repeated-step signature. */
-  repeatedStepProgressCount?: number
-  /** Consecutive text-only turns without task_completed for explicit-completion agents (bounded fallback, resets on tool use). */
-  consecutiveTextOnlyWithoutCompletion?: number
   /** Message from the most recent rejected set_output call, cleared once output is successfully set. Used to make the missing-structured-output retry name the real failure. */
   lastSetOutputError?: string
   creditsUsed: number
@@ -230,6 +486,27 @@ export type AgentState = {
   confirmedPostEditAnchorsByPath?: Record<string, ConfirmedPostEditAnchor>
   /** Why a path must be read again after a failed edit, persisted across turns. */
   editRereadRequirementsByPath?: Record<string, EditRereadRequirement>
+  /**
+   * Capped in-memory archive of pre-compaction transcripts (the recall leg of
+   * the compaction fidelity pipeline). Written by the runtime when a semantic
+   * pass or mechanical trim rewrites history; read only by `recall_context`
+   * results, which are budgeted per call — the archive itself never enters
+   * the model context. Optional so persisted sessions from before the field
+   * existed parse cleanly; the runtime caps snapshot count and size (see
+   * `packages/agent-runtime/src/util/context-archive.ts`).
+   */
+  compactionArchive?: Array<ContextArchiveSnapshot>
+  /**
+   * Capped list of background LLM consolidations of archived snapshots (the
+   * canary-gated prototype leg of the compaction fidelity pipeline). Written
+   * only by the runtime consolidator behind
+   * `programmaticConfig.backgroundSnapshotConsolidation === true`; read by
+   * `recall_context` results (budgeted per call). Optional so persisted
+   * sessions from before the field existed parse cleanly; the runtime caps
+   * count and summary size (see
+   * `packages/agent-runtime/src/util/context-consolidation.ts`).
+   */
+  contextConsolidations?: ContextConsolidation[]
   /** Runtime-owned orchestrator state that must survive message compaction. */
   base2ActiveWork?: Record<string, unknown>
   /** Durable intents/terminal receipts for detached subagent work. */
@@ -243,8 +520,22 @@ export type AgentState = {
     childRunId?: string
     receipt?: AgentReceipt
   }>
-  /** Typed operational memory compiled into each model request independently of chat summaries. */
+  /**
+   * Typed operational memory compiled into each model request independently of chat summaries.
+   *
+   * @deprecated Memory V1 compatibility surface; use Memory V2. Removal will occur only after the documented compatibility window and migration audit.
+   */
   taskMemory?: TaskMemoryV1
+  /** Opt-in runtime-neutral Memory V2 lifecycle state. */
+  memoryV2?: MemoryRuntimeStateV2
+  /** Requested and effective memory authority for the current trusted turn. */
+  memoryAuthority?: MemoryAuthorityStateV2
+  /** Validated retrieval context for the current trusted turn only. */
+  memoryV2Context?: MemoryTurnContextV2
+  /** Per-turn memory-cover reuse accumulator (S2 reuse receipt). Reset each turn. */
+  memoryReuse?: MemoryReuseReceiptV1
+  /** Snapshot of the completed turn's reuse receipt handed to the SDK coordinator for usage correlation; cleared by coordinator finishTurn. */
+  memoryUsageTurn?: MemoryReuseReceiptV1
   /** Monotonic workspace state shared by reads, mutations, indexing, validation, and review. */
   workspaceState?: WorkspaceStateV1
   /**
@@ -418,8 +709,6 @@ export function getInitialAgentState(): AgentState {
     childRunIds: [],
     messageHistory: [],
     stepsRemaining: MAX_AGENT_STEPS_DEFAULT,
-    lastStepProgressSignature: undefined,
-    repeatedStepProgressCount: 0,
     creditsUsed: 0,
     directCreditsUsed: 0,
     cacheInputTokens: 0,
@@ -435,6 +724,11 @@ export function getInitialAgentState(): AgentState {
     confirmedPostEditAnchorsByPath: {},
     editRereadRequirementsByPath: {},
     taskMemory: undefined,
+    memoryV2: undefined,
+    memoryAuthority: undefined,
+    memoryV2Context: undefined,
+    memoryReuse: undefined,
+    memoryUsageTurn: undefined,
     workspaceState: createInitialWorkspaceState(),
     backgroundAgentJobs: [],
   }

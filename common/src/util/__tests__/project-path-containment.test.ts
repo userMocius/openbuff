@@ -21,9 +21,11 @@ import {
   ensureExternalReadRootsConfigured,
   getExternalReadRoots,
   getOwnedTempRoots,
+  hasWin32AliasedSegment,
   isExternalReadPath,
   isOwnedTempPath,
   isPathInsideProject,
+  normalizePathSpelling,
   resetExternalReadRootsForTesting,
   resolveProjectPath,
   resolveProjectPathForFileSystemRead,
@@ -491,10 +493,7 @@ describe('OS temp root containment exception', () => {
       // nor a basename-only alias guard (`config` normalizes to itself)
       // fires. Paths are built by concatenation so the raw alias survives
       // into the input on every platform.
-      const aliased = [
-        `${tempRoot}/.aws /config`,
-        `${tempRoot}/.kube ./config`,
-      ]
+      const aliased = [`${tempRoot}/.aws /config`, `${tempRoot}/.kube ./config`]
       for (const target of aliased) {
         expect(isOwnedTempPath(target)).toBe(false)
         expect(resolveProjectPath('/some/project', target)).toBeNull()
@@ -788,7 +787,10 @@ describeWithOutsideFixtures('external read root allowlist', () => {
       // real `.env` on Windows. Paths built by concatenation (not `path.join`)
       // so the raw alias survives into the input on every platform, matching
       // the owned-temp twin's refusal of the identical shape.
-      const aliased = [`${allowedRoot}/.env `, `${allowedRoot}/credentials.json `]
+      const aliased = [
+        `${allowedRoot}/.env `,
+        `${allowedRoot}/credentials.json `,
+      ]
       for (const target of aliased) {
         expect(isExternalReadPath(target)).toBe(false)
         expect(resolveProjectPathForRead(projectRoot, target)).toBeNull()
@@ -1013,9 +1015,9 @@ describeWithOutsideFixtures('external read root allowlist', () => {
 
       // Same project mid-run: this is the configure-once violation the registry
       // exists to prevent, owner or not.
-      expect(() =>
-        configureExternalReadRoots([siblingRoot], projectA),
-      ).toThrow(Error)
+      expect(() => configureExternalReadRoots([siblingRoot], projectA)).toThrow(
+        Error,
+      )
       expect(getExternalReadRoots()).toEqual([path.resolve(allowedRoot)])
 
       const refused = ensureExternalReadRootsConfigured([siblingRoot], projectA)
@@ -1057,5 +1059,106 @@ describeWithOutsideFixtures('external read root allowlist', () => {
       expect(refused.status).toBe('refused-changed')
       expect(getExternalReadRoots()).toEqual([path.resolve(allowedRoot)])
     })
+  })
+})
+
+describe('normalizePathSpelling', () => {
+  test('unifies separators and drops . and empty segments', () => {
+    expect(normalizePathSpelling('src/./foo.ts')).toEqual({
+      canonical: 'src/foo.ts',
+      changed: true,
+      hasTraversalSegment: false,
+    })
+    // Mixed separators and duplicate separators collapse to the same
+    // canonical form: a non-normalized spelling must never reach a filter
+    // that was written against the canonical one.
+    expect(normalizePathSpelling('src\\.\\foo.ts')).toEqual({
+      canonical: 'src/foo.ts',
+      changed: true,
+      hasTraversalSegment: false,
+    })
+    expect(normalizePathSpelling('src//foo.ts')).toEqual({
+      canonical: 'src/foo.ts',
+      changed: true,
+      hasTraversalSegment: false,
+    })
+    expect(normalizePathSpelling('src/foo.ts')).toEqual({
+      canonical: 'src/foo.ts',
+      changed: false,
+      hasTraversalSegment: false,
+    })
+  })
+
+  test('keeps the leading separator for absolute inputs', () => {
+    expect(normalizePathSpelling('/repo/src/file.ts')).toEqual({
+      canonical: '/repo/src/file.ts',
+      changed: false,
+      hasTraversalSegment: false,
+    })
+    expect(normalizePathSpelling('\\repo\\file.ts')).toEqual({
+      canonical: '/repo/file.ts',
+      changed: true,
+      hasTraversalSegment: false,
+    })
+  })
+
+  test('PRESERVES .. segments verbatim and flags them via hasTraversalSegment', () => {
+    // The load-bearing invariant: collapsing `..` here would contradict the
+    // module's raw-input traversal refusal (the entry points refuse any raw
+    // `..` above `path.resolve`), so `..` must survive in `canonical` AND set
+    // the traversal flag.
+    expect(normalizePathSpelling('src/../outside.ts')).toEqual({
+      canonical: 'src/../outside.ts',
+      changed: false,
+      hasTraversalSegment: true,
+    })
+    expect(normalizePathSpelling('a/../../b')).toEqual({
+      canonical: 'a/../../b',
+      changed: false,
+      hasTraversalSegment: true,
+    })
+    // `..` survives even alongside dropped `.`/empty segments.
+    expect(normalizePathSpelling('a/./../b//c')).toEqual({
+      canonical: 'a/../b/c',
+      changed: true,
+      hasTraversalSegment: true,
+    })
+  })
+
+  test('collapses a trailing separator away', () => {
+    expect(normalizePathSpelling('src/foo/')).toEqual({
+      canonical: 'src/foo',
+      changed: true,
+      hasTraversalSegment: false,
+    })
+  })
+
+  test('empty input returns the documented identity', () => {
+    expect(normalizePathSpelling('')).toEqual({
+      canonical: '',
+      changed: false,
+      hasTraversalSegment: false,
+    })
+  })
+})
+
+describe('hasWin32AliasedSegment', () => {
+  test('detects trailing dot/space aliasing in ANY segment, without mutating the path', () => {
+    // Win32 strips trailing dots/spaces from every segment, so these spellings
+    // resolve to different real paths than they spell. Detection only: the
+    // helper must not rewrite the input (matching the raw spellings the
+    // aliased-path refusals in this module's resolvers see).
+    expect(hasWin32AliasedSegment('/tmp/.env ')).toBe(true)
+    expect(hasWin32AliasedSegment('/tmp/.env.')).toBe(true)
+    expect(hasWin32AliasedSegment('/tmp/.aws /config')).toBe(true)
+    expect(hasWin32AliasedSegment('src/notes./file.ts')).toBe(true)
+    expect(hasWin32AliasedSegment('trailing space ')).toBe(true)
+  })
+
+  test('is false for clean paths, including names that merely contain dots', () => {
+    expect(hasWin32AliasedSegment('/tmp/notes.txt')).toBe(false)
+    expect(hasWin32AliasedSegment('/tmp/.env')).toBe(false)
+    expect(hasWin32AliasedSegment('src/file.ts')).toBe(false)
+    expect(hasWin32AliasedSegment('')).toBe(false)
   })
 })

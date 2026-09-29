@@ -133,6 +133,20 @@ function gateFileMarker(path: string): string {
     ) {
       return 'unreadable:outside-project'
     }
+    // Existence probe BEFORE the component walk (mirrors production): a
+    // nonexistent absolute path — missing leaf OR missing intermediate
+    // directory — is attested-by-absence ('missing') without ever reaching
+    // realpathSync/readFileSync; a present-but-unstatable path stays
+    // fail-closed. lstatSync (not existsSync) so a dangling symlink's link
+    // entry still counts as present.
+    try {
+      lstatSync(absolutePath)
+    } catch (probeError) {
+      if ((probeError as { code?: unknown }).code === 'ENOENT') {
+        return 'missing'
+      }
+      return 'unreadable:lstat-failed'
+    }
     const pathSegments = projectRelativePath.split(sep).filter(Boolean)
     const symlinkParts: string[] = []
     let entryPath = cwd
@@ -197,11 +211,21 @@ function reviewableFingerprint(path: string): string {
 }
 
 /**
- * Load the REAL production `readGateFileContentMarker` from base2.ts by
- * extracting its inline declaration, transpiling, and evaluating it as a
- * standalone function (no module closure needed: it resolves fs/path/crypto
- * lazily via process.getBuiltinModule / global require at call time). This is
- * the parity oracle the test-local `gateFileMarker` must agree with.
+ * Load the REAL production gate marker logic from base2.ts by extracting its
+ * inline declaration, transpiling, and evaluating it as a standalone function
+ * (no module closure needed: it resolves fs/path/crypto lazily via
+ * process.getBuiltinModule / global require at call time). This is the parity
+ * oracle the test-local `gateFileMarker` must agree with.
+ *
+ * The extracted symbol is `readGateFileContentMarkerUncached`, the shipped
+ * body the M3-T2 cached wrapper delegates to. The wrapper only adds a
+ * liveness cache (size+mtime fstat fast path) around the SAME marker strings
+ * — it can never produce a different marker for the same bytes — so the
+ * uncached body is the semantically complete oracle. The uncached body still
+ * touches the closure-level `gateMarkerCache`/`GATE_MARKER_CACHE_MAX`
+ * bindings on its cache-STAMPING path (which never affects the returned
+ * marker string), so the harness supplies `GATE_MARKER_CACHE_MAX` extracted
+ * verbatim from production source plus a fresh transient Map.
  *
  * Inline extraction is preferred over importing the member from base2 because
  * importing would pull in the whole module and run its top-level module-closure
@@ -218,10 +242,94 @@ function loadProductionGateFileContentMarker(): (path: string) => string {
   const base2JavaScript = transpiler.transformSync(base2Source)
   const helperSource = extractInlineFunctionSource(
     base2JavaScript,
-    'readGateFileContentMarker',
+    'readGateFileContentMarkerUncached',
   )
+  // readGateFileContentMarker references the hoisted in-handleSteps const
+  // GATE_FILE_MISSING_CONTENT_MARKER (the 'missing' deletion sentinel). That
+  // binding sits OUTSIDE the extracted function span, so the standalone
+  // `new Function` reconstruction would leave it undefined and the ENOENT
+  // probe would throw a ReferenceError (surfacing as `unreadable:unknown`
+  // instead of `missing`). Slice the hoisted declaration from the transpiled
+  // source and prepend it to the evaluated scope, exactly as
+  // specialist-router-parity.test.ts does for hoisted constants. The value is
+  // pulled verbatim from production source, so the parity property is kept.
+  const hoistStart = base2JavaScript.indexOf(
+    'const GATE_FILE_MISSING_CONTENT_MARKER',
+  )
+  const inlineFnStart = base2JavaScript.indexOf(
+    'function readGateFileContentMarkerUncached(',
+  )
+  if (hoistStart < 0 || inlineFnStart < 0 || hoistStart > inlineFnStart) {
+    throw new Error(
+      'Unable to find hoisted GATE_FILE_MISSING_CONTENT_MARKER before readGateFileContentMarkerUncached',
+    )
+  }
+  // End-of-declaration robust to a `;` inside the string-literal initializer:
+  // find the `=`, the initializer's opening quote (either quote style), its
+  // matching closing quote, then the terminating `;`. A bare indexOf(';')
+  // could mis-slice if the literal ever contained a `;`.
+  const equalsIndex = base2JavaScript.indexOf('=', hoistStart)
+  const openQuoteOffset =
+    equalsIndex < 0 ? -1 : base2JavaScript.slice(equalsIndex).search(/['"]/)
+  const openQuoteIndex =
+    openQuoteOffset < 0 ? -1 : equalsIndex + openQuoteOffset
+  const closeQuoteIndex =
+    openQuoteIndex < 0
+      ? -1
+      : base2JavaScript.indexOf(
+          base2JavaScript.charAt(openQuoteIndex),
+          openQuoteIndex + 1,
+        )
+  const hoistEnd =
+    closeQuoteIndex < 0 ? -1 : base2JavaScript.indexOf(';', closeQuoteIndex)
+  if (hoistEnd < 0) {
+    throw new Error(
+      'Unable to find the end of the GATE_FILE_MISSING_CONTENT_MARKER declaration',
+    )
+  }
+  const hoistedConstSource = base2JavaScript.slice(hoistStart, hoistEnd + 1)
+  // Fail-fast structural assertion on the slice BEFORE evaluating: it must be
+  // exactly the hoisted const declaration — starting with the const name,
+  // terminated by `;`, and containing exactly one `=` (its initializer). The
+  // check is quote-style agnostic because the transpiled initializer may use
+  // either quote. If base2.ts is ever reordered so the const lands after
+  // readGateFileContentMarker (caught by the hoistStart/inlineFnStart
+  // ordering guard above) or the const is moved inside the function body
+  // (caught here when the slice loses declaration shape), these guards throw
+  // a clear error instead of the `new Function` eval failing with a confusing
+  // ReferenceError that the parity assertion would only surface as
+  // `unreadable:unknown` — or worse, a silently wrong sentinel.
+  const sliceEqualsCount = hoistedConstSource.split('=').length - 1
+  if (
+    !hoistedConstSource.startsWith('const GATE_FILE_MISSING_CONTENT_MARKER') ||
+    !hoistedConstSource.endsWith(';') ||
+    sliceEqualsCount !== 1
+  ) {
+    throw new Error(
+      `loadProductionGateFileContentMarker: hoisted GATE_FILE_MISSING_CONTENT_MARKER slice is malformed (layout changed?): ${JSON.stringify(hoistedConstSource.slice(0, 120))}`,
+    )
+  }
+  // The uncached body stamps the M3-T2 liveness cache on every successful
+  // sha256 marker, so the eval scope needs the closure bindings it expects:
+  // GATE_MARKER_CACHE_MAX pulled verbatim from production source (parity
+  // property kept) and a fresh transient Map (cache state never affects the
+  // returned marker). Fail fast with clear errors instead of letting the
+  // stamping path throw a confusing ReferenceError mid-assertion.
+  const cacheMaxStart = base2JavaScript.indexOf('const GATE_MARKER_CACHE_MAX')
+  if (cacheMaxStart < 0) {
+    throw new Error(
+      'Unable to find GATE_MARKER_CACHE_MAX declaration for the marker-cache stamping path',
+    )
+  }
+  const cacheMaxEnd = base2JavaScript.indexOf(';', cacheMaxStart)
+  if (cacheMaxEnd < 0) {
+    throw new Error(
+      'Unable to find the end of the GATE_MARKER_CACHE_MAX declaration',
+    )
+  }
+  const cacheMaxSource = base2JavaScript.slice(cacheMaxStart, cacheMaxEnd + 1)
   const fn = new Function(
-    `"use strict";\n${helperSource}\nreturn readGateFileContentMarker`,
+    `"use strict";\n${hoistedConstSource}\n${cacheMaxSource}\nconst gateMarkerCache = new Map()\n${helperSource}\nreturn readGateFileContentMarkerUncached`,
   ) as () => (path: string) => string
   return fn()
 }
@@ -1226,7 +1334,15 @@ describe('base2 reviewer spawn conditions e2e', () => {
         const symlinkAbsolute = join(tempDir, 'fixture.ts')
         try {
           symlinkSync(target, symlinkAbsolute, 'file')
-        } catch {
+        } catch (symlinkError) {
+          // POSIX symlink creation can still fail (e.g. EPERM under a
+          // sandboxed filesystem); log the skip so it is visible, then return.
+          const code = String(
+            (symlinkError as { code?: unknown }).code ?? 'unknown',
+          )
+          console.warn(
+            `parity guard: skipping external-symlink sub-case (symlinkSync failed, code=${code})`,
+          )
           return
         }
         const symlinkPath = relative(process.cwd(), symlinkAbsolute).replace(
@@ -1256,7 +1372,15 @@ describe('base2 reviewer spawn conditions e2e', () => {
         const internalSymlinkAbsolute = join(linkDir, 'link.ts')
         try {
           symlinkSync(internalTarget, internalSymlinkAbsolute, 'file')
-        } catch {
+        } catch (symlinkError) {
+          // POSIX symlink creation can still fail (e.g. EPERM under a
+          // sandboxed filesystem); log the skip so it is visible, then return.
+          const code = String(
+            (symlinkError as { code?: unknown }).code ?? 'unknown',
+          )
+          console.warn(
+            `parity guard: skipping internal-symlink sub-case (symlinkSync failed, code=${code})`,
+          )
           return
         }
         const internalSymlinkPath = relative(
@@ -1289,7 +1413,15 @@ describe('base2 reviewer spawn conditions e2e', () => {
         try {
           symlinkSync(realDir, aliasDir, 'dir')
           midSymlinkAbsolute = join(aliasDir, 'sub', 'file.ts')
-        } catch {
+        } catch (symlinkError) {
+          // POSIX symlink creation can still fail (e.g. EPERM under a
+          // sandboxed filesystem); log the skip so it is visible, then return.
+          const code = String(
+            (symlinkError as { code?: unknown }).code ?? 'unknown',
+          )
+          console.warn(
+            `parity guard: skipping mid-path-symlink sub-case (symlinkSync failed, code=${code})`,
+          )
           return
         }
         const midSymlinkPath = relative(

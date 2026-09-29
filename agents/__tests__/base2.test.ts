@@ -4934,17 +4934,34 @@ describe('base2 verification and reviewer gates', () => {
         ).value,
       ).toMatchObject({ toolName: 'add_message' })
 
-      expect(gen.next().value).toMatchObject({
+      const repairSpawn = gen.next().value as any
+      expect(repairSpawn).toMatchObject({
         toolName: 'spawn_agents',
         input: { agents: [{ agent_type: 'repair-editor' }] },
       })
-      // Receipt status blocked + empty findingsAddressed, but changedFiles present:
-      // parent must re-enter validation instead of hard-blocking the gate.
-      // The scratch file's bytes really change so the no-progress guard stays
-      // quiet and the mutation-progress path is what's under test here.
+      // M1-T4c: byte progress alone no longer satisfies the repair gate. The
+      // receipt may stay 'blocked', but it must still address at least one
+      // open finding id — extracted from the repair prompt the way a real
+      // repair-editor reads it — while the scratch file's bytes really change
+      // so the no-progress guard stays quiet and the mutation-progress path
+      // continues into re-validation.
+      // Plain-string blockers are minted `RF-<n>-<fnv-hash>` ids and listed in
+      // the repair prompt as `<id>: <text>` (text keeps its BLOCKING prefix).
+      const findingId =
+        String(repairSpawn.input.agents[0]?.prompt ?? '').match(
+          /^(RF-\d+-[0-9a-f]+):/m,
+        )?.[1] ?? ''
+      expect(findingId).not.toBe('')
       writeFileSync(tmpFile, 'export const value = 2 // partial repair\n')
       expect(
-        gen.next(progressOnlyRepairReceipt([gateFile]) as any).value,
+        gen.next(
+          repairSpawnReport({
+            receiptId: 'repair-progress-addressing-finding',
+            status: 'blocked',
+            changedFiles: [{ path: gateFile }],
+            findingsAddressed: [findingId],
+          }) as any,
+        ).value,
       ).toMatchObject({
         toolName: 'git_status',
       })
@@ -4966,6 +4983,55 @@ describe('base2 verification and reviewer gates', () => {
           ],
         } as any).value,
       ).toMatchObject({ toolName: 'spawn_agent_inline' })
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  // M1-T4c (fail closed): byte progress with ZERO addressed findings no longer
+  // satisfies the reviewer repair gate — an unrelated edit must hard-block the
+  // phase instead of re-entering validation and re-review with nothing cleared.
+  test('repair receipt with progress but zero addressed findings is rejected', () => {
+    const tmpDir = makeProjectTempDir('base2-repair-zero-addressed-')
+    try {
+      const tmpFile = join(tmpDir, 'a.ts')
+      const gateFile = normalizeGateFilePath(tmpFile)
+      writeFileSync(tmpFile, 'export const value = 1\n')
+      const base2 = createBase2('default')
+      const agentState = { agentId: 'base2' }
+      const gen = base2.handleSteps!({
+        agentState,
+        prompt: 'Make the requested change now please',
+        params: {},
+      } as any)
+
+      gen.next() // git_status
+      gen.next({
+        toolResult: [{ type: 'json', value: { status: '' } }],
+      } as any) // spawn_agent_inline
+      gen.next() // STEP
+      gen.next({
+        stepsComplete: true,
+        toolResult: [{ type: 'json', value: editReceipt(gateFile) }],
+      } as any) // git_status
+      gen.next({
+        toolResult: [{ type: 'json', value: { status: ` M ${gateFile}` } }],
+      } as any) // run_file_change_hooks
+      gen.next({
+        toolResult: [{ type: 'json', value: [] }],
+      } as any) // git_status
+      const reviewCall = gen.next({
+        toolResult: [{ type: 'json', value: { status: ` M ${gateFile}` } }],
+      } as any).value as any
+      gen.next(
+        attestedReviewerResult(reviewCall, 'BLOCKING', [
+          'Fix the edge case.',
+        ]) as any,
+      ) // add_message
+      gen.next() // repair-editor spawn
+      writeFileSync(tmpFile, 'export const value = 2 // unrelated edit\n')
+      gen.next(progressOnlyRepairReceipt([gateFile]) as any)
+      expect((agentState as any).base2ActiveWork.currentPhase).toBe('blocked')
     } finally {
       rmSync(tmpDir, { recursive: true, force: true })
     }
@@ -7188,12 +7254,13 @@ describe('base2 verification and reviewer gates', () => {
         findingText,
       )
       const active = (agentState as any).base2ActiveWork
-      // The repair round condoned the NON_BLOCKING class only.
+      // The repair round condoned the NON_BLOCKING class only (Q4-2: keys are
+      // reviewer-namespaced).
       expect(active.condonedFindingKeys).toContain(
-        `NON_BLOCKING::text:${findingText}`,
+        `code-reviewer::NON_BLOCKING::text:${findingText}`,
       )
       expect(active.condonedFindingKeys).not.toContain(
-        `BLOCKING::text:${findingText}`,
+        `code-reviewer::BLOCKING::text:${findingText}`,
       )
       // Same text, escalated verdict class: new information, must stay open.
       const secondReview = attestedReviewerResult(
@@ -7281,12 +7348,12 @@ describe('base2 verification and reviewer gates', () => {
       const active = (agentState as any).base2ActiveWork
       // The repair round condoned the BLOCKING class only; the NON_BLOCKING key
       // is never written, so convergence relies on the de-escalation allowance
-      // rather than on a same-class key.
+      // rather than on a same-class key. (Q4-2: reviewer-namespaced keys.)
       expect(active.condonedFindingKeys).toContain(
-        `BLOCKING::text:${findingText}`,
+        `code-reviewer::BLOCKING::text:${findingText}`,
       )
       expect(active.condonedFindingKeys).not.toContain(
-        `NON_BLOCKING::text:${findingText}`,
+        `code-reviewer::NON_BLOCKING::text:${findingText}`,
       )
       // Same identity, DE-ESCALATED verdict class: still condoned.
       const secondReview = attestedReviewerResult(
@@ -7354,14 +7421,15 @@ describe('base2 verification and reviewer gates', () => {
       )
       const active = (agentState as any).base2ActiveWork
       const condonedKeys = active.condonedFindingKeys as string[]
-      // (a) the reviewer-supplied id produced an id-keyed condone entry.
-      expect(condonedKeys).toContain(`NON_BLOCKING::id:${findingId}`)
-      expect(condonedKeys).toContain(`NON_BLOCKING::text:${blockerText}`)
+      // (a) the reviewer-supplied id produced an id-keyed condone entry
+      // (Q4-2: reviewer-namespaced).
+      expect(condonedKeys).toContain(`code-reviewer::NON_BLOCKING::id:${findingId}`)
+      expect(condonedKeys).toContain(`code-reviewer::NON_BLOCKING::text:${blockerText}`)
       // (c) the record-less finding got a minted RF-... id, which is positional
       // and therefore never keyed on.
-      expect(condonedKeys).toContain(`NON_BLOCKING::text:${plainFindingText}`)
+      expect(condonedKeys).toContain(`code-reviewer::NON_BLOCKING::text:${plainFindingText}`)
       expect(condonedKeys.filter((key) => key.includes('::id:'))).toEqual([
-        `NON_BLOCKING::id:${findingId}`,
+        `code-reviewer::NON_BLOCKING::id:${findingId}`,
       ])
       expect(
         condonedKeys.some((key) => /::id:RF-\d+-[0-9a-f]{8}$/.test(key)),
@@ -10251,16 +10319,31 @@ describe('base2 reviewer round-findings telemetry', () => {
         (agentState as any).base2ActiveWork.openReviewerBlockers,
       ).toContain(`NON_BLOCKING: ${findingText}`)
 
-      expect(gen.next().value).toMatchObject({
+      const repairSpawn = gen.next().value as any
+      expect(repairSpawn).toMatchObject({
         toolName: 'spawn_agents',
         input: { agents: [{ agent_type: 'repair-editor' }] },
       })
-      // Progress-only receipt: real bytes change (so the no-progress guard
-      // passes) but no finding id is claimed, so nothing is condoned and the
-      // same text legitimately returns as CARRIED next round.
+      // M1-T4c: byte progress alone no longer satisfies the repair gate when
+      // open finding ids exist — the receipt must address at least one. The
+      // receipt stays 'blocked' (so nothing is condoned and the same text
+      // legitimately returns as CARRIED next round) while still naming the
+      // open finding id minted into the repair prompt.
+      const carriedFindingId =
+        String(repairSpawn.input.agents[0]?.prompt ?? '').match(
+          /^(RF-\d+-[0-9a-f]+):/m,
+        )?.[1] ?? ''
+      expect(carriedFindingId).not.toBe('')
       writeFileSync(tmpFile, 'export const value = 2 // touched\n')
       expect(
-        gen.next(progressOnlyRepairReceipt([gateFile]) as any).value,
+        gen.next(
+          repairSpawnReport({
+            receiptId: 'repair-progress-carried-finding',
+            status: 'blocked',
+            changedFiles: [{ path: gateFile }],
+            findingsAddressed: [carriedFindingId],
+          }) as any,
+        ).value,
       ).toMatchObject({ toolName: 'git_status' })
       expect(
         gen.next(feedJson({ status: ` M ${gateFile}` })).value,
@@ -10397,13 +10480,17 @@ describe('base2 reviewer re-review round ledger', () => {
     return String(reviewCall.input.agents[0].prompt)
   }
 
-  function codeReviewerFinding(text: string, index: number) {
+  // `files` must name REAL on-disk paths: the turn-start prune drops findings
+  // whose every file resolves to the `missing` content marker, so a virtual
+  // path here would prune the seeded findings before the review packet is
+  // built and silently empty the ledger under test.
+  function codeReviewerFinding(text: string, index: number, files: string[]) {
     return {
       id: `RF-${index + 1}-0000000${index}`,
       gateId: 'code-reviewer:prior-snapshot',
       text,
       status: 'open' as const,
-      files: ['src/a.ts'],
+      files,
       snapshotFingerprint: 'prior-snapshot',
       reviewer: 'code-reviewer' as const,
       createdAt: '2025-01-01T00:00:00.000Z',
@@ -10452,10 +10539,15 @@ describe('base2 reviewer re-review round ledger', () => {
       const gateFile = normalizeGateFilePath(join(tmpDir, 'a.ts'))
       writeFileSync(join(tmpDir, 'a.ts'), 'export const value = 1\n')
       const codeFindings = [
-        codeReviewerFinding('NON_BLOCKING: Tighten the early-return guard.', 0),
+        codeReviewerFinding(
+          'NON_BLOCKING: Tighten the early-return guard.',
+          0,
+          [gateFile],
+        ),
         codeReviewerFinding(
           'BLOCKING: [code-reviewer:tests:missing-case] Add a case for the empty payload.',
           1,
+          [gateFile],
         ),
       ]
       const securityFinding = {
@@ -10514,7 +10606,9 @@ describe('base2 reviewer re-review round ledger', () => {
       const openReviewerFindings = Array.from(
         { length: 14 },
         (_unused, index) =>
-          codeReviewerFinding(`NON_BLOCKING: Finding number ${index}.`, index),
+          codeReviewerFinding(`NON_BLOCKING: Finding number ${index}.`, index, [
+            gateFile,
+          ]),
       )
       const prompt = driveSeededStateToReviewPrompt(
         gateFile,
@@ -12893,5 +12987,1205 @@ describe('base2 EXECUTE_PLAN gate-issued plan-task receipts', () => {
     expect(executePlan.stepPrompt).toContain(
       'never reuse an ID from an earlier gate-pass message',
     )
+  })
+})
+
+describe('base2 deleted-before-first-snapshot gate files', () => {
+  // Regression for the live scripts/perf-probe-tmp.ts loop: a pending gate
+  // file that is DELETED before any snapshot captured its bytes spawned a
+  // specialist that could only return `BLOCKING: ...assigned-file-unreadable...`,
+  // and the open finding that review recorded was never cleared — every turn
+  // rehydrated it into an owed revalidation, which evicted the specialist's
+  // credit and re-spawned it forever. Deletion now resolves to the `missing`
+  // content marker (attested-by-absence, so a `missing`-keyed credit stays
+  // fresh), and open findings whose files are ALL missing are pruned at turn
+  // start, before the owed-set rehydration can re-arm the reviewer family.
+  test('prunes stale unreadable findings for a deleted-never-snapshotted file and never re-spawns its specialist', () => {
+    const tmpDir = makeProjectTempDir('base2-deleted-before-snapshot-')
+    try {
+      // The parent directory exists; only the leaf file is gone (never
+      // created, never tracked, never committed — exactly the live bug).
+      mkdirSync(join(tmpDir, 'scripts'), { recursive: true })
+      const deletedFile = normalizeGateFilePath(
+        join(tmpDir, 'scripts', 'perf-probe-tmp.ts'),
+      )
+      const staleBlocker =
+        'BLOCKING: performance-specialist assigned-file-unreadable: scripts/perf-probe-tmp.ts'
+      const base2 = createBase2('default')
+      const agentState = {
+        agentId: 'base2-custom',
+        base2ActiveWork: {
+          changedFiles: [deletedFile],
+          touchedFiles: [deletedFile],
+          pendingGateFiles: [deletedFile],
+          currentPhase: 'awaiting_validation',
+          latestWorkSummary: '',
+          openReviewerBlockers: [staleBlocker],
+          // The stale finding the live bug could never clear: its only file is
+          // deleted, so every fresh review returned the same unreadable
+          // blocker and the finding was re-created each time.
+          openReviewerFindings: [
+            {
+              id: 'RF-1-deadbeef',
+              gateId: 'performance-specialist:prior-snapshot',
+              text: staleBlocker,
+              status: 'open' as const,
+              files: [deletedFile],
+              snapshotFingerprint: 'prior-snapshot',
+              reviewer: 'performance-specialist',
+              createdAt: '2025-01-01T00:00:00.000Z',
+            },
+          ],
+          lastValidationSummary: '',
+          nextRequiredAction: '',
+          lastPinnedStateMessage: '',
+          gatePassedFiles: [],
+          gatePassedPendingFiles: [],
+          gatePassedReviewerVerdict: '',
+          gatePassedValidationSummary: '',
+          gatePassedFingerprint: '',
+          lastReviewerGateSkipReason: '',
+          reviewReceipts: [],
+          // The stale owed-set entry the prune must retire: both the legacy
+          // scalar and the list point at the pruned reviewer family, so a
+          // missing clear would leave a dead revalidation reference behind.
+          requiredReviewerRevalidation: 'performance-specialist',
+          owedReviewerRevalidations: ['performance-specialist'],
+          testWriterGateDone: true,
+          docWriterGateDone: true,
+          securityReviewGateDone: true,
+          preEditSecurityReviewDone: true,
+          // The specialist already passed once against the deleted bytes, so
+          // its per-file credit marker is the stable `missing` marker. Before
+          // the fix the marker was not `missing`, so credit freshness treated
+          // it as stale on every sweep — the other half of the loop.
+          specialistReviewGatesDone: ['performance-specialist'],
+          specialistReviewGateFingerprints: {
+            'performance-specialist': buildFingerprint(
+              [{ file: deletedFile, contentMarker: 'missing' }],
+              '',
+            ),
+          },
+          specialistReviewFileMarkers: {
+            'performance-specialist': { [deletedFile]: 'missing' },
+          },
+          auxGatesLastPendingFiles: [deletedFile],
+        },
+      }
+      const gen = base2.handleSteps!({
+        agentState,
+        prompt: 'Please finish the pending performance finding.',
+        params: {},
+      } as any)
+
+      expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+      // Turn start, BEFORE the owed-set rehydration: the all-missing finding
+      // and its verbatim blocker are pruned, so nothing re-arms a
+      // performance-specialist revalidation from stale serialized state. The
+      // prune also retires the stale owed-set entry that pointed at the
+      // pruned family: both the legacy scalar and the list are cleared.
+      const turnStartWork = (agentState as any).base2ActiveWork
+      expect(turnStartWork.openReviewerFindings).toEqual([])
+      expect(turnStartWork.openReviewerBlockers).toEqual([])
+      expect(turnStartWork.owedReviewerRevalidations).toEqual([])
+      expect(turnStartWork.requiredReviewerRevalidation).toBeUndefined()
+
+      // The file is untracked and deleted, so git status is clean.
+      expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+        toolName: 'spawn_agent_inline',
+        input: { agent_type: 'context-pruner' },
+      })
+      const maybePinned = gen.next().value
+      if (maybePinned !== 'STEP') {
+        expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+        expect(gen.next().value).toBe('STEP')
+      }
+      expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+        toolName: 'git_status',
+      })
+      // No specialist spawn: the fresh `missing`-marker credit routes nothing.
+      // Validation hooks run next for the still-pending (deleted) file.
+      const hooksCall = gen.next(feedJson({ status: '' }))
+      expect(hooksCall.value).toMatchObject({
+        toolName: 'run_file_change_hooks',
+        input: { files: [deletedFile] },
+      })
+      expect(gen.next(feedJson([])).value).toMatchObject({
+        toolName: 'git_status',
+      })
+      const reviewCall = gen.next(feedJson({ status: '' })).value as any
+      expect(reviewCall).toMatchObject({
+        toolName: 'spawn_agents',
+        input: { agents: [{ agent_type: 'code-reviewer' }] },
+      })
+      const spawnedAgentTypes = (
+        reviewCall.input.agents as Array<{ agent_type: string }>
+      ).map((agent) => agent.agent_type)
+      expect(spawnedAgentTypes).not.toContain('performance-specialist')
+      // The snapshot binds the deleted file through the `missing` marker...
+      const reviewPrompt = String(reviewCall.input.agents[0].prompt)
+      expect(reviewPrompt).toContain(`${deletedFile}\tmissing`)
+      const snapshotFingerprint =
+        reviewPrompt.match(
+          /Snapshot fingerprint \(echo exactly\): ([^\n]+)/,
+        )?.[1] ?? ''
+      // ...so the reviewer attests-by-absence: reviewedFiles legitimately
+      // omits the deleted file and the review still passes.
+      expect(
+        gen.next({
+          toolResult: [
+            {
+              type: 'json',
+              value: [
+                {
+                  schemaVersion: 1,
+                  verdict: 'LOOKS_GOOD',
+                  snapshotFingerprint,
+                  reviewedFiles: [],
+                  findings: [],
+                  coverage: 'covered',
+                  dimensions: {},
+                  requirementCoverage: [],
+                },
+              ],
+            },
+          ],
+        } as any).value,
+      ).toMatchObject({ toolName: 'git_status' })
+      const gatePassed = gen.next(feedJson({ status: '' }))
+      expect(gatePassed.value).toMatchObject({
+        toolName: 'add_message',
+        input: { role: 'user' },
+      })
+      expect((gatePassed.value as any).input.content).toMatch(
+        /reviewer gate passed with LOOKS_GOOD/i,
+      )
+      const finalWork = (agentState as any).base2ActiveWork
+      expect(finalWork.currentPhase).toBe('final_response_allowed')
+      expect(finalWork.openReviewerBlockers).toEqual([])
+      expect(finalWork.openReviewerFindings).toEqual([])
+      // The deletion is credited as a stable gate-passed state, so later turns
+      // do not re-arm on it either.
+      expect(finalWork.gatePassedFiles).toEqual([deletedFile])
+      expect(finalWork.specialistReviewGatesDone).toContain(
+        'performance-specialist',
+      )
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps open findings that name any still-existing or unreadable-but-present file', () => {
+    const tmpDir = makeProjectTempDir('base2-prune-missing-findings-keep-')
+    try {
+      const presentFile = join(tmpDir, 'exists.ts')
+      writeFileSync(presentFile, 'export const here = 1\n')
+      const presentGateFile = normalizeGateFilePath(presentFile)
+      const missingGateFile = normalizeGateFilePath(join(tmpDir, 'gone.ts'))
+      // A present-but-not-a-file path (a directory): the fail-closed
+      // `unreadable:not-a-file` marker, which must never be read as deleted.
+      mkdirSync(join(tmpDir, 'adir.ts'), { recursive: true })
+      const directoryGateFile = normalizeGateFilePath(join(tmpDir, 'adir.ts'))
+      const finding = (id: string, text: string, files: string[]) => ({
+        id,
+        gateId: 'code-reviewer:prior-snapshot',
+        text,
+        status: 'open' as const,
+        files,
+        snapshotFingerprint: 'prior-snapshot',
+        reviewer: 'code-reviewer' as const,
+        createdAt: '2025-01-01T00:00:00.000Z',
+      })
+      const prunedText =
+        'BLOCKING: assigned-file-unreadable for the deleted probe.'
+      const keptTexts = [
+        'BLOCKING: still-present file issue.',
+        'BLOCKING: mixed deleted-and-present file set issue.',
+        'BLOCKING: legacy finding with no files.',
+        'BLOCKING: present-but-unreadable directory path issue.',
+      ]
+      const base2 = createBase2('default')
+      const agentState = {
+        agentId: 'base2-custom',
+        base2ActiveWork: {
+          changedFiles: [presentGateFile],
+          touchedFiles: [presentGateFile],
+          pendingGateFiles: [presentGateFile],
+          currentPhase: 'repair_loop',
+          latestWorkSummary: '',
+          openReviewerBlockers: [prunedText, ...keptTexts],
+          openReviewerFindings: [
+            // All files missing -> pruned (the loop-breaking case).
+            finding('find-missing-only', prunedText, [missingGateFile]),
+            // Still exists -> kept.
+            finding('find-present', keptTexts[0], [presentGateFile]),
+            // ANY still-existing file -> kept.
+            finding('find-mixed', keptTexts[1], [
+              missingGateFile,
+              presentGateFile,
+            ]),
+            // No file list at all -> kept (fail closed).
+            finding('find-no-files', keptTexts[2], []),
+            // Present but not a regular file -> kept (fail closed).
+            finding('find-directory', keptTexts[3], [directoryGateFile]),
+          ],
+          lastValidationSummary: '',
+          nextRequiredAction: '',
+          lastPinnedStateMessage: '',
+        },
+      }
+      const gen = base2.handleSteps!({
+        agentState,
+        prompt: 'Finish the previous response.',
+        params: {},
+      } as any)
+
+      // The prune runs during turn-start hydration, before the first yield.
+      expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+      const activeWork = (agentState as any).base2ActiveWork
+      expect(
+        (activeWork.openReviewerFindings as Array<{ id: string }>).map(
+          (entry) => entry.id,
+        ),
+      ).toEqual([
+        'find-present',
+        'find-mixed',
+        'find-no-files',
+        'find-directory',
+      ])
+      expect(activeWork.openReviewerBlockers).toEqual(keptTexts)
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  // Companion to the prune: a family is un-owed only when it was actually
+  // pruned AND no REMAINING open finding still backs it. Seed one prunable
+  // specialist finding (deleted file) plus a prunable and a surviving
+  // code-reviewer finding so the prune fires WITHOUT emptying the ledger: the
+  // specialist family is shed from the owed list, the still-backed
+  // code-reviewer family stays owed (fail closed), and the legacy scalar —
+  // seeded on the pruned family — is rewritten to the filtered owed[0] exactly
+  // as the rehydration block derives it.
+  test('a partial prune sheds only the pruned-and-unbacked family from the owed set and re-mirrors the scalar', () => {
+    const tmpDir = makeProjectTempDir('base2-prune-owed-partial-')
+    try {
+      const presentFile = join(tmpDir, 'exists.ts')
+      writeFileSync(presentFile, 'export const here = 1\n')
+      const presentGateFile = normalizeGateFilePath(presentFile)
+      const missingGateFile = normalizeGateFilePath(join(tmpDir, 'gone.ts'))
+      const prunedSpecialistText =
+        'BLOCKING: performance-specialist assigned-file-unreadable for the deleted probe.'
+      const prunedCodeText =
+        'BLOCKING: code-reviewer finding on the deleted file.'
+      const keptCodeText =
+        'BLOCKING: code-reviewer finding on the surviving file.'
+      const finding = (
+        id: string,
+        text: string,
+        files: string[],
+        reviewer: 'code-reviewer' | 'performance-specialist',
+      ) => ({
+        id,
+        gateId: `${reviewer}:prior-snapshot`,
+        text,
+        status: 'open' as const,
+        files,
+        snapshotFingerprint: 'prior-snapshot',
+        reviewer,
+        createdAt: '2025-01-01T00:00:00.000Z',
+      })
+      const base2 = createBase2('default')
+      const agentState = {
+        agentId: 'base2-custom',
+        base2ActiveWork: {
+          changedFiles: [presentGateFile],
+          touchedFiles: [presentGateFile],
+          pendingGateFiles: [presentGateFile],
+          currentPhase: 'repair_loop',
+          latestWorkSummary: '',
+          openReviewerBlockers: [
+            prunedSpecialistText,
+            prunedCodeText,
+            keptCodeText,
+          ],
+          openReviewerFindings: [
+            // All files missing -> pruned; the ONLY specialist finding.
+            finding(
+              'find-specialist-missing',
+              prunedSpecialistText,
+              [missingGateFile],
+              'performance-specialist',
+            ),
+            // All files missing -> pruned, but the code-reviewer family stays
+            // backed by the surviving finding below.
+            finding(
+              'find-code-missing',
+              prunedCodeText,
+              [missingGateFile],
+              'code-reviewer',
+            ),
+            // Still exists -> kept; keeps the code-reviewer family owed.
+            finding(
+              'find-code-present',
+              keptCodeText,
+              [presentGateFile],
+              'code-reviewer',
+            ),
+          ],
+          // The legacy scalar seeded on the PRUNED family's head: after the
+          // filter it must be re-mirrored to the surviving owed[0].
+          requiredReviewerRevalidation: 'performance-specialist',
+          owedReviewerRevalidations: [
+            'performance-specialist',
+            'code-reviewer',
+          ],
+          lastValidationSummary: '',
+          nextRequiredAction: '',
+          lastPinnedStateMessage: '',
+        },
+      }
+      const gen = base2.handleSteps!({
+        agentState,
+        prompt: 'Finish the previous response.',
+        params: {},
+      } as any)
+
+      // The prune runs during turn-start hydration, before the first yield.
+      expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+      const activeWork = (agentState as any).base2ActiveWork
+      // The specialist family was pruned and is backed by no remaining
+      // finding, so it is shed from the owed list; the code-reviewer family
+      // was also pruned but stays owed because find-code-present still backs
+      // it. The scalar is rewritten from the filtered list's first entry.
+      expect(activeWork.owedReviewerRevalidations).toEqual(['code-reviewer'])
+      expect(activeWork.requiredReviewerRevalidation).toBe('code-reviewer')
+      expect(
+        (activeWork.openReviewerFindings as Array<{ id: string }>).map(
+          (entry) => entry.id,
+        ),
+      ).toEqual(['find-code-present'])
+      expect(activeWork.openReviewerBlockers).toEqual([keptCodeText])
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('base2 committed-surface review mode', () => {
+  /** update_plan_status tool call plus its paired tool result (local copy). */
+  function planStatusHistory(
+    input: Record<string, unknown>,
+    result: Record<string, unknown> = { message: 'Updated 1 task line(s).' },
+  ) {
+    return [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'tool-call',
+            toolCallId: 'plan-1',
+            toolName: 'update_plan_status',
+            input: {
+              path: '.agents/sessions/demo/PLAN.md',
+              ...input,
+            },
+          },
+        ],
+      },
+      {
+        role: 'tool',
+        toolCallId: 'plan-1',
+        toolName: 'update_plan_status',
+        content: [{ type: 'json', value: result }],
+      },
+    ]
+  }
+
+  function seedIdleGateState(
+    overrides: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      touchedFiles: [],
+      changedFiles: [],
+      pendingGateFiles: [],
+      currentPhase: 'idle',
+      latestWorkSummary: '',
+      openReviewerBlockers: [],
+      lastValidationSummary: '',
+      nextRequiredAction: '',
+      lastPinnedStateMessage: '',
+      ...overrides,
+    }
+  }
+
+  function seedPendingGateState(
+    gateFile: string,
+    overrides: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      touchedFiles: [gateFile],
+      changedFiles: [gateFile],
+      pendingGateFiles: [gateFile],
+      currentPhase: 'awaiting_validation',
+      latestWorkSummary: '',
+      openReviewerBlockers: [],
+      openReviewerFindings: [],
+      lastValidationSummary: '',
+      nextRequiredAction: '',
+      lastPinnedStateMessage: '',
+      gatePassedFiles: [],
+      gatePassedFileMarkers: {},
+      gatePassedPendingFiles: [],
+      gatePassedReviewerVerdict: '',
+      gatePassedValidationSummary: '',
+      gatePassedFingerprint: '',
+      reviewedReviewableFingerprint: '',
+      lastReviewerGateSkipReason: '',
+      reviewReceipts: [],
+      testWriterGateDone: true,
+      docWriterGateDone: true,
+      securityReviewGateDone: true,
+      preEditSecurityReviewDone: true,
+      specialistReviewGatesDone: [],
+      auxGatesLastPendingFiles: [gateFile],
+      ...overrides,
+    }
+  }
+
+  /** Live gate-issued plan-task receipt ledger published on durable gate state. */
+  function planTaskReceiptsOf(
+    agentState: Record<string, unknown>,
+  ): Array<Record<string, unknown>> {
+    return (agentState as any).base2ActiveWork.planTaskGateReceipts as Array<
+      Record<string, unknown>
+    >
+  }
+
+  // Opt-in committed-surface mode: extraction, gate-branch lifecycle, and the
+  // supersession carve-out.
+  test('a successful requestCommittedSurfaceReview call stores a pending request', () => {
+    const base2 = createBase2('default', { executePlan: true })
+    const agentState: Record<string, unknown> = {
+      agentId: 'base2-execute-plan',
+      messageHistory: planStatusHistory({
+        currentTask: 'P2-T3 Implement the thing',
+        updates: [{ taskId: 'P2-T3', status: 'in_progress' }],
+        requestCommittedSurfaceReview: true,
+      }),
+    }
+    const gen = base2.handleSteps!({
+      agentState,
+      prompt: 'Continue the plan.',
+      params: {},
+      config: base2.programmaticConfig,
+    } as any)
+    expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+    const request = (agentState as any).base2ActiveWork
+      .committedSurfaceReviewRequest as Record<string, unknown>
+    expect(request).toMatchObject({ taskId: 'P2-T3', status: 'pending' })
+    expect(typeof request.requestedAt).toBe('string')
+  })
+
+  test('a requestCommittedSurfaceReview call without a claimed task stores nothing', () => {
+    // The tool schema documents the claimed-task requirement; runtime
+    // extraction ignores the invalid shape rather than storing it.
+    const base2 = createBase2('default', { executePlan: true })
+    const agentState: Record<string, unknown> = {
+      agentId: 'base2-execute-plan',
+      messageHistory: planStatusHistory({
+        requestCommittedSurfaceReview: true,
+      }),
+    }
+    const gen = base2.handleSteps!({
+      agentState,
+      prompt: 'Continue the plan.',
+      params: {},
+      config: base2.programmaticConfig,
+    } as any)
+    expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+    expect(
+      (agentState as any).base2ActiveWork.committedSurfaceReviewRequest,
+    ).toBeUndefined()
+  })
+
+  test('an unapplied requestCommittedSurfaceReview call stores nothing', () => {
+    const base2 = createBase2('default', { executePlan: true })
+    const agentState: Record<string, unknown> = {
+      agentId: 'base2-execute-plan',
+      messageHistory: planStatusHistory(
+        {
+          currentTask: 'P2-T3 Implement the thing',
+          requestCommittedSurfaceReview: true,
+        },
+        {
+          errorMessage:
+            'update_plan_status: PLAN transition is atomic; no task matched: P2-T3.',
+        },
+      ),
+    }
+    const gen = base2.handleSteps!({
+      agentState,
+      prompt: 'Continue the plan.',
+      params: {},
+      config: base2.programmaticConfig,
+    } as any)
+    expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+    expect(
+      (agentState as any).base2ActiveWork.committedSurfaceReviewRequest,
+    ).toBeUndefined()
+  })
+
+  test('a recorded change to a committed-surface receipt retires it, an unrelated change does not', () => {
+    const tmpDir = makeProjectTempDir('base2-committed-surface-supersede-')
+    try {
+      const coveredFile = join(tmpDir, 'a.ts')
+      const unrelatedFile = join(tmpDir, 'b.ts')
+      writeFileSync(coveredFile, 'export const a = 1\n')
+      writeFileSync(unrelatedFile, 'export const b = 1\n')
+      const coveredGateFile = normalizeGateFilePath(coveredFile)
+      const unrelatedGateFile = normalizeGateFilePath(unrelatedFile)
+      const fingerprint = buildFingerprint(
+        [
+          {
+            file: coveredGateFile,
+            contentMarker: buildContentMarker(coveredFile),
+          },
+        ],
+        '',
+      )
+      const committedReceipt = {
+        receiptId: `plan-gate:P2-T3:committed-surface:${fingerprint.slice(0, 16)}`,
+        taskId: 'P2-T3',
+        evidence: 'committed-surface',
+        snapshotFingerprint: fingerprint,
+        files: [coveredGateFile],
+        validationSummary: '',
+        reviewerVerdict: 'LOOKS_GOOD',
+        recordedAt: '2025-01-01T00:00:00.000Z',
+      }
+      /**
+       * Drive a fresh idle-state turn seeded with the receipt up to its first
+       * STEP boundary, deliver the given edit receipt there, and return the
+       * live receipt ledger. One scenario per generator: after a change is
+       * recorded the next iteration routes validation/aux gates for the new
+       * pending file, which a second delivery in the same generator would hit.
+       */
+      function supersedeScenario(
+        deliveredReceipt: Record<string, unknown>,
+      ): Array<Record<string, unknown>> {
+        const scenarioState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            planTaskGateReceipts: [committedReceipt],
+          }),
+        }
+        const scenarioBase2 = createBase2('default', { executePlan: true })
+        const scenarioGen = scenarioBase2.handleSteps!({
+          agentState: scenarioState,
+          prompt: 'Continue the plan.',
+          params: {},
+          config: scenarioBase2.programmaticConfig,
+        } as any)
+        expect(scenarioGen.next().value).toMatchObject({
+          toolName: 'git_status',
+        })
+        // Idle state with no pending request: the turn-start bookkeeping
+        // spawns the inline context-pruner, then the STEP boundary sits behind
+        // any pinned-state message (same choreography as the mint test below).
+        expect(scenarioGen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = scenarioGen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(scenarioGen.next().value).toBe('STEP')
+        }
+        // Supersession runs inside recordChangedFiles while the STEP result is
+        // processed, so the ledger is final right after this feed.
+        scenarioGen.next(finishStepWithToolResult(deliveredReceipt))
+        // Supersession filters the ledger in place; the published key survives.
+        expect(
+          'planTaskGateReceipts' in (scenarioState as any).base2ActiveWork,
+        ).toBe(true)
+        return planTaskReceiptsOf(scenarioState)
+      }
+
+      // An UNRELATED recorded change: the committed-surface receipt covers real
+      // bytes that did not change, so it must survive (the old blanket-drop
+      // would have retired it here).
+      expect(supersedeScenario(editReceipt(unrelatedGateFile))).toEqual([
+        committedReceipt,
+      ])
+
+      // A recorded change to a COVERED file: only now is the receipt retired
+      // (it has verifiable content identity, so it dies on file intersection,
+      // not the blanket non-reviewed drop).
+      expect(supersedeScenario(editReceipt(coveredGateFile))).toEqual([])
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a pending committed-surface request on a dirty worktree is rejected and falls through to the normal gate', () => {
+    const tmpDir = makeProjectTempDir('base2-committed-surface-dirty-')
+    try {
+      const dirtyFile = join(tmpDir, 'a.ts')
+      writeFileSync(dirtyFile, 'export const value = 1\n')
+      const gateFile = normalizeGateFilePath(dirtyFile)
+      const agentState: Record<string, unknown> = {
+        agentId: 'base2-execute-plan',
+        base2ActiveWork: seedPendingGateState(gateFile, {
+          activePlanTaskId: 'P2-T3',
+          committedSurfaceReviewRequest: {
+            taskId: 'P2-T3',
+            requestedAt: '2025-01-01T00:00:00.000Z',
+            status: 'pending',
+          },
+        }),
+      }
+
+      const base2 = createBase2('default', { executePlan: true })
+      const gen = base2.handleSteps!({
+        agentState,
+        prompt: 'Continue the plan.',
+        params: {},
+        config: base2.programmaticConfig,
+      } as any)
+      expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+      expect(
+        gen.next(feedJson({ status: ` M ${gateFile}` })).value,
+      ).toMatchObject({ toolName: 'spawn_agent_inline' })
+      const maybePinned = gen.next().value
+      if (maybePinned !== 'STEP') {
+        expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+        expect(gen.next().value).toBe('STEP')
+      }
+      expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+        toolName: 'git_status',
+      })
+      // No porcelain probe and no spawn: feeding the dirty status makes the
+      // committed-surface branch reject the request BEFORE the clean-tree
+      // check, then continue to the normal gate logic for the iteration.
+      gen.next(feedJson({ status: ` M ${gateFile}` }))
+      const request = (agentState as any).base2ActiveWork
+        .committedSurfaceReviewRequest as Record<string, unknown>
+      expect(request).toMatchObject({
+        taskId: 'P2-T3',
+        status: 'rejected',
+        reason: 'worktree-dirty',
+      })
+      // Nothing was minted by the committed-surface branch.
+      expect(planTaskReceiptsOf(agentState)).toEqual([])
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  test('a pending committed-surface request on a clean tree routes, attests, and mints the receipt', () => {
+    const tmpDir = makeProjectTempDir('base2-committed-surface-mint-')
+    try {
+      const taskFile = join(tmpDir, 'a.ts')
+      writeFileSync(taskFile, 'export const value = 1\n')
+      const gateFile = normalizeGateFilePath(taskFile)
+      const agentState: Record<string, unknown> = {
+        agentId: 'base2-execute-plan',
+        base2ActiveWork: seedIdleGateState({
+          activePlanTaskId: 'P2-T3',
+          touchedFiles: [gateFile],
+          changedFiles: [gateFile],
+          committedSurfaceReviewRequest: {
+            taskId: 'P2-T3',
+            requestedAt: '2025-01-01T00:00:00.000Z',
+            status: 'pending',
+          },
+        }),
+      }
+
+      const base2 = createBase2('default', { executePlan: true })
+      const gen = base2.handleSteps!({
+        agentState,
+        prompt: 'Focus on performance.',
+        params: {},
+        config: base2.programmaticConfig,
+      } as any)
+      expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+      expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+        toolName: 'spawn_agent_inline',
+      })
+      const maybePinned = gen.next().value
+      if (maybePinned !== 'STEP') {
+        expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+        expect(gen.next().value).toBe('STEP')
+      }
+      // No edits this step: the mid-loop git_status runs first, then the
+      // committed-surface branch probes porcelain on the clean result.
+      expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+        toolName: 'git_status',
+      })
+      expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+        toolName: 'run_terminal_command',
+      })
+      expect(
+        gen.next(feedJson({ stdout: '', exitCode: 0 })).value,
+      ).toMatchObject({ toolName: 'spawn_agents' })
+      // The mint runs synchronously while the reviewer result is processed;
+      // the branch then continues to the loop top, so assert on state below
+      // without pinning the post-mint yield shape.
+      gen.next(
+        feedJson([
+          {
+            agentType: 'performance-specialist',
+            value: {
+              schemaVersion: 1,
+              verdict: 'LOOKS_GOOD',
+              snapshotFingerprint: buildFingerprint(
+                [
+                  {
+                    file: gateFile,
+                    contentMarker: buildContentMarker(taskFile),
+                  },
+                ],
+                '',
+              ),
+              reviewedFiles: [gateFile],
+              findings: [],
+              coverage: 'covered',
+              dimensions: {},
+              requirementCoverage: [],
+            },
+          },
+        ]),
+      )
+
+      const activeWork = (agentState as any).base2ActiveWork
+      const receipts = planTaskReceiptsOf(agentState)
+      expect(receipts).toHaveLength(1)
+      expect(receipts[0]).toMatchObject({
+        taskId: 'P2-T3',
+        evidence: 'committed-surface',
+        files: [gateFile],
+        validationSummary: '',
+        reviewerVerdict: 'LOOKS_GOOD',
+      })
+      expect(String(receipts[0].receiptId)).toMatch(
+        /^plan-gate:P2-T3:committed-surface:v3:[a-f0-9]{13}$/,
+      )
+      expect(receipts[0].snapshotFingerprint).toBe(
+        buildFingerprint(
+          [{ file: gateFile, contentMarker: buildContentMarker(taskFile) }],
+          '',
+        ),
+      )
+      expect(
+        (activeWork.committedSurfaceReviewRequest as Record<string, unknown>)
+          .status,
+      ).toBe('consumed')
+      expect(String(activeWork.latestWorkSummary)).toContain(
+        'committed-surface',
+      )
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true })
+    }
+  })
+
+  // Failure branches: every committed-surface rejection must be durable (the
+  // reason is recorded on the request) and must mint NO receipt — a rejected
+  // request is never done evidence. The dirty-worktree rejection is covered by
+  // the earlier test; these cover the four remaining branch families plus the
+  // verdict gate, replay watermark, and standalone-flag schema contract.
+  describe('committed-surface failure branches', () => {
+    function pendingRequest(): Record<string, unknown> {
+      return {
+        taskId: 'P2-T3',
+        requestedAt: '2025-01-01T00:00:00.000Z',
+        status: 'pending',
+      }
+    }
+
+    function expectRejectedWithoutReceipt(
+      agentState: Record<string, unknown>,
+      reason: string | RegExp,
+    ) {
+      const request = (agentState as any).base2ActiveWork
+        .committedSurfaceReviewRequest as Record<string, unknown>
+      expect(request.status).toBe('rejected')
+      if (typeof reason === 'string') {
+        expect(request.reason).toBe(reason)
+      } else {
+        expect(String(request.reason)).toMatch(reason)
+      }
+      // No receipt was minted by the committed-surface branch.
+      expect(planTaskReceiptsOf(agentState)).toEqual([])
+    }
+
+    test('rejects no-reviewable-committed-files when no derived file survives (empty fileset)', () => {
+      // touchedFiles/changedFiles name only a doc: deriveCommittedSurfaceFileSet
+      // filters it out (non-reviewable marker), so the fileset is empty — a
+      // constant-fingerprint receipt — and the request must reject.
+      const tmpDir = makeProjectTempDir('base2-committed-surface-empty-')
+      try {
+        const docsFile = join(tmpDir, 'notes.md')
+        writeFileSync(docsFile, '# notes\n')
+        const docsGateFile = normalizeGateFilePath(docsFile)
+        const agentState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            touchedFiles: [docsGateFile],
+            changedFiles: [docsGateFile],
+            committedSurfaceReviewRequest: pendingRequest(),
+          }),
+        }
+
+        const base2 = createBase2('default', { executePlan: true })
+        const gen = base2.handleSteps!({
+          agentState,
+          prompt: 'Continue the plan.',
+          params: {},
+          config: base2.programmaticConfig,
+        } as any)
+        expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = gen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(gen.next().value).toBe('STEP')
+        }
+        expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+          toolName: 'git_status',
+        })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'run_terminal_command',
+        })
+        // Porcelain is clean, so the empty-derive rejection fires before any
+        // specialist spawn.
+        gen.next(feedJson({ stdout: '', exitCode: 0 }))
+        expectRejectedWithoutReceipt(
+          agentState,
+          'no-reviewable-committed-files',
+        )
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    test('rejects fileset-overflow when the derived fileset exceeds the 40-file cap', () => {
+      // 41 reviewable on-disk files with verifiable markers: the derive call
+      // overflows and the request must reject before spawning anything.
+      const tmpDir = makeProjectTempDir('base2-committed-surface-overflow-')
+      try {
+        const files: string[] = []
+        for (let i = 0; i < 41; i++) {
+          const file = join(tmpDir, `gen-${i}.ts`)
+          writeFileSync(file, `export const v${i} = ${i}\n`)
+          files.push(normalizeGateFilePath(file))
+        }
+        const agentState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            touchedFiles: files,
+            changedFiles: files,
+            committedSurfaceReviewRequest: pendingRequest(),
+          }),
+        }
+
+        const base2 = createBase2('default', { executePlan: true })
+        const gen = base2.handleSteps!({
+          agentState,
+          prompt: 'Continue the plan.',
+          params: {},
+          config: base2.programmaticConfig,
+        } as any)
+        expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = gen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(gen.next().value).toBe('STEP')
+        }
+        expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+          toolName: 'git_status',
+        })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'run_terminal_command',
+        })
+        gen.next(feedJson({ stdout: '', exitCode: 0 }))
+        expectRejectedWithoutReceipt(agentState, /^fileset-overflow:/)
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    test('rejects with no receipt when hashing is unavailable (non-attestable fingerprint family)', () => {
+      // Without a collision-resistant hash the committed fingerprint would be
+      // the stable 'unreadable:no-crypto' sentinel — an error string, never
+      // content evidence. Derive and the snapshot hash share the same crypto
+      // resolution, so the non-attestable-fingerprint guard (defense in depth
+      // behind derive) is preceded here by the empty-derive rejection: file
+      // markers are equally unverifiable, so no file survives and the request
+      // must reject with NO spawn and NO receipt either way (fail closed).
+      const tmpDir = makeProjectTempDir('base2-committed-surface-nocrypto-')
+      const originalGetBuiltinModule = (process as any).getBuiltinModule
+      const originalRequire = (globalThis as any).require
+      try {
+        const taskFile = join(tmpDir, 'a.ts')
+        writeFileSync(taskFile, 'export const value = 1\n')
+        const gateFile = normalizeGateFilePath(taskFile)
+        ;(process as any).getBuiltinModule = undefined
+        ;(globalThis as any).require = undefined
+        const agentState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            touchedFiles: [gateFile],
+            changedFiles: [gateFile],
+            committedSurfaceReviewRequest: pendingRequest(),
+          }),
+        }
+
+        const base2 = createBase2('default', { executePlan: true })
+        const gen = base2.handleSteps!({
+          agentState,
+          prompt: 'Continue the plan.',
+          params: {},
+          config: base2.programmaticConfig,
+        } as any)
+        expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = gen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(gen.next().value).toBe('STEP')
+        }
+        expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+          toolName: 'git_status',
+        })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'run_terminal_command',
+        })
+        // No spawn_agents may be reached: unverifiable bytes never spawn.
+        const afterPorcelain = gen.next(feedJson({ stdout: '', exitCode: 0 }))
+        expect((afterPorcelain.value as any)?.toolName).not.toBe('spawn_agents')
+        expectRejectedWithoutReceipt(
+          agentState,
+          'no-reviewable-committed-files',
+        )
+      } finally {
+        ;(process as any).getBuiltinModule = originalGetBuiltinModule
+        ;(globalThis as any).require = originalRequire
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    test('rejects attestation-failed when a specialist does not return the structured attestation', () => {
+      // The routed specialist returned prose (no structured receipt), so
+      // collectReviewerAttestationIssues fails closed and the request is
+      // rejected with the durable attestation-failed reason instead of minting.
+      const tmpDir = makeProjectTempDir('base2-committed-surface-attest-')
+      try {
+        const taskFile = join(tmpDir, 'a.ts')
+        writeFileSync(taskFile, 'export const value = 1\n')
+        const gateFile = normalizeGateFilePath(taskFile)
+        const agentState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            touchedFiles: [gateFile],
+            changedFiles: [gateFile],
+            committedSurfaceReviewRequest: pendingRequest(),
+          }),
+        }
+
+        const base2 = createBase2('default', { executePlan: true })
+        const gen = base2.handleSteps!({
+          agentState,
+          prompt: 'Focus on performance.',
+          params: {},
+          config: base2.programmaticConfig,
+        } as any)
+        expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = gen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(gen.next().value).toBe('STEP')
+        }
+        expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+          toolName: 'git_status',
+        })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'run_terminal_command',
+        })
+        expect(
+          gen.next(feedJson({ stdout: '', exitCode: 0 })).value,
+        ).toMatchObject({ toolName: 'spawn_agents' })
+        // Non-attesting specialist result (plain prose, no structured entry).
+        gen.next(
+          feedJson([
+            { agentType: 'performance-specialist', value: 'looks fine to me' },
+          ]),
+        )
+        expectRejectedWithoutReceipt(
+          agentState,
+          /^attestation-failed:performance-specialist/,
+        )
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    test('rejects a non-LOOKS_GOOD specialist verdict even with a clean attestation', () => {
+      // Finding committed-surface-mint-ignores-verdict: a well-attested but
+      // NON_BLOCKING receipt is not done evidence, so the mint must reject the
+      // request instead of writing a durable committed-surface receipt.
+      const tmpDir = makeProjectTempDir('base2-committed-surface-verdict-')
+      try {
+        const taskFile = join(tmpDir, 'a.ts')
+        writeFileSync(taskFile, 'export const value = 1\n')
+        const gateFile = normalizeGateFilePath(taskFile)
+        const agentState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            touchedFiles: [gateFile],
+            changedFiles: [gateFile],
+            committedSurfaceReviewRequest: pendingRequest(),
+          }),
+        }
+
+        const base2 = createBase2('default', { executePlan: true })
+        const gen = base2.handleSteps!({
+          agentState,
+          prompt: 'Focus on performance.',
+          params: {},
+          config: base2.programmaticConfig,
+        } as any)
+        expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = gen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(gen.next().value).toBe('STEP')
+        }
+        expect(gen.next(finishStepWithToolResult({})).value).toMatchObject({
+          toolName: 'git_status',
+        })
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'run_terminal_command',
+        })
+        expect(
+          gen.next(feedJson({ stdout: '', exitCode: 0 })).value,
+        ).toMatchObject({ toolName: 'spawn_agents' })
+        // Fully attesting but NON_BLOCKING: attestation passes, the verdict
+        // gate must reject.
+        gen.next(
+          feedJson([
+            {
+              agentType: 'performance-specialist',
+              value: {
+                schemaVersion: 1,
+                verdict: 'NON_BLOCKING',
+                snapshotFingerprint: buildFingerprint(
+                  [
+                    {
+                      file: gateFile,
+                      contentMarker: buildContentMarker(taskFile),
+                    },
+                  ],
+                  '',
+                ),
+                reviewedFiles: [gateFile],
+                findings: ['Minor committed-surface nit.'],
+                coverage: 'covered',
+                dimensions: {},
+                requirementCoverage: [],
+              },
+            },
+          ]),
+        )
+        expectRejectedWithoutReceipt(
+          agentState,
+          /^specialist-verdict-not-looks-good:performance-specialist/,
+        )
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    test('the replay watermark keeps an already-resolved request from re-becoming pending', () => {
+      // Finding committed-surface-watermark-never-read: after the branch
+      // resolved a request, every turn-start re-walk of the SAME history must
+      // not see the old successful request call again and replace the resolved
+      // record with a fresh pending request (which would re-spawn and re-mint
+      // reviewers every later turn).
+      const tmpDir = makeProjectTempDir('base2-committed-surface-replay-')
+      try {
+        const taskFile = join(tmpDir, 'a.ts')
+        writeFileSync(taskFile, 'export const value = 1\n')
+        const gateFile = normalizeGateFilePath(taskFile)
+        const requestHistory = planStatusHistory({
+          currentTask: 'P2-T3 Implement the thing',
+          updates: [{ taskId: 'P2-T3', status: 'in_progress' }],
+          requestCommittedSurfaceReview: true,
+        })
+        const resolvedFromIndex = requestHistory.length
+        const agentState: Record<string, unknown> = {
+          agentId: 'base2-execute-plan',
+          messageHistory: requestHistory,
+          base2ActiveWork: seedIdleGateState({
+            activePlanTaskId: 'P2-T3',
+            // The branch already consumed the request at this watermark.
+            committedSurfaceReviewRequest: {
+              taskId: 'P2-T3',
+              status: 'consumed',
+            },
+            committedSurfaceReviewResolvedFromMessageIndex: resolvedFromIndex,
+          }),
+        }
+
+        const base2 = createBase2('default', { executePlan: true })
+        const gen = base2.handleSteps!({
+          agentState,
+          prompt: 'Continue the plan.',
+          params: {},
+          config: base2.programmaticConfig,
+        } as any)
+        expect(gen.next().value).toMatchObject({ toolName: 'git_status' })
+        // Turn-start extraction ran during hydration; the watermark skipped the
+        // request call, so the consumed record stays exactly as it was.
+        const request = (agentState as any).base2ActiveWork
+          .committedSurfaceReviewRequest as Record<string, unknown>
+        expect(request).toEqual({ taskId: 'P2-T3', status: 'consumed' })
+        // And the post-STEP re-walk must not resurrect it either.
+        expect(gen.next(feedJson({ status: '' })).value).toMatchObject({
+          toolName: 'spawn_agent_inline',
+        })
+        const maybePinned = gen.next().value
+        if (maybePinned !== 'STEP') {
+          expect(maybePinned).toMatchObject({ toolName: 'add_message' })
+          expect(gen.next().value).toBe('STEP')
+        }
+        gen.next(finishStepWithToolResult({}))
+        expect(
+          (agentState as any).base2ActiveWork
+            .committedSurfaceReviewRequest as Record<string, unknown>,
+        ).toEqual({ taskId: 'P2-T3', status: 'consumed' })
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
   })
 })

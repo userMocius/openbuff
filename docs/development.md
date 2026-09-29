@@ -4,6 +4,8 @@ As a Bring Your Own Key (BYOK), local-first fork, developing Openbuff is highly 
 
 ## Getting Started (CLI & SDK Development)
 
+New to Openbuff? See [Getting Started](./getting-started.md) for end-user CLI setup (install and provider configuration). This guide covers contributing and development setup.
+
 To develop the CLI locally, you do not need to run a web server or database. Simply configure your local providers and run the CLI developer task directly:
 
 1. **Install Dependencies:**
@@ -63,7 +65,7 @@ bun test
 
 For comprehensive E2E terminal testing (which requires `tmux`):
 
-- See [cli/src/**tests**/README.md](../cli/src/__tests__/README.md) for detailed instructions on E2E test runs.
+- See [`cli/src/__tests__/README.md`](../cli/src/__tests__/README.md) for detailed instructions on E2E test runs.
 
 ## CI-local / pre-push checks
 

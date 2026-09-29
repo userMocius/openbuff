@@ -2,7 +2,9 @@ import { buildArray } from '@codebuff/common/util/array'
 import type { SpecialistReviewerAgent } from '@codebuff/common/agents/specialist-risk-router'
 import {
   resolveMaxRepairRounds,
+  resolveMaxReviewerNoVerdictRetries,
   resolveMaxReviewerRepairRounds,
+  resolveMaxSpecialistNoVerdictRetries,
   resolveMaxSpecialistRepairRounds,
 } from '@codebuff/common/util/gate-repair-budgets'
 import { FALLBACK_GUIDES } from '@codebuff/common/util/guides'
@@ -15,9 +17,15 @@ import type {
   Base2WorkflowTodoProgress,
   Base2ReviewReceipt,
 } from './gate-state'
+// NOTE: gate-committed-surface.ts is deliberately NOT imported here. Its
+// functions are spliced inline into handleSteps' <gate-helpers-generated>
+// region, and handleSteps is serialized via .toString() + new Function(...),
+// which loses module closure — inline copies (not this module) resolve the
+// names inside the generator body. base2.ts itself has no module-scope use.
 import {
   type BroadAuditFinalizeClause,
   buildBroadAuditSection,
+  decisionCapturePolicySection,
   gateAwarenessSection,
   gitDisciplineSection,
   preReviewSelfCheckSection,
@@ -65,7 +73,7 @@ const BROAD_AUDIT_POINTER_TAILS: Record<BroadAuditFinalizeClause, string> = {
     ' In plan mode, do not implement — translate the findings into the durable plan packet instead.',
 }
 const specialistRoutingPointer =
-  'Choosing a specialist agent → read_files `agents/guides/specialist-routing.md`. If that guide is unavailable, route only on a crossed risk boundary (architecture, requirements, performance, reliability, migration, compatibility, accessibility, dependencies), pass the gate-assigned `params.snapshot_id`, and never substitute a specialist for the runtime-owned final gate.'
+  'Choosing a specialist agent → read_files `agents/guides/specialist-routing.md`. If that guide is unavailable, route only on a crossed risk boundary (architecture, requirements, performance, reliability, migration, compatibility, accessibility, dependencies), never include `snapshot_id` in a manually authored reviewer-family spawn (the gate-assigned token is only available to runtime-owned spawns; put scoped files in params and the question in the prompt; security-reviewer still requires `changed_files` + `snapshot_fingerprint` on manual spawns), and never substitute a specialist for the runtime-owned final gate.'
 const gitDisciplinePointer =
   'Before any git commit/branch/push → read_files `agents/guides/git-discipline.md`. If that guide is unavailable, apply the standard git rules: delegate to `git-committer` with `params.owned_paths`, commit only after GATE: PASSED, never push or alter git config unless explicitly asked, and never commit secrets.'
 // The named guide is advisory routing only (when to ask for a pre-edit
@@ -246,6 +254,8 @@ export function createBase2(
     maxReviewerRepairRounds?: number
     maxRepairRounds?: number
     maxSpecialistRepairRounds?: number
+    maxReviewerNoVerdictRetries?: number
+    maxSpecialistNoVerdictRetries?: number
     model?: SecretAgentDefinition['model']
     providerOptions?: SecretAgentDefinition['providerOptions']
   },
@@ -260,6 +270,8 @@ export function createBase2(
     maxReviewerRepairRounds: maxReviewerRepairRoundsOption,
     maxRepairRounds: maxRepairRoundsOption,
     maxSpecialistRepairRounds: maxSpecialistRepairRoundsOption,
+    maxReviewerNoVerdictRetries: maxReviewerNoVerdictRetriesOption,
+    maxSpecialistNoVerdictRetries: maxSpecialistNoVerdictRetriesOption,
     model: modelOverride,
     providerOptions,
   } = options ?? {}
@@ -298,6 +310,24 @@ export function createBase2(
     maxSpecialistRepairRoundsOption ??
       (typeof process === 'object' && process !== null
         ? process.env?.OPENBUFF_MAX_SPECIALIST_REPAIR_ROUNDS
+        : undefined),
+  )
+  // Explicit option wins over env. When omitted, resolve from
+  // OPENBUFF_MAX_REVIEWER_NO_VERDICT_RETRIES (positive integer string).
+  // Missing/invalid → unlimited (Infinity); positive ints capped at 10.
+  const maxReviewerNoVerdictRetries = resolveMaxReviewerNoVerdictRetries(
+    maxReviewerNoVerdictRetriesOption ??
+      (typeof process === 'object' && process !== null
+        ? process.env?.OPENBUFF_MAX_REVIEWER_NO_VERDICT_RETRIES
+        : undefined),
+  )
+  // Explicit option wins over env. When omitted, resolve from
+  // OPENBUFF_MAX_SPECIALIST_NO_VERDICT_RETRIES (positive integer string).
+  // Missing/invalid → unlimited (Infinity); positive ints capped at 10.
+  const maxSpecialistNoVerdictRetries = resolveMaxSpecialistNoVerdictRetries(
+    maxSpecialistNoVerdictRetriesOption ??
+      (typeof process === 'object' && process !== null
+        ? process.env?.OPENBUFF_MAX_SPECIALIST_NO_VERDICT_RETRIES
         : undefined),
   )
   const isDefault = mode === 'default'
@@ -379,6 +409,7 @@ export function createBase2(
   const spawnGuidelinesTail = buildArray(
     "- **Never spawn the context-pruner agent:** This agent is spawned automatically for you and you don't need to spawn it yourself.",
     isDefault && !planOnly && gateAwarenessSection,
+    isDefault && !planOnly && decisionCapturePolicySection,
   ).join('\n\n')
 
   // Model-visible surface, narrowed when the caller passes `unlockedTiers`.
@@ -442,6 +473,8 @@ export function createBase2(
       maxReviewerRepairRounds,
       maxRepairRounds,
       maxSpecialistRepairRounds,
+      maxReviewerNoVerdictRetries,
+      maxSpecialistNoVerdictRetries,
       // Contract for both keys:
       // packages/agent-runtime/src/util/base2-tool-tiers.ts.
       progressiveToolDisclosure: false,
@@ -542,9 +575,9 @@ ${
 ${
   planOnly
     ? '- **Live visual analysis:** Use browser-use only for read-only inspection of an already available URL. Do not start dev servers or request browser interactions in plan mode.'
-    : '- **Live visual verification:** Visual verification extends beyond web apps. Image artifacts from 3D renders (e.g. Blender frames), image/video exports, generated diagrams, and charts must be inspected with read_image, not inferred from text logs alone. The workflow is: render/export -> wait for the background job (check_job for agent readiness/exit; live job_update for users) -> read_image the emitted artifacts -> assess the result -> make a targeted edit -> re-render. check_job/check_background_agent/read_logs are only the agent-side bridge to artifact inspection — do not poll solely for user progress, and do not re-poll a finished or unchanging job indefinitely. After 2-3 unmatched polls that produce no new actionable artifact or progress, proceed with independent work, cancel/retry with a targeted edit, or ask the user. For web app visual checks specifically, start any long-running dev server through a BACKGROUND basher (finite commands stay SYNC), keep its returned jobId, use check_job to wait for readiness, then spawn browser-use for screenshots/navigation/interaction.'
+    : '- **Live visual verification:** Visual verification extends beyond web apps. Image artifacts from 3D renders (e.g. Blender frames), image/video exports, generated diagrams, and charts must be inspected with read_image, not inferred from text logs alone. The workflow is: render/export -> wait for the background job (check_job for agent readiness/exit; live job_update for users) -> read_image the emitted artifacts -> assess the result -> make a targeted edit -> re-render. check_job is only the agent-side bridge to artifact inspection — do not poll solely for user progress. Make one bounded check_job follow per job with wait_for plus timeout_seconds, thread nextCursor across follows, and terminal state means STOP with no further follows. After 2 empty follows with no new actionable artifact or progress, do other work, cancel/retry with a targeted edit, or ask the user. For web app visual checks specifically, start any long-running dev server through a BACKGROUND basher (finite commands stay SYNC), keep its returned jobId, use check_job to wait for readiness, then spawn browser-use for screenshots/navigation/interaction.'
 }
-- **Prefer dedicated harness tools over shell fallbacks:** Repository status is injected automatically by the runtime; do not spawn basher merely to run git status. Use read_files/read_outline/read_subtree/glob/list_directory/query_index for file and codebase inspection instead of shelling out to cat/ls/find/grep. Use \`code_search\` for ripgrep-style content search (do not basher grep); for several patterns, issue one \`code_search\` call per pattern — independent calls can go in the same message. Tiered read policy: small files (≤~400 lines) use read_files paths or ranges 1..totalLines for Tier1 whole-file auth (complete:true → reusable cap.v3); large/targeted blocks use read_files windows/around/symbol for Tier2 scoped caps (must be complete:true to mint). After successful edit_transaction, compress body to path/pointer but retain whole-file postEditCapabilities verbatim. Don't force windows for small files. Use basher for commands that do not have a dedicated tool, such as tests, builds, package scripts, and one-off project CLIs. Never embed a multi-KB file body or heredoc (\`<<'EOF' ... EOF\`) inside \`basher.params.command\`; the transport truncates large payloads and the JSON normalizer intentionally fails closed on truncated input. Author files with \`write_file\`/\`edit_transaction\` and run them via a short basher command instead. When you spawn an agent, pass its required params or the spawn fails: basher needs \`params.command\` (a shell string); put these in \`params\`, not only in the prose prompt. Correct spawn_agents shape: { "agents": [{ "agent_type": "basher", "prompt": "...", "params": { "command": "..." } }] } — prompt and params go INSIDE each agent entry, never as siblings of agents, and agents is a real array (never a JSON string).
+- **Prefer dedicated harness tools over shell fallbacks:** Repository status is injected automatically by the runtime; do not spawn basher merely to run git status. Use read_files/read_outline/read_subtree/glob/list_directory/query_index for file and codebase inspection instead of shelling out to cat/ls/find/grep. Use \`code_search\` for ripgrep-style content search (do not basher grep); for several patterns, issue one \`code_search\` call per pattern — independent calls can go in the same message. Tiered read policy: small files (≤~400 lines) use read_files paths or ranges 1..totalLines for Tier1 whole-file auth (complete:true → reusable cap.v3); large/targeted blocks use read_files windows/around/symbol for Tier2 scoped caps (must be complete:true to mint). After successful edit_transaction, compress body to path/pointer but retain whole-file postEditCapabilities verbatim. Don't force windows for small files. Use basher for commands that do not have a dedicated tool, such as tests, builds, package scripts, and one-off project CLIs. Never embed a multi-KB file body or heredoc (\`<<'EOF' ... EOF\`) inside \`basher.params.command\`; the transport truncates large payloads and the JSON normalizer intentionally fails closed on truncated input. Author files with \`write_file\`/\`edit_transaction\` and run them via a short basher command instead. When you spawn an agent, pass its required params or the spawn fails: basher needs \`params.command\` (a shell string); general-agent needs prompt + params.filePaths/directoryPaths (not files); thinker needs prompt packet (params only depth/outputSchemaHint); dependency-manager needs params.manager+params.operation from manifest evidence; architect/advisory needs prompt+files (snapshot_id optional); reviewer-family manual spawns omit params.snapshot_id (security-reviewer needs changed_files+snapshot_fingerprint); put these in \`params\`, not only in the prose prompt. Correct spawn_agents shape: { "agents": [{ "agent_type": "basher", "prompt": "...", "params": { "command": "..." } }] } — prompt and params go INSIDE each agent entry, never as siblings of agents, and agents is a real array (never a JSON string).
 
 # Code Editing Mandates
 
@@ -578,7 +611,7 @@ When tools, tests, or reviewers report a failure, treat that feedback as the cur
 
 5. **Reviewer blockers are blocking:** If a reviewer returns \`BLOCKING:\` or asks for a specific action (rerun tests, fix a case, revert a change, or inspect a file), treat that exact finding as the controlling next action. Copy or paraphrase the specific blocker into your todos/progress state, do that action next, and do not run another review, continue unrelated implementation, or finalize while it is unresolved. In the next review prompt, explicitly state the blocker you fixed and how you fixed it.
 6. **Repeated reviewer blocker loop:** If a reviewer reports substantially the same blocker twice, stop and acknowledge the loop. Re-read the relevant code/test lines, make one targeted fix for that exact blocker, add or update a regression test when applicable, rerun the required validation, then request review once with the validation result and the exact blocker-resolution summary.
-7. **Loop detection:** If the same edit or validation fails twice, stop the current approach. Summarize the current diff, the exact repeated failure, and the next deterministic action before proceeding.
+7. **Loop detection:** If the same edit or validation fails twice, stop the current approach. Summarize the current diff, the exact repeated failure, and the next deterministic action before proceeding. For spawn_agents failures: after 2nd identical spawn error stop spawning, read exact files, do work directly or ask_user.
 8. **Parallelism discipline:** Parallelize context gathering, tests, and review only when they do not depend on each other. During a fragile debug/fix loop, run read → one edit → validation sequentially to avoid state drift.
 9. **Validation/review join discipline:** A reviewer spawned in parallel with tests/typechecks can only provide static code review; it cannot know validation results that are still running. Do not treat parallel reviewer approval as final approval until validation has completed. If validation fails or times out, fix or rerun validation before finalizing, regardless of reviewer output. For fragile harness/editor changes, prefer running validation first, then run reviewer with the validation summary.
 
@@ -636,7 +669,8 @@ ${
     !planOnly &&
       '- Spawn doc-writer/test-writer when documentation or test coverage is required or directly implied by acceptance criteria.',
     '- Spawn bashers sequentially if the second command depends on the the first.',
-    '- Use SYNC basher for finite commands that exit. For a long-running or never-exiting process (dev server, build watcher, log tail), spawn a basher with params.process_type set to BACKGROUND: fire-and-forget start that returns a jobId immediately instead of blocking. Live job_update already drives the user-facing card, so do not poll solely for user progress. Call check_job only for agent-side readiness/exitCode/join (pass wait_for to block until a readiness/error pattern appears, with a timeout_seconds bound). Use kill_job when a background job is no longer needed. To watch an existing log file, start a BACKGROUND `tail -f <file>` and check_job it when you need agent-side follow. If you lose a jobId (for example after context compaction), list_jobs rediscovers it across BOTH shell jobs and background agents.',
+    '- Long basher logs: for small outputs omit `what_to_summarize`; for large suites use `save_full_log:true` with `failure_pattern`/`max_failure_lines` for extracts; when the full log is needed use `retain_full_log:true` then `read_logs`/`read_files` on `fullLogPath`; use BACKGROUND+`check_job` for servers/tails; never embed multi-KB heredoc in `params.command`.',
+    '- Use SYNC basher for finite commands that exit; use BACKGROUND only for never-exiting processes (dev server, build watcher, log tail) with params.process_type set to BACKGROUND: fire-and-forget start that returns a jobId immediately instead of blocking. Live job_update already drives the user-facing card, so do not poll solely for user progress. Make one bounded check_job follow per job for agent-side readiness/exitCode (pass wait_for to block until a readiness/error pattern appears, with a timeout_seconds bound), thread nextCursor across follows, and terminal state means STOP with no further follows. After 2 empty follows with no new output or progress, do other work, cancel/retry, or ask the user. Use kill_job when a background job is no longer needed. To watch an existing log file, start a BACKGROUND `tail -f <file>` and check_job it when you need agent-side follow. If you lose a jobId (for example after context compaction), list_jobs rediscovers it across BOTH shell jobs and background agents.',
     '- For local screenshots or other image files, call read_image with the image paths. Do not call read_files on image formats. Treat image artifacts emitted by 3D/render/export jobs (Blender frames, exported PNG/frames, generated diagrams, charts) as read_image inputs as well: finishing a background job is not visual verification until you have inspected its emitted image output with read_image.',
   ).join('\n  ')}
 ${
@@ -804,6 +838,24 @@ ${guideSections}
         'timeout',
         'abort',
         'circuit',
+        'mutex',
+        'semaphore',
+        'throttle',
+        'debounce',
+        'latch',
+        'barrier',
+        'channel',
+        'stream',
+        'streams',
+        'socket',
+        'sockets',
+        'transaction',
+        'transactions',
+        'saga',
+        'reconcile',
+        'reconciler',
+        'watchdog',
+        'heartbeat',
       ])
       const reliabilityCodeExtension =
         /\.(?:ts|tsx|mts|cts|js|jsx|mjs|cjs|py|go|rs|java|kt|kts|rb|php|cs|swift|c|cc|cpp|h|hpp)$/
@@ -829,19 +881,19 @@ ${guideSections}
               file,
             ),
           ) ||
-          /\b(?:dependency|dependencies|lockfile|package manager|supply chain|license|vulnerabilit)/.test(
+          /\b(?:dependency|dependencies|lockfile|package manager|supply chain|license|vulnerabilit|cve|sbom|transitive dep\w*|peer dep\w*)/.test(
             requirements,
           )
         )
           selected.add('dependency-reviewer')
         if (
-          /(?:^|\/)(?:migrations?|schema|database|db)(?:\/|\.)|\.sql$|\b(?:migrations?|backfill|schema change|database compatibility|rollback)\b/.test(
+          /(?:^|\/)(?:migrations?|schema|database|db)(?:\/|\.)|\.sql$|\b(?:migrations?|backfill|schema change|database compatibility|rollback|data migration|reindex\w*|data backfill|dual-write|dual write)\b/.test(
             joined,
           )
         )
           selected.add('migration-reviewer')
         if (
-          /\b(?:public api|backward compat|breaking change|deprecat\w*|serialization|persisted format|config contract|environment variable|cli flag)\b/.test(
+          /\b(?:public api|backward compat|backwards compat|breaking change|deprecat\w*|serialization|persisted format|config contract|environment variable|cli flag|wire format|api contract|schema version\w*|protocol version\w*|semver|feature flag)\b/.test(
             requirements,
           ) ||
           files.some((file) =>
@@ -877,17 +929,17 @@ ${guideSections}
         }
 
         if (
-          /\b(?:race|concurr\w*|retry|retries|cancel|abort|idempoten\w*|deadlock|state machine|resource leak|partial failure)\b/.test(
+          /\b(?:race|concurr\w*|retry|retries|cancel|abort|idempoten\w*|deadlock|state machine|resource leak|partial failure|mutex|semaphore|throttl\w*|debounc\w*|livelock|lock contention|data race|atomic\w*|reentran\w*|backpressure|back-pressure|graceful shutdown|dropped (?:event|message)s?)\b/.test(
             requirements,
           ) ||
           files.some(isReliabilityCodePath)
         )
           selected.add('reliability-reviewer')
         if (
-          /\b(?:performance|latency|throughput|benchmark|profil\w*|allocation|hot path|load test|complexity)\b/.test(
+          /\b(?:performance|latency|throughput|benchmark|profil\w*|allocation|hot path|load test|complexity|memory leak|oom|regress\w*|slow\w*|bottleneck|cache miss|n\+1)\b/.test(
             requirements,
           ) ||
-          files.some((file) => /(?:bench|perf|load-test|profil)/.test(file))
+          files.some((file) => /(?:bench|perf|load-test|profil|flamegraph)/.test(file))
         )
           selected.add('performance-specialist')
         const hasUiFiles = files.some((file) =>
@@ -1012,9 +1064,59 @@ ${guideSections}
         'policy',
       ]
       const SECURITY_SENSITIVE_NAME_SUBSTRINGS = ['secret', 'token', 'apikey']
+      // The sentinel content marker for a gate file that was deleted (true
+      // nonexistence — see the ENOENT probe in readGateFileContentMarker).
+      // Single source of truth for every deletion-semantics site so the
+      // producer and its consumers cannot drift: readGateFileContentMarker
+      // (both ENOENT returns), collectDeletedFilesFromSnapshotDetails, the
+      // turn-start open-finding prune, and isCreditableContentMarker.
+      // Declared INSIDE the handleSteps body rather than at module scope for
+      // the same serialization reason as the globs above: handleSteps is
+      // serialized via .toString() and reconstructed with new Function(...),
+      // so a module-scope binding would be undefined in the reconstructed
+      // body, while this in-body const is serialized along with the function.
+      // It must stay ABOVE the deleted-file finding prune in source order:
+      // `const` bindings are not hoisted (temporal dead zone), and the prune
+      // executes during the generator's initial top-to-bottom pass, so a
+      // lower declaration would throw a ReferenceError at turn start. The
+      // VALUE must remain exactly 'missing': it is persisted in serialized
+      // gate state (the per-file marker ledgers) and compared against markers
+      // recomputed from the live filesystem, so a changed value would silently
+      // evict all persisted deletion credit.
+      const GATE_FILE_MISSING_CONTENT_MARKER = 'missing'
+      // M3-T2 (audit shard-agent-roster readGateFileContentMarker HIGH perf
+      // finding): per-turn marker cache keyed by normalized path. The gate
+      // loop calls readGateFileContentMarker for the SAME files many times
+      // per iteration (eviction ledger, security/specialist freshness,
+      // buildGateSnapshotDetails per fingerprint), re-opening and sha256-
+      // hashing every file each time. Liveness without a filesystem watcher:
+      // a cached marker is reused ONLY while a fresh fstat of the same size +
+      // mtime matches the values captured when it was hashed, so any content
+      // change still re-hashes the live bytes. The marker string itself stays
+      // the per-path sha256 marker, so the cache can never serve a different
+      // file's bytes and every other failure marker (unreadable:*/missing)
+      // stays byte-identical. Bounded (250 entries), reset every turn.
+      const GATE_MARKER_CACHE_MAX = 250
+      const gateMarkerCache = new Map<
+        string,
+        { size: number; mtimeMs: number; marker: string }
+      >()
       const runReviewerGate = runValidationGate
       const reviewerAgentType = 'code-reviewer'
-      const MAX_REVIEWER_NO_VERDICT_RETRIES = 1
+      // Retry the reviewer before offering the user-authorized bypass:
+      // weaker (non-SOTA) models often fail the structured set_output contract
+      // on the first attempt but recover on a re-prompt. A no-verdict is never
+      // credited as a pass. Default is unlimited (Infinity): retries continue
+      // without crediting until a schema-valid verdict arrives; a finite
+      // configured value ≥ 1 must be set explicitly to bound the retries.
+      const configuredMaxReviewerNoVerdictRetries =
+        config?.maxReviewerNoVerdictRetries
+      const MAX_REVIEWER_NO_VERDICT_RETRIES =
+        typeof configuredMaxReviewerNoVerdictRetries === 'number' &&
+        Number.isFinite(configuredMaxReviewerNoVerdictRetries) &&
+        configuredMaxReviewerNoVerdictRetries >= 1
+          ? Math.min(Math.floor(configuredMaxReviewerNoVerdictRetries), 10)
+          : Number.POSITIVE_INFINITY
       // Optional validation-hook repair cap. Already resolved into
       // programmaticConfig at createBase2 load time (null = unlimited).
       // Re-clamp here with local literals only because handleSteps is
@@ -1045,7 +1147,14 @@ ${guideSections}
         configuredMaxSpecialistRepairRounds >= 1
           ? Math.min(Math.floor(configuredMaxSpecialistRepairRounds), 20)
           : Number.POSITIVE_INFINITY
-      const MAX_SPECIALIST_NO_VERDICT_RETRIES = 1
+      const configuredMaxSpecialistNoVerdictRetries =
+        config?.maxSpecialistNoVerdictRetries
+      const MAX_SPECIALIST_NO_VERDICT_RETRIES =
+        typeof configuredMaxSpecialistNoVerdictRetries === 'number' &&
+        Number.isFinite(configuredMaxSpecialistNoVerdictRetries) &&
+        configuredMaxSpecialistNoVerdictRetries >= 1
+          ? Math.min(Math.floor(configuredMaxSpecialistNoVerdictRetries), 10)
+          : Number.POSITIVE_INFINITY
       // The post-gate finalization instruction shared by every gate-pass path
       // is built by buildGatePassFinalizationNotice() in the inline-helper
       // region below (see that function's comment for why it must stay a
@@ -1202,6 +1311,97 @@ ${guideSections}
       // serialized state lacks this field, which is what makes the
       // condonedFindingTexts fallback below conditional on it being empty.
       activeWorkState.condonedFindingKeys ??= []
+      // Deleted-file finding prune. A pending gate file DELETED before any
+      // snapshot captured its bytes resolves to the `missing` content marker
+      // (readGateFileContentMarker's GATE_FILE_MISSING_CONTENT_MARKER) and is
+      // attested-by-absence, so an open
+      // finding whose ENTIRE file set is now missing can never be cleared by a
+      // fresh matching review: the reviewer cannot read a deleted file and
+      // keeps returning `BLOCKING: ...assigned-file-unreadable...`, which
+      // re-creates the finding and re-spawns its specialist forever (the
+      // scripts/perf-probe-tmp.ts loop). Remove such findings — and their
+      // verbatim blocker strings, matched by the same text-containment rule
+      // mergeReviewerFindings uses to keep blockers and findings in sync —
+      // BEFORE the owed-set rehydration below so a pruned finding's reviewer
+      // family is not rehydrated into another re-review. A finding naming ANY
+      // still-existing file is kept untouched: genuinely
+      // unreadable-but-present files (permissions, EISDIR, symlink escape)
+      // produce `unreadable:*` markers, never `missing`, so fail-closed
+      // re-review for them is preserved.
+      {
+        const openFindings = activeWorkState.openReviewerFindings ?? []
+        const missingFileFindings = openFindings.filter((finding) => {
+          const findingFiles = Array.isArray(finding.files)
+            ? finding.files.filter(
+                (file): file is string =>
+                  typeof file === 'string' && file.length > 0,
+              )
+            : []
+          return (
+            findingFiles.length > 0 &&
+            findingFiles.every(
+              (file) =>
+                readGateFileContentMarker(file) ===
+                GATE_FILE_MISSING_CONTENT_MARKER,
+            )
+          )
+        })
+        if (missingFileFindings.length > 0) {
+          const prunedFindingSet = new Set(missingFileFindings)
+          activeWorkState.openReviewerFindings = openFindings.filter(
+            (finding) => !prunedFindingSet.has(finding),
+          )
+          const prunedFindingTexts = missingFileFindings
+            .map((finding) => finding.text)
+            .filter(
+              (text): text is string =>
+                typeof text === 'string' && text.length > 0,
+            )
+          activeWorkState.openReviewerBlockers = (
+            activeWorkState.openReviewerBlockers ?? []
+          ).filter(
+            (blocker) =>
+              !prunedFindingTexts.some((text) => blocker.includes(text)),
+          )
+          // Retire the owed-set reference the prune would otherwise strand. A
+          // family whose every open finding was just dropped can never be
+          // re-attested — the reviewer cannot read a deleted file — so leaving
+          // it in owedReviewerRevalidations would keep re-arming its aux block
+          // forever after the ledger emptied. Remove ONLY a family that was
+          // actually pruned AND is backed by no remaining open finding: a
+          // pruned family with a surviving finding stays owed (fail closed),
+          // and a family that was never pruned is untouched. The legacy scalar
+          // is owed[0]'s mirror (exactly how the rehydration block derives
+          // it), so a stale one is rewritten from the filtered list rather
+          // than left pointing at the pruned family.
+          const prunedFamilies = new Set(
+            missingFileFindings.map((finding) =>
+              reviewerFamilyFromFinding(finding),
+            ),
+          )
+          const remainingOwed = new Set(
+            activeWorkState.openReviewerFindings.map((finding) =>
+              reviewerFamilyFromFinding(finding),
+            ),
+          )
+          activeWorkState.owedReviewerRevalidations = (
+            activeWorkState.owedReviewerRevalidations ?? []
+          ).filter(
+            (family) =>
+              !prunedFamilies.has(family) || remainingOwed.has(family),
+          )
+          const staleOwedScalar = activeWorkState.requiredReviewerRevalidation
+          if (
+            staleOwedScalar !== undefined &&
+            prunedFamilies.has(staleOwedScalar) &&
+            !remainingOwed.has(staleOwedScalar)
+          ) {
+            activeWorkState.requiredReviewerRevalidation =
+              activeWorkState.owedReviewerRevalidations[0] ?? undefined
+          }
+          markActiveWorkStateChanged()
+        }
+      }
       if (activeWorkState.openReviewerFindings.length > 0) {
         // Rehydrate the owed set from EVERY open finding, not just findings[0]:
         // serialized state can carry open findings from several reviewers and
@@ -1244,6 +1444,10 @@ ${guideSections}
       // claimed in an earlier turn is already known when this turn's gate
       // passes.
       updateActivePlanTaskFromMessages(mutableAgentState.messageHistory)
+      // Track an opt-in committed-surface review request at turn start (see
+      // updateActivePlanTaskFromMessages above for the turn-start + post-STEP
+      // pairing rationale).
+      updateCommittedSurfaceReviewFromMessages(mutableAgentState.messageHistory)
       // Recognize a user-issued "COMMIT ANYWAY" at turn start (not only in
       // the post-STEP messageHistory branch) so a git-committer spawned in
       // the first step of the 'COMMIT ANYWAY' turn already sees the
@@ -1684,6 +1888,7 @@ ${guideSections}
           currentConversationMessages = messageHistory
           updateWorkflowTodoProgressFromMessages(messageHistory)
           updateActivePlanTaskFromMessages(messageHistory)
+          updateCommittedSurfaceReviewFromMessages(messageHistory)
           updateCommitScopeBypassFromMessages(messageHistory)
           processedMessageHistoryLength = messageHistory.length
         }
@@ -1742,11 +1947,25 @@ ${guideSections}
           gitStatusObservedDirty &&
           gitStatusFiles.length === 0
         ) {
+          // Q2-1 (gate-robustness fix): dropping a file here means it was
+          // COMMITTED, not that it was ever reviewed — the commit may have
+          // landed via the user, another agent, or a bypass path. Crediting
+          // it into gatePassedFiles manufactured review evidence for bytes
+          // no reviewer attested, and those files then dropped out of every
+          // future gate submission. Record the lifecycle truthfully: remove
+          // from pending (so the gate is not stuck on a clean tree) with NO
+          // credit. If the same bytes return as dirty later, P0 re-arm
+          // re-pends them from scratch.
+          let prunedCommitted = false
           for (const pendingFile of Array.from(pendingGateFiles)) {
             if (gitStatusObservedFiles.has(pendingFile)) {
               pendingGateFiles.delete(pendingFile)
-              creditGatePassedFiles([pendingFile])
+              prunedCommitted = true
             }
+          }
+          if (prunedCommitted) {
+            activeWorkState.pendingGateFiles = Array.from(pendingGateFiles)
+            markActiveWorkStateChanged()
           }
         }
         for (const file of gitStatusFiles) {
@@ -1827,6 +2046,308 @@ ${guideSections}
         ) {
           resetAuxGateFlags(activeWorkState, auxRelevantPendingFiles)
           markActiveWorkStateChanged()
+        }
+        // 5) OPT-IN committed-surface specialist review. Evaluated BEFORE the
+        // specialist gates below, so a pending request can never reach the
+        // 'no-pending-changes-in-snapshot' early-credit skip inside them (that
+        // block only runs when a specialist still routes for the pending set,
+        // which cannot happen on a clean tree) and is never silently
+        // auto-credited with zero review. Consumed on its FIRST attempt
+        // whatever the outcome: a stale pending request can never auto-mint on a
+        // later clean turn the model did not intend. Committed paths never enter
+        // the pending set: this branch only ever consumes/rejects the request,
+        // spawns reviewers, or mints a receipt.
+        const committedSurfaceRequest =
+          activeWorkState.committedSurfaceReviewRequest
+        if (committedSurfaceRequest?.status === 'pending') {
+          const committedSurfaceTaskId = committedSurfaceRequest.taskId
+          const consumeCommittedSurfaceRequest = (
+            status: 'consumed' | 'rejected',
+            reason?: string,
+          ): void => {
+            activeWorkState.committedSurfaceReviewRequest =
+              status === 'consumed'
+                ? {
+                    taskId: committedSurfaceTaskId,
+                    status: 'consumed',
+                  }
+                : {
+                    taskId: committedSurfaceTaskId,
+                    status: 'rejected',
+                    reason: reason ?? 'unknown',
+                  }
+            activeWorkState.committedSurfaceReviewResolvedFromMessageIndex =
+              processedMessageHistoryLength
+            markActiveWorkStateChanged()
+          }
+          // (a) The dirty-tree gate still owns working-tree changes. Pending
+          // files exist -> reject and fall through to the normal gate logic
+          // WITHOUT spawning anything. The tree is definitionally not fully
+          // committed, and committed paths must never enter the pending set.
+          if (currentPendingGateFiles.length > 0) {
+            consumeCommittedSurfaceRequest('rejected', 'worktree-dirty')
+            activeWorkState.latestWorkSummary =
+              'Committed-surface review rejected: worktree-dirty (pending gate files exist).'
+            markActiveWorkStateChanged()
+            continue
+          }
+          // (b) Fresh clean-tree check via raw porcelain. Only .agents/sessions/
+          // paths are excluded; any other dirty path rejects the request.
+          const porcelainResult = yield {
+            toolName: 'run_terminal_command',
+            input: {
+              command: 'git status --porcelain --untracked-files=all',
+              process_type: 'SYNC',
+            },
+            includeToolCall: false,
+          } as any
+          const porcelainToolResult =
+            (porcelainResult as any)?.toolResult ?? porcelainResult
+          const porcelainFailure = detectCommandFailure(porcelainToolResult)
+          const porcelainStdout = extractTerminalStdout(porcelainToolResult)
+          if (porcelainFailure && !porcelainStdout) {
+            consumeCommittedSurfaceRequest('rejected', 'git-unavailable')
+            activeWorkState.latestWorkSummary =
+              'Committed-surface review rejected: git-unavailable (could not run git status).'
+            markActiveWorkStateChanged()
+            continue
+          }
+          const porcelainPaths = porcelainStdout
+            .split('\n')
+            .map((line) => parseGitStatusLine(line))
+            .filter((path) => path.length > 0)
+          const committedSurfaceDirtyPaths = porcelainPaths.filter(
+            (path) => !isAgentsSessionsPath(path),
+          )
+          if (committedSurfaceDirtyPaths.length > 0) {
+            consumeCommittedSurfaceRequest(
+              'rejected',
+              `worktree-dirty:${committedSurfaceDirtyPaths.slice(0, 5).join(',')}`,
+            )
+            activeWorkState.latestWorkSummary = `Committed-surface review rejected: worktree-dirty (${committedSurfaceDirtyPaths.slice(0, 5).join(', ')}).`
+            markActiveWorkStateChanged()
+            continue
+          }
+          // (c) Derive the bounded fileset from runtime-observed task files.
+          // Fail closed on an empty fileset (a constant-fingerprint receipt) or
+          // an overflow (an unbounded review).
+          const committedSurfaceOutcome = deriveCommittedSurfaceFileSet({
+            runtimeFiles: normalizeGateFileList([
+              ...activeWorkState.touchedFiles,
+              ...activeWorkState.changedFiles,
+            ]),
+            isReviewable: isReviewableGateFile,
+            markerFor: readGateFileContentMarker,
+            cap: 40,
+          })
+          if (committedSurfaceOutcome.status === 'empty') {
+            consumeCommittedSurfaceRequest(
+              'rejected',
+              'no-reviewable-committed-files',
+            )
+            activeWorkState.latestWorkSummary =
+              'Committed-surface review rejected: no-reviewable-committed-files (the derived fileset was empty).'
+            markActiveWorkStateChanged()
+            continue
+          }
+          if (committedSurfaceOutcome.status === 'overflow') {
+            consumeCommittedSurfaceRequest(
+              'rejected',
+              `fileset-overflow:${committedSurfaceOutcome.total}`,
+            )
+            activeWorkState.latestWorkSummary = `Committed-surface review rejected: fileset-overflow (${committedSurfaceOutcome.total} reviewable committed files exceed the 40-file cap).`
+            markActiveWorkStateChanged()
+            continue
+          }
+          const derivedFiles = committedSurfaceOutcome.files
+          const committedFingerprint = hashGateSnapshotDetails(
+            buildGateSnapshotDetails(derivedFiles, ''),
+          )
+          // (e) Fail closed on a non-attestable fingerprint: a stable error
+          // string is not content evidence and must never mint.
+          if (!isAttestableSnapshotFingerprint(committedFingerprint)) {
+            consumeCommittedSurfaceRequest(
+              'rejected',
+              'non-attestable-fingerprint',
+            )
+            activeWorkState.latestWorkSummary =
+              'Committed-surface review rejected: non-attestable-fingerprint (crypto unavailable).'
+            markActiveWorkStateChanged()
+            continue
+          }
+          // (d) Route specialists over the derived fileset, union with owed
+          // specialists (same carve-out as the dirty path), then drop any whose
+          // credit is fresh for THIS committed fingerprint.
+          const committedBaseRouted = selectSpecialistReviewersInline({
+            files: derivedFiles,
+            requirements: prompt ?? '',
+          })
+          const committedOwed = (
+            activeWorkState.owedReviewerRevalidations ?? []
+          ).filter(
+            (agent) =>
+              agent !== 'code-reviewer' && agent !== 'security-reviewer',
+          ) as string[]
+          const routedCommittedSpecialists = (
+            committedOwed.length > 0
+              ? Array.from(new Set([...committedBaseRouted, ...committedOwed]))
+              : committedBaseRouted
+          ).filter(
+            (agentType) =>
+              !specialistCreditIsFresh(
+                agentType,
+                committedFingerprint,
+                derivedFiles,
+              ),
+          )
+          if (routedCommittedSpecialists.length === 0) {
+            consumeCommittedSurfaceRequest('consumed')
+            activeWorkState.lastReviewerGateSkipReason =
+              'committed-surface-no-specialists-routed'
+            activeWorkState.latestWorkSummary = `Committed-surface review skipped: committed-surface-no-specialists-routed for task ${committedSurfaceTaskId} over ${derivedFiles.length} file(s).`
+            markActiveWorkStateChanged()
+            continue
+          }
+          // (f) Spawn every routed specialist in ONE batch against the
+          // committed fingerprint, mirroring the dirty-path spawn shape.
+          const committedSpawnBatch = yield {
+            toolName: 'spawn_agents',
+            input: {
+              agents: routedCommittedSpecialists.map((agentType) => ({
+                agent_type: agentType,
+                prompt: buildSpecialistScopedReviewPrompt({
+                  title:
+                    'Perform the routed committed-surface specialist review (worktree is clean; the listed files are committed at HEAD).',
+                  agentType,
+                  files: derivedFiles,
+                  snapshotFingerprint: committedFingerprint,
+                  userPrompt: prompt ?? '',
+                  extraLines: [
+                    'The worktree is fully committed and clean; review the COMMITTED content of the listed files and attest to exactly those bytes.',
+                  ],
+                }),
+                params: {
+                  files: derivedFiles,
+                  snapshot_id: committedFingerprint,
+                },
+              })),
+            },
+            includeToolCall: false,
+          } as any
+          const committedSpawnToolResult =
+            (committedSpawnBatch as any)?.toolResult ?? committedSpawnBatch
+          // (g) Attestation per specialist. There are no deleted files by
+          // construction: every derived file carries a verifiable sha256
+          // marker, so none is attested-by-absence (empty deleted set).
+          let committedAttestationFailed = false
+          for (const agentType of routedCommittedSpecialists) {
+            const committedResult = extractSpawnedAgentResult(
+              committedSpawnToolResult,
+              agentType,
+            )
+            const committedAttestationIssues = collectReviewerAttestationIssues(
+              committedResult,
+              committedFingerprint,
+              derivedFiles,
+              [],
+            )
+            if (committedAttestationIssues.length > 0) {
+              consumeCommittedSurfaceRequest(
+                'rejected',
+                `attestation-failed:${agentType}`,
+              )
+              activeWorkState.currentPhase = 'blocked'
+              activeWorkState.openReviewerBlockers = [
+                `${agentType} committed-surface review could not attest: ${committedAttestationIssues.join('; ')}`,
+              ]
+              activeWorkState.nextRequiredAction =
+                'Re-run the committed-surface review once the specialists return well-formed snapshot attestations; do not finalize without it.'
+              activeWorkState.latestWorkSummary = `${agentType} failed committed-surface attestation; the review request was consumed.`
+              markActiveWorkStateChanged()
+              committedAttestationFailed = true
+              break
+            }
+          }
+          if (committedAttestationFailed) continue
+          // (g2) A clean snapshot attestation is NOT enough to mint:
+          // collectReviewerAttestationIssues verifies only the snapshot/
+          // coverage shape, so a specialist returning BLOCKING/NON_BLOCKING
+          // with open findings would otherwise mint a durable
+          // 'committed-surface' receipt that validatePlanTransition accepts as
+          // done evidence. Require the same finalization verdict (LOOKS_GOOD
+          // with no coverage gap, failing dimension, or in-scope requirement
+          // gap) the specialist gates apply before crediting, so a receipt
+          // mints only for genuinely reviewed, attested committed bytes.
+          let committedReviewFailed = false
+          for (const agentType of routedCommittedSpecialists) {
+            const committedVerdict = getReviewerFinalizationVerdict(
+              extractSpawnedAgentResult(committedSpawnToolResult, agentType),
+            )
+            if (committedVerdict !== 'LOOKS_GOOD') {
+              consumeCommittedSurfaceRequest(
+                'rejected',
+                `specialist-verdict-not-looks-good:${agentType}`,
+              )
+              activeWorkState.currentPhase = 'blocked'
+              activeWorkState.openReviewerBlockers = [
+                `${agentType} committed-surface review returned a non-finalizing verdict; committed bytes are not done evidence.`,
+              ]
+              activeWorkState.nextRequiredAction =
+                'Resolve the specialist findings and request the committed-surface review again once the committed bytes are genuinely clean.'
+              activeWorkState.latestWorkSummary = `${agentType} did not return LOOKS_GOOD on the committed surface; the review request was rejected.`
+              markActiveWorkStateChanged()
+              committedReviewFailed = true
+              break
+            }
+          }
+          if (committedReviewFailed) continue
+          // (h) Full attestation + verdict success: mint the receipt.
+          prunePlanTaskGateReceipts()
+          const committedReceiptId = committedSurfaceReceiptId(
+            committedSurfaceTaskId,
+            committedFingerprint,
+          )
+          const committedExistingReceipts = readPlanTaskGateReceipts(
+            activeWorkState.planTaskGateReceipts,
+          )
+          // One live receipt per task: REPLACE the claimed task's previous
+          // receipt over the remaining entries and keep the ledger bounded to
+          // the most recent 24 (same convention as the fresh gate-pass mint).
+          const committedReviewerVerdict = routedCommittedSpecialists
+            .map((agentType) => {
+              const committedOutputs = collectStructuredReviewerOutputs(
+                extractSpawnedAgentResult(committedSpawnToolResult, agentType),
+              )
+              return (
+                committedOutputs[committedOutputs.length - 1]?.verdict ?? ''
+              )
+            })
+            .filter(Boolean)
+            .join(', ')
+            .slice(0, 400)
+          const committedReceipt: Base2PlanTaskGateReceipt = {
+            receiptId: committedReceiptId,
+            taskId: committedSurfaceTaskId,
+            evidence: 'committed-surface',
+            snapshotFingerprint: committedFingerprint,
+            files: derivedFiles,
+            validationSummary: '',
+            reviewerVerdict: committedReviewerVerdict,
+            recordedAt: new Date().toISOString(),
+          }
+          activeWorkState.planTaskGateReceipts = [
+            ...committedExistingReceipts.filter(
+              (receipt) => receipt.taskId !== committedSurfaceTaskId,
+            ),
+            committedReceipt,
+          ].slice(-24)
+          consumeCommittedSurfaceRequest('consumed')
+          activeWorkState.latestWorkSummary = `Committed-surface review passed (evidence committed-surface) for task ${committedSurfaceTaskId}: ${derivedFiles.length} file(s) attested at fingerprint ${committedFingerprint.slice(0, 16)}; receipt ${committedReceiptId}.`
+          markActiveWorkStateChanged()
+          // Every committed-surface outcome either consumed the request or
+          // rejected it, and none touched the pending gate set or the aux
+          // gates, so continue to the normal gate logic for this iteration.
+          continue
         }
         // Unified pre-reviewer aux gates (M3). These fire BEFORE the
         // validation/reviewer gate (which is now the FINAL gate), in order:
@@ -2355,7 +2876,8 @@ ${guideSections}
             securityDriftedFiles.length > 0
               ? securityDriftedFiles
               : securityChangedFiles
-          const securitySpawnScoped = securitySpawnFiles !== securityChangedFiles
+          const securitySpawnScoped =
+            securitySpawnFiles !== securityChangedFiles
           const securitySpawnDetails = securitySpawnScoped
             ? buildGateSnapshotDetails(securitySpawnFiles, '')
             : securitySnapshotDetails
@@ -2406,8 +2928,15 @@ ${guideSections}
             securitySpawnFiles,
             securitySpawnDeletedFiles,
           )
+          // Attestation-loop fix: a security review's clean verdict is
+          // NON_BLOCKING (its findings are elevated as repair fuel by the
+          // securityBlockers branch below BEFORE this protocol check), so the
+          // LOOKS_GOOD-only default read every clean review as a protocol
+          // failure and parked the gate in a spawn/reject loop. The
+          // security-specific credit accepts NON_BLOCKING while keeping the
+          // same coverage/requirement/dimension gates.
           const securityVerdict =
-            getReviewerFinalizationVerdict(securityToolResult)
+            getSecurityReviewerFinalizationVerdict(securityToolResult)
           const securityProtocolFailure =
             securityCrash ||
             securityAttestationIssues.length > 0 ||
@@ -2513,11 +3042,14 @@ ${guideSections}
                       ],
                       unknowns: [],
                       findings: activeWorkState.openReviewerFindings.map(
-                        ({ id, text, files, snapshotFingerprint }) => ({
+                        ({ id, text, files, snapshotFingerprint, reviewer }) => ({
                           id,
                           text,
                           files,
                           snapshotFingerprint,
+                          // Q4-3: carry the owning family so the repair
+                          // receipt's findingsAddressed can be scoped to it.
+                          ...(reviewer && { reviewer }),
                         }),
                       ),
                       permissions: {
@@ -2577,8 +3109,19 @@ ${guideSections}
             const securityRepairReceipt = extractAgentReceipt(
               (securityRepairResult as any)?.toolResult ?? securityRepairResult,
             )
+            // Q4-3 (gate-robustness fix): scope the open-id set to the
+            // SECURITY family. The unfiltered map let a repair receipt
+            // address a code-reviewer finding's id (or any other family's)
+            // and satisfy this security check through a cross-family id —
+            // and conversely the every-id-addressed completion check below
+            // could demand code-reviewer ids a security repair cannot touch.
             const openSecurityFindingIds = new Set(
-              activeWorkState.openReviewerFindings.map((finding) => finding.id),
+              (activeWorkState.openReviewerFindings ?? [])
+                .filter(
+                  (finding) =>
+                    reviewerFamilyFromFinding(finding) === 'security-reviewer',
+                )
+                .map((finding) => finding.id),
             )
             const securityRepairHasProgress =
               !!securityRepairReceipt &&
@@ -2586,8 +3129,18 @@ ${guideSections}
                 (file: { path: string }) =>
                   typeof file.path === 'string' && file.path.trim().length > 0,
               )
+            // M1-T4c (fail closed): byte progress alone must not satisfy the
+            // gate — the receipt must report at least one open finding id
+            // (same intersection rule as the reviewer repair path).
+            const securityRepairAddressesOpenFinding =
+              openSecurityFindingIds.size === 0 ||
+              (!!securityRepairReceipt &&
+                securityRepairReceipt.findingsAddressed.some((id: string) =>
+                  openSecurityFindingIds.has(id),
+                ))
             if (
               !securityRepairReceipt ||
+              !securityRepairAddressesOpenFinding ||
               (!securityRepairHasProgress &&
                 (securityRepairReceipt.status !== 'completed' ||
                   [...openSecurityFindingIds].some(
@@ -2953,7 +3506,8 @@ ${guideSections}
                         specialistCreditFingerprint,
                       userPrompt: prompt ?? '',
                       extraLines: buildReviewerRoundLedgerLines(agentType, {
-                        scopeFiles: specialistScopedFileSets.get(agentType) ?? [],
+                        scopeFiles:
+                          specialistScopedFileSets.get(agentType) ?? [],
                         currentFingerprint:
                           specialistScopedFingerprints.get(agentType) ??
                           specialistCreditFingerprint,
@@ -3195,11 +3749,10 @@ ${guideSections}
                     // attested, PRESERVING previously stored markers for other
                     // files so their per-file credit survives the re-review.
                     {
-                      const markerMap = (
-                        (activeWorkState.specialistReviewFileMarkers ??= {})[
+                      const markerMap =
+                        ((activeWorkState.specialistReviewFileMarkers ??= {})[
                           agentType
-                        ] ??= {}
-                      )
+                        ] ??= {})
                       for (const scopedFile of specialistScopedFileSets.get(
                         agentType,
                       ) ?? []) {
@@ -3499,8 +4052,20 @@ ${guideSections}
                           typeof file.path === 'string' &&
                           file.path.trim().length > 0,
                       )
+                    // M1-T4c (fail closed): byte progress alone must not
+                    // satisfy the gate — the receipt must report at least one
+                    // open finding id (same intersection rule as the reviewer
+                    // repair path).
+                    const specialistRepairAddressesOpenFinding =
+                      specialistOpenFindingIds.size === 0 ||
+                      (!!specialistRepairReceipt &&
+                        specialistRepairReceipt.findingsAddressed.some(
+                          (id: string) =>
+                            specialistOpenFindingIds.has(id),
+                        ))
                     if (
                       !specialistRepairReceipt ||
+                      !specialistRepairAddressesOpenFinding ||
                       (!specialistRepairHasProgress &&
                         (specialistRepairReceipt.status !== 'completed' ||
                           [...specialistOpenFindingIds].some(
@@ -3729,11 +4294,10 @@ ${guideSections}
                   // attested, PRESERVING previously stored markers for other
                   // files so their per-file credit survives the re-review.
                   {
-                    const markerMap = (
-                      (activeWorkState.specialistReviewFileMarkers ??= {})[
+                    const markerMap =
+                      ((activeWorkState.specialistReviewFileMarkers ??= {})[
                         agentType
-                      ] ??= {}
-                    )
+                      ] ??= {})
                     for (const scopedFile of specialistScopedFileSets.get(
                       agentType,
                     ) ?? []) {
@@ -3768,14 +4332,89 @@ ${guideSections}
                   const rateLimited =
                     activeWorkState.lastReviewerGateSkipReason ===
                     'specialist-rate-limited'
+                  // Deadlock escape: a specialist that keeps failing for a
+                  // non-source reason (protocol/attestation crash or provider
+                  // rate-limit) would otherwise block the turn forever. Mirror
+                  // the reviewer-crash bypass: after the harness has already
+                  // failed closed once, let the user explicitly authorize
+                  // crediting this ONE specialist on the recorded validation
+                  // evidence. The bypass credits the specialist exactly like
+                  // its success path so re-routing skips it, then re-enters the
+                  // loop toward the final code-reviewer (never finalizes here).
+                  const specialistBypassAuthorized =
+                    hasReviewerBypassAuthorization(
+                      currentConversationMessages,
+                      activeWorkState.reviewerBypassChallenge,
+                      reviewChallengeFingerprint(currentPendingGateFiles),
+                    )
+                  if (specialistBypassAuthorized) {
+                    // The terminal-failure handler runs AFTER the routed-agent
+                    // for loop, so the failing agentType is no longer bound.
+                    // Credit every routed specialist for this snapshot exactly
+                    // like the success path (done set + fingerprint + file
+                    // markers + owed clear) so re-routing skips them and the
+                    // loop advances toward the final code-reviewer.
+                    for (const routedAgent of routedSpecialists) {
+                      activeWorkState.specialistReviewGatesDone = Array.from(
+                        new Set([
+                          ...(activeWorkState.specialistReviewGatesDone ?? []),
+                          routedAgent,
+                        ]),
+                      )
+                      ;(activeWorkState.specialistReviewGateFingerprints ??=
+                        {})[routedAgent] = specialistCreditFingerprint
+                      const markerMap =
+                        ((activeWorkState.specialistReviewFileMarkers ??= {})[
+                          routedAgent
+                        ] ??= {})
+                      for (const scopedFile of specialistScopedFileSets.get(
+                        routedAgent,
+                      ) ?? []) {
+                        markerMap[scopedFile] =
+                          readGateFileContentMarker(scopedFile)
+                      }
+                      clearOwedReviewer(routedAgent)
+                    }
+                    activeWorkState.lastReviewerGateSkipReason = ''
+                    activeWorkState.validationAssurance = 'reduced'
+                    activeWorkState.reviewerGateBypassReason = `User authorized bypass of the specialist review gate after ${rateLimited ? 'a specialist rate-limit' : 'a specialist terminal (protocol/attestation) failure'}.`
+                    activeWorkState.reviewerGateBypassRecord = {
+                      reason: activeWorkState.reviewerGateBypassReason,
+                      authorizedAt: new Date().toISOString(),
+                      pendingFiles: Array.from(pendingGateFiles),
+                      fingerprint:
+                        reviewChallengeFingerprint(currentPendingGateFiles),
+                      validationSummary:
+                        activeWorkState.lastValidationSummary ?? '',
+                    }
+                    if (activeWorkState.reviewerBypassChallenge) {
+                      activeWorkState.reviewerBypassChallenge.consumed = true
+                    }
+                    markActiveWorkStateChanged()
+                    emitGateTelemetry({
+                      currentPhase: activeWorkState.currentPhase,
+                      pendingFileCount: pendingGateFiles.size,
+                      pendingFiles: Array.from(pendingGateFiles),
+                      reviewerStatus: 'skipped',
+                      validationStatus: 'passed',
+                      skipReason: rateLimited
+                        ? 'user-authorized-specialist-rate-limit-bypass'
+                        : 'user-authorized-specialist-terminal-bypass',
+                    })
+                    continue
+                  }
                   if (!activeWorkState.lastReviewerGateSkipReason) {
                     activeWorkState.lastReviewerGateSkipReason =
                       'specialist-terminal-failure'
                   }
+                  const specialistBypassChallenge =
+                    ensureReviewerBypassChallenge(
+                      reviewChallengeFingerprint(currentPendingGateFiles),
+                      currentConversationMessages,
+                    )
                   activeWorkState.currentPhase = 'blocked'
                   if (!rateLimited) {
-                    activeWorkState.nextRequiredAction =
-                      'Obtain a fresh matching specialist review against a stable review bundle before finalization can continue.'
+                    activeWorkState.nextRequiredAction = `Obtain a fresh matching specialist review against a stable review bundle before finalization can continue, or explicitly reply "BYPASS REVIEWER ${specialistBypassChallenge.id}".`
                     activeWorkState.latestWorkSummary =
                       'Specialist review protocol failed after one automatic refresh; finalization remains blocked.'
                   }
@@ -3793,6 +4432,7 @@ ${guideSections}
                             ...activeWorkState.openReviewerBlockers,
                             '',
                             'This is a transient provider limit, not a source-code finding. The harness did not spawn repair-editor or recompute bare-hex fingerprints. End turn and retry later.',
+                            `Or, to finalize on the recorded validation evidence for this snapshot only, explicitly reply "BYPASS REVIEWER ${specialistBypassChallenge.id}".`,
                           ].join('\n')
                         : [
                             'Specialist review gate failed snapshot/file attestation after one automatic refresh.',
@@ -3800,6 +4440,7 @@ ${guideSections}
                             ...activeWorkState.openReviewerBlockers,
                             '',
                             'This is a specialist reviewer protocol/configuration failure, not a source-code finding. The harness did not spawn repair-editor or finalize. Stop retrying automatically; obtain a fresh matching specialist review against a stable review bundle.',
+                            `Or, to finalize on the recorded validation evidence for this snapshot only, explicitly reply "BYPASS REVIEWER ${specialistBypassChallenge.id}".`,
                           ].join('\n'),
                     },
                     includeToolCall: false,
@@ -4107,9 +4748,7 @@ ${guideSections}
           // `typeof activeWorkState...` annotation is itself circular
           // (TS2502), so the named imported type is used instead.
           const newestEvidenceEntry:
-            | NonNullable<
-                Base2ActiveWorkState['validationEvidence']
-              >[number]
+            | NonNullable<Base2ActiveWorkState['validationEvidence']>[number]
             | undefined =
             activeWorkState.validationEvidence?.[
               (activeWorkState.validationEvidence?.length ?? 0) - 1
@@ -4124,9 +4763,7 @@ ${guideSections}
             !!newestEvidenceEntry &&
             gateFileSetsEqual(newestEvidenceEntry.files ?? [], gateScopeFiles)
           const reusedEvidence:
-            | NonNullable<
-                Base2ActiveWorkState['validationEvidence']
-              >[number]
+            | NonNullable<Base2ActiveWorkState['validationEvidence']>[number]
             | null =
             evidenceCoversExactScope &&
             newestEvidenceEntry.assurance === 'full' &&
@@ -4147,15 +4784,13 @@ ${guideSections}
           }
           const verify = reusedEvidence
             ? null
-            : (yield {
+            : yield {
                 toolName: 'run_file_change_hooks',
                 input: { files: gateScopeFiles },
-              } as any)
+              } as any
           let failures = reusedEvidence
             ? []
-            : collectHookFailures(
-                (verify as any) && (verify as any).toolResult,
-              )
+            : collectHookFailures((verify as any) && (verify as any).toolResult)
           if (failures.length === 0) {
             if (!reusedEvidence) {
               validationSummary = summarizeHookResults(
@@ -4367,8 +5002,19 @@ ${guideSections}
                     typeof file.path === 'string' &&
                     file.path.trim().length > 0,
                 )
+              // M1-T4c (fail closed): byte progress alone must not satisfy
+              // the gate — the receipt must report at least one validation
+              // failure id (same intersection rule as the reviewer repair
+              // path).
+              const validationRepairAddressesFinding =
+                validationFindingIds.length === 0 ||
+                (!!validationRepairReceipt &&
+                  validationRepairReceipt.findingsAddressed.some(
+                    (id: string) => validationFindingIds.includes(id),
+                  ))
               if (
                 !validationRepairReceipt ||
+                !validationRepairAddressesFinding ||
                 (!validationRepairHasProgress &&
                   (validationRepairReceipt.status !== 'completed' ||
                     validationFindingIds.some(
@@ -4733,10 +5379,13 @@ ${guideSections}
                     // block); empty on round 0 with no prior receipts so no
                     // stray heading or blank line appears in the first
                     // review's prompt.
-                    ...buildReviewerRoundLedgerLines(requiredReviewerAgentType, {
-                      scopeFiles: reviewableGateScopeFiles,
-                      currentFingerprint: reviewSnapshotFingerprint,
-                    }),
+                    ...buildReviewerRoundLedgerLines(
+                      requiredReviewerAgentType,
+                      {
+                        scopeFiles: reviewableGateScopeFiles,
+                        currentFingerprint: reviewSnapshotFingerprint,
+                      },
+                    ),
                     'Read large files via read_files windows (bounded block reads) instead of whole-file reads so your accumulated read context stays bounded; still attest to every pending file in reviewedFiles.',
                     '',
                     'Return the required structured review object. Echo snapshotFingerprint exactly, list every pending changed file in reviewedFiles (including tests), evaluate all review dimensions, and map every user requirement to evidence. Changed tests are first-class review targets and may also be cited as coverage evidence. Use coverage: missing only when no covering test exists in the changed files or elsewhere in the repo.',
@@ -4782,10 +5431,13 @@ ${guideSections}
                       'Snapshot details (read for file membership; do not echo):',
                       reviewSnapshotDetails,
                       `Validation gate summary: ${validationSummary}`,
-                      ...buildReviewerRoundLedgerLines(requiredReviewerAgentType, {
-                        scopeFiles: reviewableGateScopeFiles,
-                        currentFingerprint: reviewSnapshotFingerprint,
-                      }),
+                      ...buildReviewerRoundLedgerLines(
+                        requiredReviewerAgentType,
+                        {
+                          scopeFiles: reviewableGateScopeFiles,
+                          currentFingerprint: reviewSnapshotFingerprint,
+                        },
+                      ),
                       '',
                       'Protocol errors from the prior response:',
                       ...attestationIssues,
@@ -4934,6 +5586,9 @@ ${guideSections}
                     blocker,
                     reviewerFindingRecords,
                   )?.id,
+                  // Q4-2: match against THIS reviewer family's condone
+                  // records only.
+                  requiredReviewerAgentType,
                 )
               }
               return !legacyCondonedTextMatches(condonedTexts, blocker)
@@ -4962,6 +5617,8 @@ ${guideSections}
                   reviewerVerdictClass(b),
                   stripReviewerVerdictPrefix(b),
                   correlateReviewerFindingRecord(b, reviewerFindingRecords)?.id,
+                  // Q4-2: record under THIS reviewer family's namespace.
+                  requiredReviewerAgentType,
                 ),
               ),
             ])
@@ -5020,6 +5677,8 @@ ${guideSections}
                       blocker,
                       reviewerFindingRecords,
                     )?.id,
+                    // Q4-2: family-scoped cleanup, mirroring the filter.
+                    requiredReviewerAgentType,
                   )
                 }
                 return !legacyCondonedTextMatches(cleanupCondonedTexts, blocker)
@@ -5143,6 +5802,8 @@ ${guideSections}
                 stripReviewerVerdictPrefix(blocker),
                 correlateReviewerFindingRecord(blocker, reviewerFindingRecords)
                   ?.id,
+                // Q4-2: same family, other verdict class.
+                requiredReviewerAgentType,
               ).some((key) => condonedKeys.has(key))
             })
             // Emitted only on this non-exhausted path; an exhausted round is
@@ -5295,11 +5956,14 @@ ${guideSections}
                           ],
                           unknowns: [],
                           findings: activeWorkState.openReviewerFindings.map(
-                            ({ id, text, files, snapshotFingerprint }) => ({
+                            ({ id, text, files, snapshotFingerprint, reviewer }) => ({
                               id,
                               text,
                               files,
                               snapshotFingerprint,
+                              // Q4-3: carry the owning family so the repair
+                              // receipt's findingsAddressed can be scoped to it.
+                              ...(reviewer && { reviewer }),
                             }),
                           ),
                           permissions: {
@@ -5390,11 +6054,14 @@ ${guideSections}
                           ],
                           unknowns: [],
                           findings: activeWorkState.openReviewerFindings.map(
-                            ({ id, text, files, snapshotFingerprint }) => ({
+                            ({ id, text, files, snapshotFingerprint, reviewer }) => ({
                               id,
                               text,
                               files,
                               snapshotFingerprint,
+                              // Q4-3: carry the owning family so the repair
+                              // receipt's findingsAddressed can be scoped to it.
+                              ...(reviewer && { reviewer }),
                             }),
                           ),
                           permissions: {
@@ -5467,10 +6134,18 @@ ${guideSections}
             const reviewerRepairReceipt = extractAgentReceipt(
               (reviewerRepairResult as any)?.toolResult ?? reviewerRepairResult,
             )
+            // Q4-3 (gate-robustness fix): scope the open-id set to the
+            // OWNING family (requiredReviewerAgentType) so another family's
+            // open finding id can neither satisfy this repair-progress check
+            // nor be demanded of this repair round.
             const openFindingIds = new Set(
-              (activeWorkState.openReviewerFindings ?? []).map(
-                (finding) => finding.id,
-              ),
+              (activeWorkState.openReviewerFindings ?? [])
+                .filter(
+                  (finding) =>
+                    reviewerFamilyFromFinding(finding) ===
+                    requiredReviewerAgentType,
+                )
+                .map((finding) => finding.id),
             )
             const reviewerRepairHasProgress =
               !!reviewerRepairReceipt &&
@@ -5478,8 +6153,21 @@ ${guideSections}
                 (file: { path: string }) =>
                   typeof file.path === 'string' && file.path.trim().length > 0,
               )
+            // M1-T4c (fail closed): when open finding IDs exist, byte progress
+            // alone must not satisfy the gate — the receipt must report at
+            // least one open finding id, so an unrelated edit (or a repeat of
+            // an already-applied fix) cannot clear the round with zero
+            // findings addressed. With no structured open findings the
+            // progress path is unchanged.
+            const reviewerRepairAddressesOpenFinding =
+              openFindingIds.size === 0 ||
+              (!!reviewerRepairReceipt &&
+                reviewerRepairReceipt.findingsAddressed.some((id: string) =>
+                  openFindingIds.has(id),
+                ))
             if (
               !reviewerRepairReceipt ||
+              !reviewerRepairAddressesOpenFinding ||
               (!reviewerRepairHasProgress &&
                 (reviewerRepairReceipt.status !== 'completed' ||
                   [...openFindingIds].some(
@@ -5536,6 +6224,10 @@ ${guideSections}
                     reviewerVerdictClass(finding.text),
                     stripReviewerVerdictPrefix(finding.text),
                     finding.id,
+                    // Q4-2: the OWNING family from the finding record, so a
+                    // mixed code/specialist repair round namespaces each
+                    // condone key to the family that reported it.
+                    finding.reviewer,
                   ),
                 ),
               ])
@@ -5630,15 +6322,21 @@ ${guideSections}
             )
             if (reFailures.length === 0) {
               // Same no-drift rule: only seed the owed family when nothing is
-              // owed yet, and do it through the mutator.
+              // owed yet, and do it through the mutator. Q4-1: seed EVERY
+              // family that owns an open finding, not just findings[0]'s —
+              // with mixed reviewer/specialist findings, findings[0] alone
+              // dropped the other families' owed revalidations.
               if (
                 (activeWorkState.owedReviewerRevalidations ?? []).length === 0
               ) {
-                addOwedReviewer(
-                  reviewerOriginFromGateId(
-                    activeWorkState.openReviewerFindings[0]?.gateId,
+                const openFamilies = new Set(
+                  (activeWorkState.openReviewerFindings ?? []).map((finding) =>
+                    reviewerFamilyFromFinding(finding),
                   ),
                 )
+                for (const family of openFamilies) {
+                  addOwedReviewer(family)
+                }
               }
               validationSummary = summarizeHookResults(
                 (reVerify as any) && (reVerify as any).toolResult,
@@ -5790,32 +6488,93 @@ ${guideSections}
             } else {
               activeWorkState.reviewerNoVerdictCount =
                 (activeWorkState.reviewerNoVerdictCount ?? 0) + 1
-              if (
+              const noVerdictExhausted =
                 activeWorkState.reviewerNoVerdictCount >
                 MAX_REVIEWER_NO_VERDICT_RETRIES
-              ) {
-                activeWorkState.nextRequiredAction =
-                  'Reviewer repeatedly violated its structured output contract. Fix reviewer configuration before retrying.'
+              // Deadlock escape: a reviewer that keeps running but never emits
+              // a schema-valid verdict would otherwise block the turn forever
+              // (weaker non-SOTA models often fail the structured set_output
+              // contract). After the retry budget is spent, let the user
+              // explicitly authorize finalizing on the recorded validation
+              // evidence, mirroring the reviewer-crash bypass. A no-verdict is
+              // never silently credited; the bypass requires the exact
+              // "BYPASS REVIEWER <id>" reply and records reduced assurance.
+              const noVerdictBypassAuthorized =
+                noVerdictExhausted &&
+                hasReviewerBypassAuthorization(
+                  currentConversationMessages,
+                  activeWorkState.reviewerBypassChallenge,
+                  reviewSnapshotFingerprint,
+                )
+              if (noVerdictBypassAuthorized) {
+                activeWorkState.reviewerGateBypassReason = `User authorized bypass after ${activeWorkState.reviewerNoVerdictCount} reviewer no-verdict (structured-output) violations.`
+                activeWorkState.reviewerGateBypassRecord = {
+                  reason: activeWorkState.reviewerGateBypassReason,
+                  authorizedAt: new Date().toISOString(),
+                  pendingFiles: Array.from(pendingGateFiles),
+                  fingerprint: reviewSnapshotFingerprint,
+                  validationSummary,
+                }
+                if (activeWorkState.reviewerBypassChallenge) {
+                  activeWorkState.reviewerBypassChallenge.consumed = true
+                }
+                activeWorkState.nextRequiredAction = ''
+                activeWorkState.currentPhase = 'awaiting_review'
+                activeWorkState.validationAssurance = 'reduced'
+                activeWorkState.lastReviewerGateSkipReason =
+                  'user-authorized-reviewer-no-verdict-bypass'
+                reviewerFinalizationVerdict = 'LOOKS_GOOD'
+                markActiveWorkStateChanged()
+                emitGateTelemetry({
+                  currentPhase: 'awaiting_review',
+                  pendingFileCount: pendingGateFiles.size,
+                  pendingFiles: Array.from(pendingGateFiles),
+                  reviewerStatus: 'skipped',
+                  validationStatus: 'passed',
+                  skipReason: 'user-authorized-reviewer-no-verdict-bypass',
+                })
+                // No break/continue: fall through to shared finalization,
+                // exactly like the reviewer-crash bypass sibling.
+              } else if (noVerdictExhausted) {
+                const challenge = ensureReviewerBypassChallenge(
+                  reviewSnapshotFingerprint,
+                  currentConversationMessages,
+                )
+                activeWorkState.nextRequiredAction = `Reviewer repeatedly violated its structured output contract. Fix reviewer configuration before retrying, or explicitly reply "BYPASS REVIEWER ${challenge.id}" to finalize using the recorded validation evidence for this snapshot only.`
                 activeWorkState.latestWorkSummary =
                   'Reviewer no-verdict retry budget exhausted.'
                 markActiveWorkStateChanged()
+                yield {
+                  toolName: 'add_message',
+                  input: {
+                    role: 'user',
+                    content: [
+                      `Reviewer gate: ${reviewerAgentType} ran but never populated its structured verdict, repeatedly.`,
+                      '',
+                      'This is a reviewer output-contract failure, not a source finding. No repair-editor or additional retry runs automatically.',
+                      `Fix reviewer configuration, or explicitly reply "BYPASS REVIEWER ${challenge.id}" to finalize on the recorded validation evidence for this snapshot only.`,
+                    ].join('\n'),
+                  },
+                  includeToolCall: false,
+                } as any
                 break
+              } else {
+                activeWorkState.nextRequiredAction =
+                  'Retry the automated reviewer gate; reviewer did not populate its required structured output.'
+                markActiveWorkStateChanged()
+                yield {
+                  toolName: 'add_message',
+                  input: {
+                    role: 'user',
+                    content: [
+                      `Reviewer gate: ${reviewerAgentType} ran but returned no structured output. The verdict is unavailable.`,
+                      '',
+                      'Do not manually re-spawn the reviewer or ask it for a textual label. Continue the gate loop so the automated reviewer retries with its declared output schema; it must call set_output and populate verdict, findings, coverage, dimensions, requirementCoverage, snapshotFingerprint, and reviewedFiles.',
+                    ].join('\n'),
+                  },
+                  includeToolCall: false,
+                } as any
               }
-              activeWorkState.nextRequiredAction =
-                'Retry the automated reviewer gate; reviewer did not populate its required structured output.'
-              markActiveWorkStateChanged()
-              yield {
-                toolName: 'add_message',
-                input: {
-                  role: 'user',
-                  content: [
-                    `Reviewer gate: ${reviewerAgentType} ran but returned no structured output. The verdict is unavailable.`,
-                    '',
-                    'Do not manually re-spawn the reviewer or ask it for a textual label. Continue the gate loop so the automated reviewer retries with its declared output schema; it must call set_output and populate verdict, findings, coverage, dimensions, requirementCoverage, snapshotFingerprint, and reviewedFiles.',
-                  ].join('\n'),
-                },
-                includeToolCall: false,
-              } as any
             }
             if (!reviewerFinalizationVerdict) {
               continue
@@ -6645,12 +7404,23 @@ ${guideSections}
         return 'idle'
       }
 
+      // Q4-1 (gate-robustness fix): derive the reviewer family from the
+      // gateId prefix GENERALLY, not a binary code/security split. Specialist
+      // gateIds are `${specialistAgentType}:${fingerprint}`, so the old binary
+      // version misattributed every specialist finding to 'code-reviewer' and
+      // the owed-revalidation seeding then summoned the wrong family. The
+      // unknown-prefix case now resolves to that specialist agent type —
+      // mirroring revalidationFamily's fail-closed rule that a non-code/
+      // non-security marker routes to the specialist aux block, never the
+      // final code-reviewer block. A missing gateId keeps the code-reviewer
+      // default (the final gate family).
       function reviewerOriginFromGateId(
         gateId: string | undefined,
-      ): 'code-reviewer' | 'security-reviewer' {
-        return gateId?.startsWith('security-reviewer:')
-          ? 'security-reviewer'
-          : 'code-reviewer'
+      ): 'code-reviewer' | 'security-reviewer' | SpecialistReviewerAgent {
+        const prefix = gateId?.split(':')[0]
+        if (prefix === 'security-reviewer') return 'security-reviewer'
+        if (!prefix || prefix === 'code-reviewer') return 'code-reviewer'
+        return prefix as SpecialistReviewerAgent
       }
 
       // Classify a requiredReviewerRevalidation marker into the reviewer family
@@ -6820,10 +7590,19 @@ ${guideSections}
         verdictClass: string,
         strippedText: string,
         id?: string,
+        reviewer?: string,
       ): string[] {
-        const keys = [`${verdictClass}::text:${strippedText}`]
+        // Q4-2 (gate-robustness fix): keys are REVIEWER-NAMESPACED so an id
+        // (or text) condoned for one reviewer family can never condone
+        // another family's finding that happens to reuse the same free-form
+        // id or text. Call sites thread the owning family
+        // (requiredReviewerAgentType / finding.reviewer / record.reviewer).
+        // Legacy prefix-less keys (state serialized before namespacing) are
+        // still honored at MATCH time by condonedKeyMatches below.
+        const scope = reviewer ? `${reviewer}::` : ''
+        const keys = [`${scope}${verdictClass}::text:${strippedText}`]
         if (id && !isMintedReviewerFindingId(id)) {
-          keys.push(`${verdictClass}::id:${id}`)
+          keys.push(`${scope}${verdictClass}::id:${id}`)
         }
         return keys
       }
@@ -6833,15 +7612,23 @@ ${guideSections}
         verdictClass: string,
         strippedText: string,
         id?: string,
+        reviewer?: string,
       ): boolean {
+        const matches = (candidateKeys: string[]) =>
+          candidateKeys.some((key) => condonedKeys.has(key))
         // Same-class match first: a `*` (prefix-less, legacy) entry condones
         // only another `*` finding, and a NON_BLOCKING entry never condones a
         // BLOCKING re-raise of the same identity — an escalation is new
-        // information and must reopen the gate.
+        // information and must reopen the gate. Q4-2: when a reviewer family
+        // is supplied, the legacy PREFIX-LESS keys recorded before reviewer
+        // namespacing still match (migration compatibility) — but new records
+        // are always namespaced, so cross-family contamination stops growing.
         if (
-          condonedFindingKeysFor(verdictClass, strippedText, id).some((key) =>
-            condonedKeys.has(key),
-          )
+          matches(
+            condonedFindingKeysFor(verdictClass, strippedText, id, reviewer),
+          ) ||
+          (reviewer !== undefined &&
+            matches(condonedFindingKeysFor(verdictClass, strippedText, id)))
         ) {
           return true
         }
@@ -6853,8 +7640,12 @@ ${guideSections}
         // converging. The reverse direction is NOT accepted: only the same-class
         // check above can condone a BLOCKING re-raise.
         if (verdictClass === 'NON_BLOCKING') {
-          return condonedFindingKeysFor('BLOCKING', strippedText, id).some(
-            (key) => condonedKeys.has(key),
+          return (
+            matches(
+              condonedFindingKeysFor('BLOCKING', strippedText, id, reviewer),
+            ) ||
+            (reviewer !== undefined &&
+              matches(condonedFindingKeysFor('BLOCKING', strippedText, id)))
           )
         }
         return false
@@ -6915,13 +7706,20 @@ ${guideSections}
         const condonedTexts: Set<string> = new Set<string>(
           activeWorkState.condonedFindingTexts ?? [],
         )
-        const isCondoned = (record: { text: string; id: string }): boolean => {
+        const isCondoned = (record: {
+          text: string
+          id: string
+          reviewer?: string
+        }): boolean => {
           if (condonedKeys.size > 0) {
             return condonedKeyMatches(
               condonedKeys,
               reviewerVerdictClass(record.text),
               stripReviewerVerdictPrefix(record.text),
               record.id,
+              // Q4-2: the incoming record's own family, so a family's condone
+              // record only condones that family's re-raise.
+              record.reviewer,
             )
           }
           return legacyCondonedTextMatches(condonedTexts, record.text)
@@ -7193,23 +7991,25 @@ type ResolvedReviewerAttestation = {
  *
  * CANONICAL WHY for the entry selection; call sites carry pointers only.
  *
- * Resolution is PER FIELD, so the result is a COMPOSITE rather than one entry:
- * `reviewedFiles` is the UNION of the shaped entries, `snapshotFingerprint` is
- * the entry reporting `expectedFingerprint` else the first reporting an
- * attestable v3 fingerprint else undefined, and `schemaVersion` is 1 only when
- * EVERY shaped entry reports 1 (otherwise the first non-conforming version, so
- * the caller's `!== 1` check rejects the whole receipt).
+ * Resolution is ENTRY-SCOPED when an attestation exists (fail closed, M1-T4a):
+ * the attesting entry — the one reporting `expectedFingerprint`, else the
+ * first reporting an attestable v3 fingerprint — supplies BOTH
+ * `snapshotFingerprint` AND `reviewedFiles`. A prompt-injected quoted example
+ * can no longer splice its fingerprint onto a real entry's coverage, nor its
+ * coverage onto a real entry's fingerprint. When NO entry reports an
+ * attestable fingerprint the receipt already fails closed on the
+ * missing-fingerprint blocker, so the coverage union is preserved purely so
+ * the diagnostic stays informative. `schemaVersion` is 1 only when EVERY
+ * shaped entry reports 1 (otherwise the first non-conforming version, so the
+ * caller's `!== 1` check rejects the whole receipt);
+ * `collectReviewerAttestationIssues` additionally rejects a result whose
+ * shaped entries report distinct attestable fingerprints while NO entry
+ * reports the expected one (ambiguous multi-receipt attestation — when the
+ * expected fingerprint IS reported, entry-scoping resolves unambiguously and
+ * sibling foreign fingerprints are tolerated order-independently).
  *
- * ACCEPTED LOOSENING (pinned in agents/__tests__/gate-reviewer.test.ts): the
- * spliced fields let a quoted example entry supply the fingerprint for a real
- * entry that reported none, and — because the union is NOT restricted to the
- * entry that contributed the credited fingerprint — a quoted example whose
- * `reviewedFiles` path COLLIDES with a real pending path (the documented
- * example literally shows `reviewedFiles: ["src/a.ts"]`) credits coverage the
- * real entry never attested. Narrowing the union would not close the
- * fingerprint half and WOULD reject the deletions-only receipt, which
- * legitimately attests with an empty `reviewedFiles`. So the guarantee is the
- * weaker one: a pending file NO entry reported at all still blocks.
+ * The deletions-only receipt (a single shaped entry with an attestable
+ * fingerprint and empty `reviewedFiles`) still attests.
  *
  * With no shaped entry at all the LAST entry is read verbatim, so a receipt that
  * never attested still fails closed on the caller's schemaVersion check.
@@ -7240,12 +8040,19 @@ function resolveReviewerAttestation(structured: StructuredReviewerOutput[], expe
             attestable = entry;
         }
     }
+    // M1-T4a (fail closed): when an ATTESTING entry exists, BOTH attestation
+    // fields come from it — not a per-field composite. A quoted example entry
+    // (prompt injection inside the reviewer result) can no longer lend its
+    // fingerprint to a real entry's coverage, nor its coverage to a real
+    // entry's fingerprint: the splice was the forged-receipt vector and is
+    // closed. When NO entry reports an attestable fingerprint there is nothing
+    // to splice — the receipt already fails closed on the missing-fingerprint
+    // blocker — so the union keeps the coverage diagnostic informative instead
+    // of manufacturing a spurious missing-file blocker.
     const attesting = matching ?? attestable;
-    const reviewedFiles: string[] = [];
-    for (const entry of shaped) {
-        for (const file of entry.reviewedFiles ?? [])
-            reviewedFiles.push(file);
-    }
+    const reviewedFiles = attesting
+        ? (attesting.reviewedFiles ?? [])
+        : shaped.flatMap((entry) => entry.reviewedFiles ?? []);
     // Surfacing the FIRST non-conforming version (instead of the attesting
     // entry's) is what makes the caller's `!== 1` check reject a receipt whose
     // sibling entry claims another schema version.
@@ -7282,6 +8089,25 @@ function collectReviewerAttestationIssues(toolResult: unknown, expectedFingerpri
     if (verdicts.size > 1) {
         return [
             'BLOCKING: reviewer returned conflicting structured verdicts in one result',
+        ];
+    }
+    // M1-T4a (fail closed, order-independent): when NO shaped entry reports the
+    // EXPECTED fingerprint, two or more DISTINCT attestable v3 fingerprints make
+    // the result ambiguous — more than one receipt's worth of attestation with no
+    // way to tell which is real — so the whole result is rejected. When the
+    // expected fingerprint IS reported, resolution is unambiguous (that entry
+    // wins outright) and sibling foreign fingerprints are tolerated
+    // order-independently (RF-2): entry-scoping already binds coverage to the
+    // attesting entry, so a sibling can neither lend nor steal either field.
+    const reportedFingerprints = new Set(structured
+        .filter((entry) => entry.schemaVersion !== undefined)
+        .map((entry) => entry.snapshotFingerprint)
+        .filter((value): value is string => isAttestableV3Fingerprint(value)));
+    const reportsExpectedFingerprint = structured.some((entry) => entry.schemaVersion !== undefined &&
+        entry.snapshotFingerprint === expectedFingerprint);
+    if (reportedFingerprints.size > 1 && !reportsExpectedFingerprint) {
+        return [
+            'BLOCKING: reviewer returned conflicting snapshot fingerprints in one result',
         ];
     }
     const result = resolveReviewerAttestation(structured, expectedFingerprint);
@@ -7794,6 +8620,26 @@ function classifyReviewerCrash(message: string | null): 'none' | 'transient' | '
 }
 
 function getReviewerFinalizationVerdict(toolResult: unknown): ReviewerFinalizationVerdict {
+    // allowNonBlocking=false makes the resolver's NON_BLOCKING branch statically
+    // unreachable, so narrowing it back to '' here is sound (and keeps the
+    // exported contract unchanged for every existing caller).
+    const verdict = resolveReviewerFinalizationVerdict(toolResult, false);
+    return verdict === 'NON_BLOCKING' ? '' : verdict;
+}
+
+/**
+ * NON_BLOCKING is the security-reviewer family's clean verdict; its findings
+ * are elevated by the caller's blocker branch before the protocol check, so a
+ * clean security review may credit finalization instead of being misclassified
+ * as a protocol failure. All pre-credit gates (coverage missing, incomplete
+ * in-scope requirements, blocking dimensions) still apply; the default
+ * `getReviewerFinalizationVerdict` keeps crediting LOOKS_GOOD only.
+ */
+function getSecurityReviewerFinalizationVerdict(toolResult: unknown): 'LOOKS_GOOD' | 'NON_BLOCKING' | '' {
+    return resolveReviewerFinalizationVerdict(toolResult, true);
+}
+
+function resolveReviewerFinalizationVerdict(toolResult: unknown, allowNonBlocking: boolean): 'LOOKS_GOOD' | 'NON_BLOCKING' | '' {
     // Automated gates accept only schema-backed structured reviewer output.
     const structured = collectStructuredReviewerOutputs(toolResult);
     // Coverage-adequacy contract (M6.3): missing coverage blocks finalization
@@ -7816,8 +8662,10 @@ function getReviewerFinalizationVerdict(toolResult: unknown): ReviewerFinalizati
     if (structured.some((entry) => Object.values(entry.dimensions ?? {}).some((status) => /^block(?:s|ing|er|ers)?\b/.test(status.trim().toLowerCase())))) {
         return '';
     }
-    // Finalization credit is LOOKS_GOOD only. NON_BLOCKING findings are
-    // elevated by collectReviewerBlockers into the repair loop.
+    // Finalization credit is LOOKS_GOOD only for the default variant;
+    // NON_BLOCKING findings are elevated by collectReviewerBlockers into the
+    // repair loop (the security-reviewer variant may credit NON_BLOCKING — see
+    // getSecurityReviewerFinalizationVerdict).
     // The scan is restricted to the `schemaVersion`-carrying entries whenever the
     // receipt carries any, so credit and collectReviewerAttestationIssues read
     // the SAME entry set and an unshaped quoted LOOKS_GOOD example cannot credit
@@ -7829,6 +8677,11 @@ function getReviewerFinalizationVerdict(toolResult: unknown): ReviewerFinalizati
     for (const entry of creditable) {
         if (entry.verdict === 'LOOKS_GOOD')
             return 'LOOKS_GOOD';
+        // Security-reviewer family: NON_BLOCKING is its clean verdict (see the
+        // docblock on getSecurityReviewerFinalizationVerdict).
+        if (allowNonBlocking && entry.verdict === 'NON_BLOCKING') {
+            return 'NON_BLOCKING';
+        }
     }
     return '';
 }
@@ -7846,7 +8699,18 @@ function collectStructuredReviewerOutputs(value: unknown): StructuredReviewerOut
     return out;
 }
 
-function visitForStructuredVerdict(value: unknown, out: StructuredReviewerOutput[], depth: number = 0): void {
+function visitForStructuredVerdict(value: unknown, out: StructuredReviewerOutput[], depth: number = 0, 
+// Gate-crash fix: schemaVersion inherited from the nearest enclosing
+// ENVELOPE record (agentReceipt / review / output / result slots and the
+// json/structuredOutput wrappers). The runtime receipt carries
+// `schemaVersion: 1` while the compact review inside it omits it, so the
+// review entry used to resolve UNSHAPED and the attestation check failed
+// closed ("invalid attestation schemaVersion" / no structured snapshot
+// attestation) — parking the gate after its single retry despite a valid
+// review. Inheritance NEVER crosses arrays or arbitrary keys, so a
+// verdict-shaped quoted example nested in findings/evidence stays unshaped
+// exactly as before.
+envelopeSchemaVersion?: number): void {
     // Depth cap (same value findReviewerCrash uses on the same envelopes): 8 is
     // well past any realistic agent-result envelope but stops pathological or
     // self-referential recursion from blowing the stack.
@@ -7862,8 +8726,18 @@ function visitForStructuredVerdict(value: unknown, out: StructuredReviewerOutput
     if (typeof value !== 'object')
         return;
     const record = value as Record<string, unknown>;
-    if (record.type === 'json' && 'value' in record) {
-        visitForStructuredVerdict(record.value, out, depth + 1);
+    const recordSchemaVersion = typeof record.schemaVersion === 'number' ? record.schemaVersion : undefined;
+    const inheritedSchemaVersion = recordSchemaVersion ?? envelopeSchemaVersion;
+    if ((record.type === 'json' || record.type === 'structuredOutput') &&
+        'value' in record) {
+        visitForStructuredVerdict(record.value, out, depth + 1, inheritedSchemaVersion);
+        // spawn_agent_inline can surface the agent receipt as a SIBLING of
+        // `value` on the json record; the receipt carries the compact review
+        // when the bulky payload was truncated in transit. Visit it too —
+        // recognition only; an absent receipt is a no-op.
+        if (record.type === 'json' && record.agentReceipt !== undefined) {
+            visitForStructuredVerdict(record.agentReceipt, out, depth + 1, inheritedSchemaVersion);
+        }
         return;
     }
     const rawVerdict = record.verdict;
@@ -7965,7 +8839,7 @@ function visitForStructuredVerdict(value: unknown, out: StructuredReviewerOutput
                     : undefined,
                 schemaVersion: typeof record.schemaVersion === 'number'
                     ? record.schemaVersion
-                    : undefined,
+                    : envelopeSchemaVersion,
                 findingRecords: Array.isArray(rawFindings)
                     ? rawFindings.flatMap((finding) => {
                         if (!finding || typeof finding !== 'object')
@@ -7998,8 +8872,18 @@ function visitForStructuredVerdict(value: unknown, out: StructuredReviewerOutput
             return;
         }
     }
-    for (const nested of Object.values(record)) {
-        visitForStructuredVerdict(nested, out, depth + 1);
+    for (const [key, nested] of Object.entries(record)) {
+        // Dedicated envelope slots inherit this record's schemaVersion (the
+        // receipt carries it, the verdict object inside omits it). Every other
+        // key — evidence, findings, quoted examples — never inherits, so a
+        // verdict-shaped quote stays unshaped and outside the conflict checks.
+        const slotSchemaVersion = key === 'agentReceipt' ||
+            key === 'review' ||
+            key === 'output' ||
+            key === 'result'
+            ? inheritedSchemaVersion
+            : undefined;
+        visitForStructuredVerdict(nested, out, depth + 1, slotSchemaVersion);
     }
 }
 
@@ -8282,6 +9166,117 @@ function hashGateSnapshotDetails(details: string): string {
     // gate credit, review receipt, or bypass challenge can match it.
     return 'unreadable:no-crypto';
 }
+
+/** `ok` carries the sorted, reviewable, byte-verifiable file list. */
+type CommittedSurfaceFileSetOk = {
+    status: 'ok';
+    files: string[];
+};
+
+/** Mandatory rejection: the derived fileset was empty (a constant fingerprint). */
+type CommittedSurfaceFileSetEmpty = {
+    status: 'empty';
+};
+
+/** Mandatory rejection: the derived fileset exceeded the cap (`total` files). */
+type CommittedSurfaceFileSetOverflow = {
+    status: 'overflow';
+    total: number;
+};
+
+type CommittedSurfaceFileSetResult = CommittedSurfaceFileSetOk | CommittedSurfaceFileSetEmpty | CommittedSurfaceFileSetOverflow;
+
+/**
+ * A committed-surface receipt must cover only files with verifiable bytes, so
+ * the content marker must be a 64-hex sha256 marker: `sha256:<hex>:<length>`
+ * for regular files or `symlink-sha256:<hex>:<length>` for safe in-project
+ * symlinks. `missing`, `unreadable:*`, and every other sentinel are dropped.
+ * Same shape as base2's canonical isAttestableContentMarker; duplicated as a
+ * pure local so this module stays import-free.
+ */
+function isAttestableCommittedSurfaceMarker(value: string): boolean {
+    return /^(?:symlink-)?sha256:[a-f0-9]{64}:\d+$/.test(value);
+}
+
+/**
+ * Derive the bounded committed-surface fileset from the runtime-observed task
+ * files. `runtimeFiles` is normalized, deduped (first-seen order), optionally
+ * narrowed to `narrowingHint` ∩ runtimeFiles, filtered through `isReviewable`,
+ * and stripped of every path whose `markerFor` is not a 64-hex sha256 content
+ * marker. The survivor list is sorted; a result above `cap` overflows and an
+ * empty survivor list is empty — both must be rejected by the caller (never
+ * minted over). `cap` defaults to MAX_COMMITTED_SURFACE_FILES (40).
+ */
+function deriveCommittedSurfaceFileSet(input: {
+    runtimeFiles: string[];
+    narrowingHint?: string[];
+    isReviewable: (path: string) => boolean;
+    markerFor: (path: string) => string;
+    cap?: number;
+}): CommittedSurfaceFileSetResult {
+    const cap = typeof input.cap === 'number' && input.cap >= 1 ? Math.floor(input.cap) : 40;
+    const runtimeFiles = Array.isArray(input.runtimeFiles)
+        ? input.runtimeFiles
+        : [];
+    const seen = new Set<string>();
+    const normalizedRuntime: string[] = [];
+    for (const rawFile of runtimeFiles) {
+        if (typeof rawFile !== 'string') {
+            continue;
+        }
+        const normalized = rawFile.trim().replace(/\\/g, '/');
+        if (!normalized) {
+            continue;
+        }
+        if (seen.has(normalized)) {
+            continue;
+        }
+        seen.add(normalized);
+        normalizedRuntime.push(normalized);
+    }
+    let candidates = normalizedRuntime;
+    if (Array.isArray(input.narrowingHint) && input.narrowingHint.length > 0) {
+        const hintSet = new Set<string>();
+        for (const rawHint of input.narrowingHint) {
+            if (typeof rawHint !== 'string') {
+                continue;
+            }
+            const normalized = rawHint.trim().replace(/\\/g, '/');
+            if (!normalized) {
+                continue;
+            }
+            hintSet.add(normalized);
+        }
+        candidates = normalizedRuntime.filter((file) => hintSet.has(file));
+    }
+    const kept: string[] = [];
+    for (const file of candidates) {
+        if (!input.isReviewable(file)) {
+            continue;
+        }
+        if (!isAttestableCommittedSurfaceMarker(input.markerFor(file))) {
+            continue;
+        }
+        kept.push(file);
+    }
+    kept.sort((a, b) => a.localeCompare(b));
+    if (kept.length > cap) {
+        return { status: 'overflow', total: kept.length };
+    }
+    if (kept.length === 0) {
+        return { status: 'empty' };
+    }
+    return { status: 'ok', files: kept };
+}
+
+/**
+ * Gate-computed receipt id for a committed-surface mint. The kind is part of
+ * the id so a committed-surface receipt can never be mistaken for a
+ * different-evidence receipt carrying the same fingerprint prefix.
+ */
+function committedSurfaceReceiptId(taskId: string, fingerprint: string): string {
+    return `plan-gate:${taskId}:committed-surface:${fingerprint.slice(0, 16)}`;
+}
 // </gate-helpers-generated>
 
       function recordChangedFiles(
@@ -8334,7 +9329,10 @@ function hashGateSnapshotDetails(details: string): string {
               activeWorkState.validationEvidence[
                 activeWorkState.validationEvidence.length - 1
               ]
-            if (evidenceEntry.fileMarkers && file in evidenceEntry.fileMarkers) {
+            if (
+              evidenceEntry.fileMarkers &&
+              file in evidenceEntry.fileMarkers
+            ) {
               delete evidenceEntry.fileMarkers[file]
             }
           }
@@ -8448,12 +9446,18 @@ function hashGateSnapshotDetails(details: string): string {
       // complement of prunePlanTaskGateReceipts. Two drops, both required:
       //   - every receipt whose covered `files` intersect the changed paths (its
       //     content evidence no longer describes the workspace);
-      //   - every receipt whose `evidence` is not 'reviewed-diff', because those
-      //     have no verifiable content identity at all — a 'no-diff' receipt's
-      //     fingerprint is the hash of an EMPTY file list, i.e. a constant, so it
-      //     can never fail content verification and supersession is the only
-      //     thing that can retire it. Legacy receipts serialized before
-      //     `evidence` existed fail closed the same way.
+      //   - every receipt whose `evidence` is neither 'reviewed-diff' nor
+      //     'committed-surface', because those have no verifiable content
+      //     identity at all — a 'no-diff' receipt's fingerprint is the hash of an
+      //     EMPTY file list, i.e. a constant, and an 'unreviewed-scope' receipt
+      //     covers a non-reviewable pending set — so neither can ever fail
+      //     content verification and supersession is the only thing that can
+      //     retire them. The two verifiable kinds hash real file bytes, so a
+      //     change that does not touch their covered set leaves them true and
+      //     they are NOT blanket-dropped (a committed-surface receipt only
+      //     retires on an INTERSECTING change, exactly like 'reviewed-diff').
+      //     Legacy receipts serialized before `evidence` existed fail closed
+      //     the same way as the non-verifiable kinds.
       // Inline (hoisted `function`) for the same serialization reason as
       // prunePlanTaskGateReceipts; reuses the inline normalizeGateFileList so the
       // changed paths are compared in the same normalized form the receipts
@@ -8468,7 +9472,11 @@ function hashGateSnapshotDetails(details: string): string {
         // no change to supersede and a live receipt must not be dropped.
         if (changedFilePaths.size === 0) return
         const survivingReceipts = receipts.filter((receipt) => {
-          if (!receipt || receipt.evidence !== 'reviewed-diff') return false
+          if (!receipt) return false
+          const evidence = receipt.evidence
+          const isVerifiableEvidence =
+            evidence === 'reviewed-diff' || evidence === 'committed-surface'
+          if (!isVerifiableEvidence) return false
           const receiptFiles = Array.isArray(receipt.files) ? receipt.files : []
           return !receiptFiles.some((file) => changedFilePaths.has(file))
         })
@@ -9523,7 +10531,10 @@ function hashGateSnapshotDetails(details: string): string {
       // non-attestable markers (unreadable:<code>, missing-crypto, etc.) remain
       // excluded so they can never grant durable gate credit.
       function isCreditableContentMarker(value: string): boolean {
-        return isAttestableContentMarker(value) || value === 'missing'
+        return (
+          isAttestableContentMarker(value) ||
+          value === GATE_FILE_MISSING_CONTENT_MARKER
+        )
       }
 
       function hasFreshGateFingerprintForPendingFiles(
@@ -9619,7 +10630,7 @@ function hashGateSnapshotDetails(details: string): string {
               'GATE: PENDING',
               `phase: ${state.currentPhase}`,
               `hooks summary present: ${state.lastValidationSummary ? 'yes' : 'no'}`,
-              'allowed actions: finish implementation work, then end your turn',
+              'allowed actions: finish implementation work, then end your turn (stop calling tools and yield; do not write the completion summary yet)',
               'blocked actions: git-committer, suggest_followups, claiming the gate is running',
               'local checks (basher/typecheck) are not the gate',
               hasDirtyGateLag
@@ -9680,7 +10691,7 @@ function hashGateSnapshotDetails(details: string): string {
         }
         if (hasUnresolvedGateWork) {
           sections.push(
-            'suggest_followups: BLOCKED — GATE: PENDING. End your turn; call suggest_followups only after GATE: PASSED.',
+            'suggest_followups: BLOCKED — GATE: PENDING. End your turn (do not retry this call or re-write the summary; re-emitting it now only re-triggers this rejection). Call suggest_followups only after GATE: PASSED.',
           )
         }
         if (state.openReviewerBlockers.length > 0) {
@@ -9934,6 +10945,168 @@ function hashGateSnapshotDetails(details: string): string {
         if (activeWorkState.activePlanTaskId === nextActiveTaskId) return
         activeWorkState.activePlanTaskId = nextActiveTaskId
         markActiveWorkStateChanged()
+      }
+
+      // Opt-in committed-surface review request (evidence kind
+      // 'committed-surface'): a successful update_plan_status call carrying
+      // `requestCommittedSurfaceReview === true` while a task is claimed asks
+      // base2 to review the task's runtime-observed files off the CLEAN
+      // committed worktree instead of a working-tree diff. Same structure as
+      // extractActivePlanTaskIdFromMessages: walk history, pair each
+      // update_plan_status tool call with its SUCCESSFUL result via the shared
+      // toolCallSucceeded check, and only then trust the raw input.
+      // Self-contained inline helpers because handleSteps is serialized via
+      // .toString() + new Function(...): they must not reference module-scope
+      // imports; `function` declarations hoist above the call sites (turn
+      // start and the post-STEP messageHistory block), which appear earlier in
+      // the source.
+      type CommittedSurfaceReviewRequest = NonNullable<
+        Base2ActiveWorkState['committedSurfaceReviewRequest']
+      >
+      type CommittedSurfaceExtraction = {
+        /** The claimed task id, or '' when the call claimed nothing. */
+        claimed: string
+        /** True when the raw input asked for the committed-surface review. */
+        requested: boolean
+      }
+
+      function extractCommittedSurfaceIntent(
+        input: unknown,
+      ): CommittedSurfaceExtraction {
+        const noRequest: CommittedSurfaceExtraction = {
+          claimed: '',
+          requested: false,
+        }
+        if (!input || typeof input !== 'object' || Array.isArray(input)) {
+          return noRequest
+        }
+        const record = input as Record<string, unknown>
+        if (record.requestCommittedSurfaceReview !== true) {
+          return noRequest
+        }
+        // Same pointer precedence as extractPlanTaskClaimIntent: the explicit
+        // currentTask wins, else the LAST in_progress updates entry.
+        let claimed = ''
+        if (typeof record.currentTask === 'string') {
+          claimed = normalizePlanTaskPointer(record.currentTask)
+        }
+        if (!claimed) {
+          const rawUpdates = Array.isArray(record.updates) ? record.updates : []
+          for (const update of rawUpdates) {
+            if (!update || typeof update !== 'object') continue
+            const entry = update as Record<string, unknown>
+            if (entry.status !== 'in_progress') continue
+            const pointer = normalizePlanTaskPointer(entry.taskId ?? entry.task)
+            if (pointer) claimed = pointer
+          }
+        }
+        return { claimed, requested: true }
+      }
+
+      /**
+       * Walk history for the LAST successful request-bearing
+       * update_plan_status call and store a PENDING committed-surface request
+       * for its claimed task. An unclaimed request is ignored (the tool schema
+       * documents the claimed-task requirement; extraction just never stores
+       * the invalid shape). Only a pending record for the SAME task is
+       * idempotent; a new request replaces a consumed/rejected one.
+       *
+       * Replay guard: the walk starts at
+       * `committedSurfaceReviewResolvedFromMessageIndex`, the history length
+       * recorded when the gate branch last consumed/rejected a request. Every
+       * message index below it was already visible when that request was
+       * resolved, so re-processing them would see the same successful request
+       * call, fail the pending-idempotence check (the stored record is now
+       * `consumed`/`rejected`), and REPLACE the resolved record with a fresh
+       * pending request — re-spawning (and re-minting) reviewers on every later
+       * turn. A watermark GREATER THAN the CURRENT history length is impossible
+       * while it stays accurate (it was recorded as a past length); it can only
+       * appear when history SHRANK (context compaction), so it is ignored
+       * rather than trusted and the full history is re-walked — post-compaction
+       * requests are never wrongly blocked, and pre-compaction messages that
+       * survive the shrink are re-processed by design because their resolved
+       * request is gone from state (compaction also dropped it) and the
+       * idempotence check cannot tell otherwise. A watermark EQUAL to the
+       * current length is the normal post-resolution state (no new messages
+       * yet): the walk range is legitimately empty and the resolved record
+       * stays untouched.
+       */
+      function extractCommittedSurfaceReviewRequest(messages: unknown): void {
+        if (!Array.isArray(messages)) return
+        const resolvedFromIndex =
+          activeWorkState.committedSurfaceReviewResolvedFromMessageIndex
+        const walkFromIndex =
+          typeof resolvedFromIndex === 'number' &&
+          Number.isInteger(resolvedFromIndex) &&
+          resolvedFromIndex >= 0 &&
+          resolvedFromIndex <= messages.length
+            ? resolvedFromIndex
+            : 0
+        const pendingToolCalls = new Map<string, CommittedSurfaceExtraction>()
+        let latest: CommittedSurfaceExtraction = {
+          claimed: '',
+          requested: false,
+        }
+        for (
+          let messageIndex = walkFromIndex;
+          messageIndex < messages.length;
+          messageIndex += 1
+        ) {
+          const message = messages[messageIndex]
+          if (!message || typeof message !== 'object') continue
+          const record = message as Record<string, unknown>
+          if (record.role === 'assistant' && Array.isArray(record.content)) {
+            for (const part of record.content) {
+              if (!part || typeof part !== 'object') continue
+              const toolCall = part as Record<string, unknown>
+              if (toolCall.type !== 'tool-call') continue
+              const toolName =
+                typeof toolCall.toolName === 'string' ? toolCall.toolName : ''
+              if (toolName !== 'update_plan_status') continue
+              const toolCallId =
+                typeof toolCall.toolCallId === 'string'
+                  ? toolCall.toolCallId
+                  : ''
+              if (!toolCallId) continue
+              pendingToolCalls.set(
+                toolCallId,
+                extractCommittedSurfaceIntent(toolCall.input),
+              )
+            }
+          }
+          if (record.role !== 'tool') continue
+          const toolCallId =
+            typeof record.toolCallId === 'string' ? record.toolCallId : ''
+          const extraction = pendingToolCalls.get(toolCallId)
+          if (!extraction) continue
+          if (!extraction.requested) continue
+          // Fail closed on a rejected transition, exactly like the claim
+          // tracker: a request the handler never applied must not store state.
+          if (!toolCallSucceeded(record.content, /\bcurrent task\b/i)) continue
+          latest = extraction
+        }
+        if (!latest.requested || !latest.claimed) return
+        const existing = activeWorkState.committedSurfaceReviewRequest
+        if (
+          existing &&
+          existing.status === 'pending' &&
+          existing.taskId === latest.claimed
+        ) {
+          return
+        }
+        const request: CommittedSurfaceReviewRequest = {
+          taskId: latest.claimed,
+          requestedAt: new Date().toISOString(),
+          status: 'pending',
+        }
+        activeWorkState.committedSurfaceReviewRequest = request
+        markActiveWorkStateChanged()
+      }
+
+      function updateCommittedSurfaceReviewFromMessages(
+        messages: unknown,
+      ): void {
+        extractCommittedSurfaceReviewRequest(messages)
       }
 
       // Detects an exact standalone "COMMIT ANYWAY" user message and publishes
@@ -10574,13 +11747,14 @@ function hashGateSnapshotDetails(details: string): string {
       }
 
       // Deleted-file extraction from files-v4 snapshot details. A pending file
-      // whose content marker is exactly `missing` was deleted in the changeset
-      // and cannot be read by the reviewer, so it is attested-by-absence and
-      // excluded from the reviewedFiles requirement. Only exact `missing`
-      // markers count: `unreadable:<code>` is a present-but-unreadable file
-      // that must still be attested (fail closed). Self-contained inline
-      // helper (handleSteps is serialized via .toString() + new Function(...),
-      // so it must not reference module-scope imports).
+      // whose content marker is exactly `missing` — the shared
+      // GATE_FILE_MISSING_CONTENT_MARKER sentinel — was deleted in the
+      // changeset and cannot be read by the reviewer, so it is
+      // attested-by-absence and excluded from the reviewedFiles requirement.
+      // Only exact `missing` markers count: `unreadable:<code>` is a
+      // present-but-unreadable file that must still be attested (fail closed).
+      // Self-contained inline helper (handleSteps is serialized via .toString()
+      // + new Function(...), so it must not reference module-scope imports).
       function collectDeletedFilesFromSnapshotDetails(
         details: string,
       ): string[] {
@@ -10591,7 +11765,7 @@ function hashGateSnapshotDetails(details: string): string {
           if (line === '--') break
           const tabIndex = line.indexOf('\t')
           if (tabIndex <= 0) continue
-          if (line.slice(tabIndex + 1) === 'missing') {
+          if (line.slice(tabIndex + 1) === GATE_FILE_MISSING_CONTENT_MARKER) {
             deletedFiles.push(line.slice(0, tabIndex))
           }
         }
@@ -10602,11 +11776,97 @@ function hashGateSnapshotDetails(details: string): string {
        * Resolve a normalized gate file path against process.cwd() and return
        * a deterministic content marker for fingerprinting. Regular files are
        * hashed in fixed-size chunks; symlink markers additionally bind the link
-       * path to bytes read from its resolved target. Never throws: scope, read,
-       * or stat failures become `unreadable:<code>` markers so stale credit
-       * fails closed.
+       * path to bytes read from its resolved target. A path that does not exist
+       * on disk returns the exact marker `missing`
+       * (GATE_FILE_MISSING_CONTENT_MARKER; attested-by-absence — the same
+       * marker a snapshotted-then-deleted file gets from the ENOENT catch
+       * below, now also produced for a file deleted before its first snapshot).
+       * Never throws: every other scope, read, or stat failure becomes an
+       * `unreadable:<code>` marker so stale credit fails closed.
        */
+      // M3-T2 cached wrapper (see gateMarkerCache above): fast path returns
+      // the previously computed marker when a fresh stat proves the file is
+      // still the same size and mtime it was hashed with; the uncached body
+      // below re-hashes otherwise. Error/sentinel markers (unreadable:*,
+      // missing) are NOT cached: they are cheap to recompute and a transient
+      // failure state must not pin stale credit.
       function readGateFileContentMarker(normalizedPath: string): string {
+        if (!normalizedPath) return 'unreadable:empty-path'
+        const cached = gateMarkerCache.get(normalizedPath)
+        if (cached !== undefined) {
+          // Resolve built-ins lazily alongside the uncached body so tests and
+          // serialized runtimes stay supported in both paths.
+          const cacheFs = readGateMarkerBuiltinFs()
+          if (cacheFs) {
+            try {
+              const cwd = process.cwd()
+              const stat = cacheFs.statSync(
+                cacheFs.realpathSync(
+                  requirePath().resolve(cwd, normalizedPath),
+                ),
+              )
+              if (
+                stat.isFile() &&
+                stat.size === cached.size &&
+                stat.mtimeMs === cached.mtimeMs
+              ) {
+                return cached.marker
+              }
+            } catch {
+              // Any stat/realpath failure falls through to a full recompute,
+              // which re-derives the same fail-closed sentinels as before.
+            }
+          }
+          gateMarkerCache.delete(normalizedPath)
+        }
+        const marker = readGateFileContentMarkerUncached(normalizedPath)
+        // Cache only present-file sha256 markers, keyed with the stat the
+        // uncached body read (its openedStat/fstat values). Simplest scheme
+        // that preserves bytes-unchanged liveness: stamp with the marker's own
+        // length is NOT enough, so the uncached body records stats itself via
+        // the entry below when they are available.
+        return marker
+      }
+
+      function readGateMarkerBuiltinFs():
+        | typeof import('node:fs')
+        | undefined {
+        const getBuiltinModule =
+          typeof process === 'object' &&
+          process !== null &&
+          'getBuiltinModule' in process &&
+          typeof process.getBuiltinModule === 'function'
+            ? process.getBuiltinModule.bind(process)
+            : undefined
+        const req = (globalThis as any).require as NodeJS.Require | undefined
+        if (getBuiltinModule) {
+          return getBuiltinModule('node:fs') as typeof import('node:fs')
+        }
+        if (typeof req === 'function') return req('node:fs')
+        return undefined
+      }
+
+      function requirePath(): typeof import('node:path') {
+        const getBuiltinModule =
+          typeof process === 'object' &&
+          process !== null &&
+          'getBuiltinModule' in process &&
+          typeof process.getBuiltinModule === 'function'
+            ? process.getBuiltinModule.bind(process)
+            : undefined
+        const req = (globalThis as any).require as NodeJS.Require | undefined
+        if (getBuiltinModule) {
+          return getBuiltinModule('node:path') as typeof import('node:path')
+        }
+        return (req as NodeJS.Require)('node:path')
+      }
+
+      // Cache entry write happens inside the uncached body: it closes over the
+      // resolved absolute path so the stamped stat is exactly the file that
+      // produced the marker (in-process fast path only).
+      function readGateFileContentMarkerUncached(
+        normalizedPath: string,
+      ): string {
         if (!normalizedPath) return 'unreadable:empty-path'
         // Resolve built-ins at call time so this stays compatible with
         // serialized handleSteps executions. Prefer process.getBuiltinModule
@@ -10653,6 +11913,34 @@ function hashGateSnapshotDetails(details: string): string {
           return 'unreadable:outside-project'
         }
         try {
+          // True nonexistence is attested-by-absence, NOT an unreadable file:
+          // a pending gate file deleted before any snapshot captured its bytes
+          // must resolve to the existing `missing` marker so
+          // collectDeletedFilesFromSnapshotDetails recognizes the deletion and
+          // per-file credit treats it as stable (a never-snapshotted deletion
+          // otherwise re-triggers specialist review forever). Probe existence
+          // BEFORE the component walk; the walk's lstatSync (or the open below)
+          // still throws ENOENT for the TOCTOU case — deleted between this
+          // probe and the read — and the catch below maps ENOENT to `missing`
+          // too. A path that EXISTS (regular file, directory, or symlink) falls
+          // through unchanged, so present-but-not-a-file stays
+          // `unreadable:not-a-file` and an escaping symlink stays
+          // `unreadable:outside-project-symlink`: only true absence yields
+          // `missing`.
+          // Use lstatSync (not existsSync) for the probe: existsSync follows a
+          // dangling symlink to its nonexistent target and would wrongly report
+          // `missing`, whereas lstatSync sees the link entry itself as present
+          // (ENOENT only when the path truly does not exist).
+          try {
+            fs.lstatSync(absolutePath)
+          } catch (probeError) {
+            if ((probeError as NodeJS.ErrnoException).code === 'ENOENT') {
+              return GATE_FILE_MISSING_CONTENT_MARKER
+            }
+            // A present path that cannot be stated (permissions, etc.) stays
+            // fail-closed as unreadable rather than being mistaken for absent.
+            return 'unreadable:lstat-failed'
+          }
           const pathSegments = projectRelativePath
             .split(path.sep)
             .filter(Boolean)
@@ -10722,7 +12010,25 @@ function hashGateSnapshotDetails(details: string): string {
               return 'unreadable:changed-during-read'
             }
             const prefix = symlinkParts.length > 0 ? 'symlink-sha256' : 'sha256'
-            return `${prefix}:${hash.digest('hex')}:${bytesReadTotal}`
+            const marker = `${prefix}:${hash.digest('hex')}:${bytesReadTotal}`
+            // M3-T2: stamp the cache with this file's size/mtime, captured on
+            // the SAME fd/result that produced the digest, so the fast path
+            // above can re-verify liveness without re-reading bytes. Cap the
+            // cache in insertion order (Map preserves recency).
+            if (gateMarkerCache.has(normalizedPath)) {
+              gateMarkerCache.delete(normalizedPath)
+            }
+            gateMarkerCache.set(normalizedPath, {
+              size: openedStat.size,
+              mtimeMs: openedStat.mtimeMs,
+              marker,
+            })
+            while (gateMarkerCache.size > GATE_MARKER_CACHE_MAX) {
+              const oldest = gateMarkerCache.keys().next().value
+              if (oldest === undefined) break
+              gateMarkerCache.delete(oldest)
+            }
+            return marker
           } finally {
             fs.closeSync(fd)
           }
@@ -10731,9 +12037,58 @@ function hashGateSnapshotDetails(details: string): string {
             err && typeof err === 'object' && 'code' in err
               ? String((err as { code?: unknown }).code ?? 'unknown')
               : 'unknown'
-          if (code === 'ENOENT') return 'missing'
+          if (code === 'ENOENT') return GATE_FILE_MISSING_CONTENT_MARKER
           return `unreadable:${code}`
         }
+      }
+
+      // Committed-surface clean-tree check reads raw porcelain stdout off the
+      // run_terminal_command tool result. Bounds the walk and accepts the same
+      // envelope shapes as extractWriterOutcome (toolResult / result / plain
+      // value), returning '' when the command produced no readable stdout —
+      // the caller then treats a detected failure as git-unavailable. Inline
+      // hoisted `function` for the serialization reason recorded on
+      // parseGitStatusLine below; no regex literals so the serialized source
+      // stays escape-clean.
+      function extractTerminalStdout(toolResult: unknown, depth = 0): string {
+        if (!toolResult || depth > 8) return ''
+        if (Array.isArray(toolResult)) {
+          for (const item of toolResult) {
+            const found = extractTerminalStdout(item, depth + 1)
+            if (found) return found
+          }
+          return ''
+        }
+        if (typeof toolResult !== 'object') {
+          return typeof toolResult === 'string' ? toolResult : ''
+        }
+        const record = toolResult as Record<string, unknown>
+        if (record.type === 'json' && 'value' in record) {
+          return extractTerminalStdout(record.value, depth + 1)
+        }
+        if (typeof record.stdout === 'string') return record.stdout
+        for (const nested of Object.values(record)) {
+          const found = extractTerminalStdout(nested, depth + 1)
+          if (found) return found
+        }
+        return ''
+      }
+
+      // Committed-surface porcelain exclusion: ONLY .agents/sessions/ paths are
+      // ignored by the clean-tree check (session bookkeeping churns while the
+      // gate runs); every other dirty path rejects the request. Accepts an
+      // optional leading './' or '/' plus Windows separators, matching the
+      // parseGitStatusLine outputs this consumes. Inline hoisted `function`
+      // alongside extractTerminalStdout for the same serialization reason.
+      function isAgentsSessionsPath(path: string): boolean {
+        let normalized = path.trim().replace(/\\/g, '/')
+        while (normalized.startsWith('./')) {
+          normalized = normalized.slice(2)
+        }
+        const withoutLeadingSlash = normalized.startsWith('/')
+          ? normalized.slice(1)
+          : normalized
+        return withoutLeadingSlash.startsWith('.agents/sessions/')
       }
 
       function parseGitStatusLine(line: string): string {
@@ -11151,7 +12506,7 @@ function buildExecutePlanInstructionsPrompt(params: {
     '## Durable plan execution mode',
     '',
     'You are in EXECUTE_PLAN mode. Your job is to execute or resume durable plan artifacts, not merely revise them. Treat durable artifact contents already provided in the conversation as the initial authoritative context; read artifacts directly only when their contents are missing, truncated, stale, or have changed. Continue from the next actionable milestone, and use normal project source editing tools when implementation work is required.',
-    'Run the plan preflight before editing. Tasks should have stable IDs, dependencies, Acceptance criteria, and Validate gates. Claim exactly one actionable task by moving it to in_progress and recording its stable ID as currentTask. A task may move to done only after its validation gate passes; record validation/review evidence as a checkpoint. That checkpoint must cite the gate-issued receipt ID printed in the gate-pass message (shaped `plan-gate:<taskId>:<fingerprintPrefix>`, or `plan-gate:<taskId>:unreviewed-scope:<fingerprintPrefix>` / `plan-gate:<taskId>:no-diff:<fingerprintPrefix>` when the cycle had no reviewable diff) in checkpoint.receiptIds; never invent a receipt ID, because the runtime verifies it against gate state and rejects an ID that matches no gate-issued receipt for that task. A receipt is SUPERSEDED when the task\'s files change again, so after further edits you must let the gate close again and copy the NEW ID from the newest gate-pass message (or the pinned harness state); never reuse an ID from an earlier gate-pass message. If preflight fails, repair the durable plan before implementation. Use STATE.json revisions to avoid overwriting newer execution state.',
+    "Run the plan preflight before editing. Tasks should have stable IDs, dependencies, Acceptance criteria, and Validate gates. Claim exactly one actionable task by moving it to in_progress and recording its stable ID as currentTask. A task may move to done only after its validation gate passes; record validation/review evidence as a checkpoint. That checkpoint must cite the gate-issued receipt ID printed in the gate-pass message (shaped `plan-gate:<taskId>:<fingerprintPrefix>`, or `plan-gate:<taskId>:unreviewed-scope:<fingerprintPrefix>` / `plan-gate:<taskId>:no-diff:<fingerprintPrefix>` when the cycle had no reviewable diff) in checkpoint.receiptIds; never invent a receipt ID, because the runtime verifies it against gate state and rejects an ID that matches no gate-issued receipt for that task. A receipt is SUPERSEDED when the task's files change again, so after further edits you must let the gate close again and copy the NEW ID from the newest gate-pass message (or the pinned harness state); never reuse an ID from an earlier gate-pass message. If preflight fails, repair the durable plan before implementation. Use STATE.json revisions to avoid overwriting newer execution state.",
     '',
     'Keep STATUS.md and LESSONS.md current throughout execution. Prefer update_plan_status for incremental STATUS.md / LESSONS.md updates; use create_plan for SPEC.md / PLAN.md revisions, substantial rewrites, or creating missing artifacts. PLAN mode remains plan-only, but EXECUTE_PLAN is allowed to edit project source to complete the plan. Do not let plan artifacts drift behind actual implementation state.',
   ].join('\n')

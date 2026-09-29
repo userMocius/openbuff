@@ -97,37 +97,222 @@ export function getPinnedGrammarAssetUrl(wasmFile: string): string | null {
   )
 }
 
+// Transient network failures are retried so one flaky fetch can no longer
+// fail a release build. Only network-level problems retry: fetch throwing,
+// the per-attempt abort/timeout, and retryable HTTP statuses (5xx and 429).
+// Worst-case added latency stays bounded at 3 attempts x 30s plus two short
+// retry delays. A sha256 mismatch is deterministic corruption of the
+// downloaded bytes, so it fails immediately without retrying.
+const MAX_REPAIR_ATTEMPTS = 3
+const ATTEMPT_TIMEOUT_MS = 30_000
+const DEFAULT_RETRY_DELAY_MS = 2_000
+/**
+ * Byte cap enforced while streaming the response body (reliability finding
+ * unbounded-arraybuffer-before-hash): a hijacked asset source must not be
+ * able to force a multi-GB allocation before the sha256 check runs. Pinned
+ * grammar WASM files are far below this bound.
+ */
+const MAX_WASM_DOWNLOAD_BYTES = 20 * 1024 * 1024
+/** Exported for the retry-backoff regression test. */
+export const REPAIR_RETRY_BASE_DELAY_MS = DEFAULT_RETRY_DELAY_MS
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms))
+
+// Discarded error responses are never read, so their bodies are cancelled
+// before the attempt ends: an undrained body can hold its socket open
+// indefinitely and block connection reuse, and the per-attempt timeout is
+// already cleared once headers arrive. Cancellation is best-effort:
+// cancel() rejects for a body that already errored, and that must not be
+// misreported as a network failure.
+const releaseBody = async (response: Response): Promise<void> => {
+  try {
+    await response.body?.cancel()
+  } catch {
+    // Nothing left to release; keep the attempt's real failure reason.
+  }
+}
+
+/**
+ * Stream the response body under a hard byte cap instead of buffering an
+ * unbounded arrayBuffer() before hashing (reliability finding
+ * unbounded-arraybuffer-before-hash). Rejects early on a declared
+ * Content-Length above the cap and aborts mid-stream when the running total
+ * exceeds it, so a hostile source cannot force a huge allocation. Returns
+ * null when the body is missing or exceeds the cap.
+ */
+const readBodyWithCap = async (
+  response: Response,
+  capBytes: number,
+): Promise<Uint8Array | null> => {
+  const declaredLength = Number(response.headers.get('content-length'))
+  if (
+    response.headers.has('content-length') &&
+    Number.isInteger(declaredLength) &&
+    declaredLength >= 0 &&
+    declaredLength > capBytes
+  ) {
+    await releaseBody(response)
+    return null
+  }
+  const reader = response.body?.getReader()
+  if (!reader) return null
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > capBytes) {
+        await reader.cancel().catch(() => {})
+        return null
+      }
+      chunks.push(value)
+    }
+  } catch {
+    return null
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return bytes
+}
+
+function parseRetryAfterSeconds(headerValue: string | null): number | null {
+  if (headerValue === null) return null
+  const seconds = Number.parseInt(headerValue, 10)
+  return Number.isInteger(seconds) && seconds >= 0 && seconds <= 3600
+    ? seconds
+    : null
+}
+
+/**
+ * Delay before the next repair attempt: honor Retry-After when the server
+ * sent one (seconds), otherwise back off exponentially with jitter so
+ * parallel repair attempts do not hammer a rate-limited CDN in lockstep
+ * (reliability finding wasm-repair-fixed-retry-delay).
+ */
+export function computeRetryDelayMs(
+  baseDelayMs: number,
+  attempt: number,
+  retryAfterSeconds: number | null,
+): number {
+  if (retryAfterSeconds !== null) return retryAfterSeconds * 1000
+  const exponential = baseDelayMs * 2 ** (attempt - 1)
+  const jitter = 0.5 + Math.random() * 0.5
+  return Math.round(exponential * jitter)
+}
+
 export async function repairGrammarWasm(params: {
   wasmFile: string
   targetDir: string
   fetchImpl?: typeof fetch
+  retryDelayMs?: number
+  /** Test seam: overrides the module download byte cap. */
+  maxBodyBytes?: number
+  onFailure?: (reason: string) => void
 }): Promise<string | null> {
+  const fail = (reason: string): null => {
+    params.onFailure?.(reason)
+    return null
+  }
+
   const asset = PINNED_GRAMMAR_ASSETS[params.wasmFile]
-  if (!asset || !path.isAbsolute(params.targetDir)) return null
+  if (!asset) return fail(`no pinned checksum exists for ${params.wasmFile}`)
+  if (!path.isAbsolute(params.targetDir)) {
+    return fail(`repair target ${params.targetDir} is not an absolute path`)
+  }
   const sourceUrl = getPinnedGrammarAssetUrl(params.wasmFile)
-  if (!sourceUrl) return null
+  if (!sourceUrl) {
+    return fail(`no pinned download URL exists for ${params.wasmFile}`)
+  }
 
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 30_000)
+  const fetchFn = params.fetchImpl ?? fetch
+  const retryDelayMs = params.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
+  const maxBodyBytes = params.maxBodyBytes ?? MAX_WASM_DOWNLOAD_BYTES
+  let lastErrorMessage: string | null = null
+  let lastHttpStatus: number | null = null
+  let retryAfterSeconds: number | null = null
+  let verifiedBytes: Uint8Array | null = null
+
+  // Each attempt re-downloads, so the hash always checks fresh bytes. Only
+  // the network phase lives inside the retry loop: verified bytes break out
+  // of the loop before persistence, so disk failures are never retried and
+  // never misreported as network errors.
+  for (let attempt = 1; attempt <= MAX_REPAIR_ATTEMPTS; attempt++) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), ATTEMPT_TIMEOUT_MS)
+    try {
+      const response = await fetchFn(sourceUrl, { signal: controller.signal })
+      if (response.ok) {
+        const bytes = await readBodyWithCap(response, maxBodyBytes)
+        if (bytes === null) {
+          // A missing or oversized body is deterministic corruption of the
+          // asset source: like a hash mismatch, retrying cannot fix it.
+          return fail(
+            `downloaded body missing or exceeded the ${maxBodyBytes}-byte cap`,
+          )
+        }
+        const actualHash = createHash('sha256').update(bytes).digest('hex')
+        if (actualHash !== asset.sha256) {
+          // Retry cannot fix wrong bytes: fail immediately with a
+          // distinct reason instead of burning more attempts.
+          return fail('downloaded bytes failed sha256 verification')
+        }
+        verifiedBytes = bytes
+        break
+      } else if (response.status >= 500 || response.status === 429) {
+        // Transient server-side condition: record it, release the body,
+        // and try again. Clearing the network message keeps the final
+        // diagnostic tied to the most recent attempt rather than an
+        // earlier fetch throw.
+        lastHttpStatus = response.status
+        lastErrorMessage = null
+        retryAfterSeconds = parseRetryAfterSeconds(
+          response.headers.get('retry-after'),
+        )
+        await releaseBody(response)
+      } else {
+        await releaseBody(response)
+        return fail(`HTTP ${response.status} response`)
+      }
+    } catch (error) {
+      // Fetch throwing covers network errors and the per-attempt abort
+      // timeout; both are transient, so record the message and try again.
+      lastErrorMessage = error instanceof Error ? error.message : String(error)
+    } finally {
+      clearTimeout(timeout)
+    }
+    // Delay only between attempts to keep the worst-case latency bounded.
+    if (attempt < MAX_REPAIR_ATTEMPTS) {
+      await sleep(computeRetryDelayMs(retryDelayMs, attempt, retryAfterSeconds))
+    }
+  }
+
+  if (verifiedBytes === null) {
+    if (lastErrorMessage !== null) {
+      return fail(
+        `network error after ${MAX_REPAIR_ATTEMPTS} attempts: ${lastErrorMessage}`,
+      )
+    }
+    return fail(`HTTP ${lastHttpStatus} after ${MAX_REPAIR_ATTEMPTS} attempts`)
+  }
+
   try {
-    const response = await (params.fetchImpl ?? fetch)(sourceUrl, {
-      signal: controller.signal,
-    })
-    if (!response.ok) return null
-    const bytes = new Uint8Array(await response.arrayBuffer())
-    const actualHash = createHash('sha256').update(bytes).digest('hex')
-    if (actualHash !== asset.sha256) return null
-
     await fs.mkdir(params.targetDir, { recursive: true, mode: 0o700 })
     const targetPath = path.join(params.targetDir, params.wasmFile)
     const tempPath = `${targetPath}.tmp.${process.pid}.${randomUUID()}`
-    await fs.writeFile(tempPath, bytes, { mode: 0o600 })
+    await fs.writeFile(tempPath, verifiedBytes, { mode: 0o600 })
     await fs.rename(tempPath, targetPath)
     return targetPath
-  } catch {
-    return null
-  } finally {
-    clearTimeout(timeout)
+  } catch (error) {
+    return fail(
+      `failed to persist repaired bytes: ${error instanceof Error ? error.message : String(error)}`,
+    )
   }
 }
 
@@ -136,6 +321,12 @@ export async function resolveGrammarWasmSource(params: {
   candidates: readonly string[]
   repairDir: string
   repairImpl?: typeof repairGrammarWasm
+  /**
+   * Test seam: force the post-repair pin re-verification even when a
+   * repairImpl stand-in produced the bytes (the production repair output is
+   * always re-verified).
+   */
+  forceRepairedBytesVerification?: boolean
 }): Promise<string> {
   const asset = PINNED_GRAMMAR_ASSETS[params.wasmFile]
   if (!asset) {
@@ -155,20 +346,55 @@ export async function resolveGrammarWasmSource(params: {
     }
   }
 
+  // Capture the last repair failure reason so the final error below can
+  // state WHY checksum-pinned repair failed.
+  let failureReason: string | undefined
+  const reportMissing = async (): Promise<never> => {
+    throw new Error(
+      `Missing required tree-sitter asset ${params.wasmFile}; searched ${params.candidates.join(', ')} and checksum-pinned repair failed${failureReason ? `: ${failureReason}` : ''}`,
+    )
+  }
   const repaired = await (params.repairImpl ?? repairGrammarWasm)({
     wasmFile: params.wasmFile,
     targetDir: params.repairDir,
+    onFailure: (reason) => {
+      failureReason = reason
+    },
   })
   if (repaired) {
     try {
       const stats = await fs.stat(repaired)
-      if (stats.isFile() && stats.size > 0) return repaired
+      if (stats.isFile() && stats.size > 0) {
+        // Re-verify the persisted bytes against the pin before trusting them
+        // (reliability finding repaired-wasm-never-reverified-at-load): the
+        // default repair wrote checksum-verified bytes, but anything could
+        // have touched the path between write and load; re-verifying here
+        // keeps this function's contract that a returned path matches the
+        // pin. A caller-supplied repairImpl stands in for the repair step in
+        // tests and is not required to write pin-matching bytes, so only the
+        // production repair output is re-verified.
+        if (
+          params.repairImpl === undefined ||
+          params.forceRepairedBytesVerification === true
+        ) {
+          const actualHash = createHash('sha256')
+            .update(await fs.readFile(repaired))
+            .digest('hex')
+          if (actualHash !== asset.sha256) {
+            failureReason =
+              'repaired file no longer matches the pinned checksum'
+            return await reportMissing()
+          }
+        }
+        return repaired
+      }
     } catch {
       // Fall through to the deterministic missing-asset error below.
     }
   }
 
-  throw new Error(
-    `Missing required tree-sitter asset ${params.wasmFile}; searched ${params.candidates.join(', ')} and checksum-pinned repair failed`,
-  )
+  // return-await: reportMissing returns Promise<never>, but only an explicit
+  // return/throw satisfies the control-flow analyzer for this Promise<string>
+  // signature (TS2366) while preserving the thrown deterministic error.
+  return await reportMissing()
 }

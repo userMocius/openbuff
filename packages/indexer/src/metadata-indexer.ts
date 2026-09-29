@@ -3,6 +3,7 @@ import * as fs from 'node:fs'
 import * as path from 'node:path'
 
 import {
+  extractCodeChunks,
   getFileTokenScores,
   SUPPORTED_CODE_EXTENSIONS,
 } from '@codebuff/code-map'
@@ -64,6 +65,39 @@ export function resolveGraphWeights(
     }
   }
   return resolved
+}
+
+function toRevisionKey(
+  value: string | number | undefined,
+): number | string | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : String(value)
+  }
+  const trimmed = value.trim()
+  if (/^\d+$/.test(trimmed)) return Number.parseInt(trimmed, 10)
+  return trimmed
+}
+
+/**
+ * P8.3: numeric-aware ordered comparison of persisted/incoming workspace
+ * revisions. Plain `<` on the raw values mis-orders numeric strings against
+ * numbers and each other ('10' < '9'); numeric strings are coerced to numbers.
+ * Returns a negative number when a sorts before b.
+ */
+export function compareRevisions(
+  a: string | number | undefined,
+  b: string | number | undefined,
+): number {
+  const keyA = toRevisionKey(a)
+  const keyB = toRevisionKey(b)
+  if (keyA === undefined || keyB === undefined) return 0
+  if (typeof keyA === 'number' && typeof keyB === 'number') {
+    return keyA < keyB ? -1 : keyA > keyB ? 1 : 0
+  }
+  const strA = String(keyA)
+  const strB = String(keyB)
+  return strA < strB ? -1 : strA > strB ? 1 : 0
 }
 
 // Captures the module specifier from: `import … from 'x'`, `export … from 'x'`
@@ -183,6 +217,18 @@ export async function updateMetadataIndex(
   mutationDelta?: IndexMutationDelta,
 ): Promise<MetadataIndex> {
   tsAliasCacheByRoot.delete(projectRoot)
+  // B5(c) workspaceRevision journal: reject stale complete:true deltas. If the
+  // incoming revision is older than the incorporated revision, skip the precise
+  // walk and return existing with a builtAt refresh so callers observe liveness
+  // without regressing to stale content.
+  if (
+    mutationDelta?.complete === true &&
+    mutationDelta.revision !== undefined &&
+    existing.workspaceRevision !== undefined &&
+    compareRevisions(mutationDelta.revision, existing.workspaceRevision) < 0
+  ) {
+    return { ...existing, builtAt: Date.now() }
+  }
   const preciseDelta = mutationDelta?.complete === true
   const walked = preciseDelta
     ? await collectPreciseWalk(existing, projectRoot, mutationDelta, config)
@@ -282,6 +328,8 @@ export async function updateMetadataIndex(
     return {
       ...existing,
       builtAt: Date.now(),
+      // A refresh that applied changes clears any prior degraded flag (P8.1).
+      parserDegraded: undefined,
       files: metadataOnlyChange ? updatedFiles : existing.files,
       graph,
       queryData: buildIndexQueryData(
@@ -342,9 +390,15 @@ export async function updateMetadataIndex(
   }
 
   if (parserDegraded) {
+    // P8.1: the parser degraded, so `files`/`parseData` above were not
+    // refreshed and the pending mutation delta was dropped. Keep the prior
+    // builtAt (and workspaceRevision) intact — re-stamping Date.now() would
+    // mark a stale index fresh and suppress the manager's staleness-driven
+    // retry. parseDiagnostics/coverage are preserved; the returned
+    // `parserDegraded` flag makes IndexManager re-queue the delta once.
     return {
       ...existing,
-      builtAt: Date.now(),
+      parserDegraded: true,
       parseDiagnostics,
       coverage: createIndexCoverage(walked, parseCoverage),
     }
@@ -356,6 +410,7 @@ export async function updateMetadataIndex(
   }
 
   for (const file of changedFiles) {
+    const previous = existing.files[file.relativePath]
     const indexed = await indexWalkedFile({
       absolutePath: file.absolutePath,
       projectRoot,
@@ -366,9 +421,18 @@ export async function updateMetadataIndex(
       asset: file.asset,
       hash: hashByPath.get(file.relativePath),
       tokenScores: tokenScores[file.relativePath] ?? {},
+      previousChunks: previous?.chunks,
+      previousHash: previous?.hash,
     })
     if (indexed) {
       updatedFiles[file.relativePath] = indexed
+    } else if (
+      hashReadFailedPaths.has(file.relativePath) &&
+      existing.files[file.relativePath]
+    ) {
+      // Transient (non-deletion) read failure: the walk still sees the file,
+      // so keep the previous indexed entry until a later refresh can re-read
+      // it instead of silently dropping a still-existing file from the index.
     } else {
       delete updatedFiles[file.relativePath]
     }
@@ -406,6 +470,8 @@ async function indexWalkedFile(params: {
   asset?: { kind: '3d'; format: string }
   hash?: string
   tokenScores: Record<string, number>
+  previousChunks?: IndexedFile['chunks']
+  previousHash?: string
 }): Promise<IndexedFile | null> {
   // Skip binary files entirely — they cannot be parsed as UTF-8 text and
   // reading them would corrupt the index with garbage imports/symbols.
@@ -485,16 +551,47 @@ async function indexWalkedFile(params: {
         ? configConcepts
         : []
   const concepts = mergeConcepts(baseConcepts, configConcepts)
-  const contentSample = content
+  const contentSampleRaw = content
     .split('\n')
     .filter((line) => line.trim().length > 0)
     .slice(0, 120)
     .join('\n')
-    .slice(0, 4_000)
+  const contentSampleSliced = contentSampleRaw.slice(0, 4_000)
+  const contentSampleTruncated = contentSampleSliced.length < contentSampleRaw.length
+  const contentSample = contentSampleTruncated ? `${contentSampleSliced}…[truncated]` : contentSampleSliced
 
   // Extract asset references from game engine text files (Unity .meta/.prefab/.unity,
   // Godot .tscn/.tres, Unreal .uproject, Bevy configs). Returns [] for non-asset files.
   const assetRefs = extractAssetRefs(content, params.ext, params.relativePath)
+
+  // Phase A2 (additive): chunk summaries for code files only. Reuses the
+  // already-read `content`; never re-reads disk. Errors or empty results
+  // leave `chunks` undefined to keep the cache compact.
+  let chunks: IndexedFile['chunks']
+  if (CODE_EXTENSIONS.has(params.ext)) {
+    const contentHash = params.hash ?? hashContent(content)
+    if (params.previousChunks && params.previousHash && contentHash === params.previousHash) {
+      chunks = params.previousChunks.slice(0, 100)
+      if (chunks.length === 0) chunks = undefined
+    } else try {
+      const rawChunks = await extractCodeChunks(content, params.relativePath)
+      if (rawChunks.length > 0) {
+        chunks = rawChunks.slice(0, 100).map((chunk) => ({
+          chunkId: chunk.chunkId,
+          qualifiedName: chunk.qualifiedName,
+          kind: chunk.kind,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          hash: chunk.hash,
+          stableChunkId: chunk.stableChunkId,
+          signature: chunk.signature,
+        }))
+        if (chunks.length === 0) chunks = undefined
+      }
+    } catch {
+      chunks = undefined
+    }
+  }
 
   return {
     path: params.relativePath,
@@ -507,6 +604,7 @@ async function indexWalkedFile(params: {
     headings,
     concepts,
     contentSample,
+    ...(chunks ? { chunks } : {}),
     ...(assetRefs.length > 0 ? { assetRefs } : {}),
   }
 }
