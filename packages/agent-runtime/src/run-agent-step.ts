@@ -1153,7 +1153,8 @@ export const runAgentStep = async (
     shouldEndTurn = true
   }
 
-agentState = {    ...agentState,
+  agentState = {
+    ...agentState,
     stepsRemaining:
       agentState.stepsRemaining > 0
         ? agentState.stepsRemaining - 1
@@ -2037,34 +2038,34 @@ export async function loopAgentSteps(
         const buildCompiledTaskMemoryMessage = (state: AgentState) =>
           state.taskMemory && !getCorrelatedAuthoritativeV2(state)
             ? userMessage({
-                content: withSystemTags(
-                  compileTaskMemoryContext({
-                    memory: state.taskMemory,
-                    agentType: state.agentType,
-                    contextWindowTokens: state.contextWindowTokens,
-                    rootAgent: !state.parentId,
-                    // Rank evidence toward the files this run has just read or
-                    // edited and the bounded terms in this loop's trusted
-                    // request, so relevance rather than raw recency decides what
-                    // survives the compiled budget.
-                    focusPaths: deriveTaskMemoryFocusPaths(state.taskMemory),
-                    currentRequest: prompt,
-                  }),
-                ),
-                tags: ['TASK_MEMORY_CONTEXT'],
-                timeToLive: 'agentStep' as const,
-                keepDuringTruncation: true,
-              })
+              content: withSystemTags(
+                compileTaskMemoryContext({
+                  memory: state.taskMemory,
+                  agentType: state.agentType,
+                  contextWindowTokens: state.contextWindowTokens,
+                  rootAgent: !state.parentId,
+                  // Rank evidence toward the files this run has just read or
+                  // edited and the bounded terms in this loop's trusted
+                  // request, so relevance rather than raw recency decides what
+                  // survives the compiled budget.
+                  focusPaths: deriveTaskMemoryFocusPaths(state.taskMemory),
+                  currentRequest: prompt,
+                }),
+              ),
+              tags: ['TASK_MEMORY_CONTEXT'],
+              timeToLive: 'agentStep' as const,
+              keepDuringTruncation: true,
+            })
             : false
         const buildCompiledMemoryV2Message = (state: AgentState) => {
           const context = getCorrelatedAuthoritativeV2(state)
           return context
             ? userMessage({
-                content: withSystemTags(compileMemoryV2Context(context)),
-                tags: ['MEMORY_V2_CONTEXT'],
-                timeToLive: 'agentStep' as const,
-                keepDuringTruncation: true,
-              })
+              content: withSystemTags(compileMemoryV2Context(context)),
+              tags: ['MEMORY_V2_CONTEXT'],
+              timeToLive: 'agentStep' as const,
+              keepDuringTruncation: true,
+            })
             : false
         }
         let messagesWithStepPrompt = buildArray(
@@ -2163,9 +2164,9 @@ export async function loopAgentSteps(
               buildCompiledTaskMemoryMessage(currentAgentState),
               buildCompiledMemoryV2Message(currentAgentState),
               stepPrompt &&
-                userMessage({
-                  content: stepPrompt,
-                }),
+              userMessage({
+                content: stepPrompt,
+              }),
             )
             currentAgentState.contextTokenCount = estimateContextTokensLocally()
             logger.debug(
@@ -2848,7 +2849,7 @@ export async function loopAgentSteps(
         )
         receipt.conceptExpanded =
           parsedMemoryContext.success &&
-          parsedMemoryContext.data.userInputId === String(userInputId)
+            parsedMemoryContext.data.userInputId === String(userInputId)
             ? countConceptAdvisoryEntries(parsedMemoryContext.data)
             : 0
         receipt.turnId = String(userInputId).slice(0, 128)

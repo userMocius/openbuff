@@ -345,16 +345,16 @@ export async function getModelForRequest(
           configuredProviderModel.provider.api === 'responses'
           ? createConfiguredOpenAIResponsesModel(configuredProviderModel)
           : isOpenCodeGoResponsesModel(configuredProviderModel.providerModel) ||
-              isOpenCodeGoResponsesModel(effectiveModel) ||
-              isOpenCodeGoResponsesModel(configuredProviderModel.requestedModel)
+            isOpenCodeGoResponsesModel(effectiveModel) ||
+            isOpenCodeGoResponsesModel(configuredProviderModel.requestedModel)
             ? createConfiguredOpenCodeGoResponsesModel(
-                configuredProviderModel,
-                sessionId,
-              )
+              configuredProviderModel,
+              sessionId,
+            )
             : createConfiguredOpenAICompatibleModel(
-                configuredProviderModel,
-                sessionId,
-              ),
+              configuredProviderModel,
+              sessionId,
+            ),
       isChatGptOAuth: false,
       compatibility: configuredProviderModel.compatibility,
       reasoningEffort,
@@ -814,9 +814,9 @@ export function createOpenAICompatibleHeaders(
 ): Record<string, string> {
   const isGo = opts?.providerId
     ? isOpenCodeGoProvider({
-        providerId: opts.providerId,
-        baseURL: opts.baseURL,
-      })
+      providerId: opts.providerId,
+      baseURL: opts.baseURL,
+    })
     : false
   return {
     ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),

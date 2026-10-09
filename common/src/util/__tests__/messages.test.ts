@@ -23,12 +23,12 @@ function createLoggerStub(): {
 } {
   const warnings: Array<{ data: unknown; msg?: string }> = []
   const logger: Logger = {
-    debug: () => {},
-    info: () => {},
+    debug: () => { },
+    info: () => { },
     warn: (data, msg) => {
       warnings.push({ data, msg })
     },
-    error: () => {},
+    error: () => { },
   }
   return { logger, warnings }
 }

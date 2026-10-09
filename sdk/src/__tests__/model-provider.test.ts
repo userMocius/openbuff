@@ -640,7 +640,7 @@ describe('model-provider', () => {
       expect(resolved?.provider.type).toBe('openai-compatible')
       expect(
         resolved?.provider.type === 'openai-compatible' &&
-          resolved.provider.supportsStructuredOutputs,
+        resolved.provider.supportsStructuredOutputs,
       ).toBe(true)
     })
 
@@ -3130,7 +3130,7 @@ describe('ancestor config trust gate (M1-T3, fail-closed apiKeyEnv strip)', () =
     expect(loaded.config.providers.ancestor).toBeDefined()
     expect(
       loaded.config.providers.ancestor.type === 'openai-compatible' &&
-        loaded.config.providers.ancestor.apiKeyEnv,
+      loaded.config.providers.ancestor.apiKeyEnv,
     ).toBe('ANCESTOR_EXFIL_API_KEY')
     // Opted in: no strip diagnostic for the ancestor fragment.
     expect(
@@ -3158,7 +3158,7 @@ describe('ancestor config trust gate (M1-T3, fail-closed apiKeyEnv strip)', () =
     expect(loaded.config.providers.project).toBeDefined()
     expect(
       loaded.config.providers.project.type === 'openai-compatible' &&
-        loaded.config.providers.project.apiKeyEnv,
+      loaded.config.providers.project.apiKeyEnv,
     ).toBe('PROJECT_API_KEY')
     expect(loaded.diagnostics).toEqual([])
   })
